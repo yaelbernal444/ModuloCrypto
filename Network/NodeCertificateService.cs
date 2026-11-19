@@ -5,7 +5,7 @@ using System.Security.Cryptography.X509Certificates;
 namespace ModuloCrypto.Network;
 
 /// <summary>
-/// Administra el certificado X.509 local del nodo para firma raíz y verificación de paquetes Tor (.zip).
+/// Administra el certificado X.509 local del nodo (NODO-01) para firma raíz y verificación de paquetes Tor (.zip).
 /// </summary>
 public static class NodeCertificateService
 {
@@ -20,27 +20,35 @@ public static class NodeCertificateService
 
     public static X509Certificate2 Initialize(bool forceRegenerate = false)
     {
+        string expectedCn = $"CN={NodeRuntimeState.CurrentNodeId}";
+
         if (!forceRegenerate && File.Exists(CertPath))
         {
             try
             {
                 _currentCert?.Dispose();
-                _currentCert = X509CertificateLoader.LoadPkcs12FromFile(
+                var loaded = X509CertificateLoader.LoadPkcs12FromFile(
                     CertPath,
                     CertPassword,
                     X509KeyStorageFlags.Exportable);
-                NodeRuntimeState.CertificateActive = true;
-                return _currentCert;
+
+                if (loaded.Subject.Contains(expectedCn, StringComparison.OrdinalIgnoreCase))
+                {
+                    _currentCert = loaded;
+                    NodeRuntimeState.CertificateActive = true;
+                    return _currentCert;
+                }
+                loaded.Dispose();
             }
             catch
             {
-                // Regenerar si el archivo está corrupto
+                // Regenerar si el archivo está corrupto o corresponde a otro nodo
             }
         }
 
         using var rsa = RSA.Create(2048);
         var req = new CertificateRequest(
-            $"CN={NodeRuntimeState.CurrentNodeId}, O=ModuloCrypto-TorMesh, OU=CyberSec-8Nodes",
+            $"{expectedCn}, O=ModuloCrypto-TorMesh, OU=CyberSec-8Nodes",
             rsa,
             HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);

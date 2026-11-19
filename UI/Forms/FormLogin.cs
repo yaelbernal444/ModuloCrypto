@@ -4,6 +4,7 @@ using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Theme;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Windows.Forms;
 
 namespace ModuloCrypto.UI.Forms;
@@ -12,139 +13,130 @@ public sealed class FormLogin : Form
 {
     public Usuario? AuthenticatedUser { get; private set; }
 
+    private const string CryptoGlyphPool = "0123456789ABCDEF@#$%&*<>+=?∑∆Ω";
+
+    private sealed class CascadeDrop
+    {
+        public float X;
+        public float Y;
+        public float Speed;
+        public int Length;
+        public char[] Chars = Array.Empty<char>();
+    }
+
+    private readonly System.Windows.Forms.Timer _cascadeTimer;
+    private readonly List<CascadeDrop> _drops = new();
+    private readonly Random _rng = new(1337);
+    private readonly Font _cascadeFont = new("Consolas", 11f, FontStyle.Bold);
+    private float _scanlineY;
+    private int _lastColumnsWidth;
+
     private readonly GlassPanel _mainCard;
     private readonly HologramLockControl _previewHologram;
     private readonly TextBox _txtUsername;
     private readonly TextBox _txtPassword;
-    private readonly ComboBox _cmbNode;
-    private readonly ComboBox _cmbRole;
-    private readonly Label _lblNode;
-    private readonly Label _lblRole;
-    private readonly Label _lblModeTitle;
     private readonly Label _lblFeedback;
-    private readonly NeonButton _btnSubmit;
-    private readonly NeonButton _btnToggleMode;
-    private bool _isRegisterMode;
 
     public FormLogin()
     {
-        Text = "ModuloCrypto — Acceso al Nodo Criptográfico";
+        Text = "ModuloCrypto — NODO-01";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1024, 680);
         BackColor = HologramTheme.BackgroundBase;
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         KeyPreview = true;
 
         _mainCard = new GlassPanel
         {
-            Size = new Size(960, 580),
+            Size = new Size(940, 540),
             CornerRadius = 22,
             NeonBorderGlow = true,
-            BorderColor = Color.FromArgb(95, HologramTheme.AccentGlow),
-            Padding = new Padding(0)
+            BorderColor = Color.FromArgb(115, HologramTheme.AccentGlow),
+            FillColorTop = HologramTheme.PanelGlass,
+            FillColorBottom = Color.FromArgb(16, 13, 30),
+            Padding = new Padding(2)
         };
         Controls.Add(_mainCard);
 
-        // Panel Izquierdo: Identidad Visual + Holograma Binario en Vivo
+        // Panel Izquierdo: Identidad Visual + Holograma Binario en Vivo (sin textos cortados ni badges inferiores)
         var leftPanel = new Panel
         {
             Dock = DockStyle.Left,
-            Width = 465,
-            BackColor = Color.FromArgb(14, 11, 27),
-            Padding = new Padding(26)
+            Width = 455,
+            BackColor = Color.FromArgb(15, 12, 28),
+            Padding = new Padding(28, 26, 24, 24)
         };
 
         var lblBrand = new Label
         {
-            Text = "◆ ModuloCrypto",
-            Font = new Font("Segoe UI", 22f, FontStyle.Bold),
+            Text = "ModuloCrypto",
+            Font = new Font("Segoe UI", 20f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Top,
-            Height = 46
+            Height = 48,
+            AutoEllipsis = false,
+            TextAlign = ContentAlignment.MiddleLeft
         };
 
         var lblTagline = new Label
         {
-            Text = "RED DISTRIBUIDA DE 8 NODOS • ENRUTAMIENTO TIPO TOR (.ZIP)\nAPI REST :5000  •  SQLITE LOCAL  •  21 ALGORITMOS OFICIALES",
-            Font = new Font("Segoe UI Semibold", 8.4f),
+            Text = "RED DISTRIBUIDA DE 8 NODOS",
+            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Top,
-            Height = 42
+            Height = 28,
+            AutoEllipsis = false,
+            TextAlign = ContentAlignment.MiddleLeft
         };
 
         _previewHologram = new HologramLockControl
         {
             Dock = DockStyle.Fill,
-            ActiveAlgorithmLabel = "X.509",
-            StatusSubtitle = "Sistema Criptográfico Holográfico • Listo"
+            ActiveAlgorithmLabel = "NODO-01",
+            StatusSubtitle = "Núcleo Criptográfico Holográfico • Listo"
         };
-
-        var statusBar = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 42,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            BackColor = Color.Transparent,
-            Padding = new Padding(0, 6, 0, 0)
-        };
-        statusBar.Controls.Add(new StatusPill
-        {
-            Text = NodeRuntimeState.ApiOnline ? $"API: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
-            IsActive = NodeRuntimeState.ApiOnline,
-            Width = 148
-        });
-        statusBar.Controls.Add(new StatusPill
-        {
-            Text = NodeRuntimeState.SqliteConnected ? "SQLite: OK" : "SQLite: Error",
-            IsActive = NodeRuntimeState.SqliteConnected,
-            Width = 120
-        });
-        statusBar.Controls.Add(new StatusPill
-        {
-            Text = NodeRuntimeState.CertificateActive ? "X.509: Activo" : "X.509: Off",
-            IsActive = NodeRuntimeState.CertificateActive,
-            Width = 132
-        });
 
         leftPanel.Controls.Add(_previewHologram);
-        leftPanel.Controls.Add(statusBar);
         leftPanel.Controls.Add(lblTagline);
         leftPanel.Controls.Add(lblBrand);
 
-        // Panel Derecho: Formulario Glassmorphism Login / Registro
+        // Panel Derecho: Formulario Limpio (Solo 2 botones: Iniciar Sesión y Registrar Nuevo Integrante)
         var rightPanel = new Panel
         {
             Dock = DockStyle.Fill,
-            BackColor = Color.Transparent,
-            Padding = new Padding(44, 38, 44, 30)
+            BackColor = HologramTheme.PanelGlass,
+            Padding = new Padding(44, 42, 44, 34)
         };
 
-        _lblModeTitle = new Label
+        var lblTitle = new Label
         {
-            Text = "Iniciar Sesión en el Nodo",
-            Font = new Font("Segoe UI", 19f, FontStyle.Bold),
+            Text = "Iniciar Sesión",
+            Font = new Font("Segoe UI", 20f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(44, 38),
-            Size = new Size(410, 38)
+            Location = new Point(44, 42),
+            Size = new Size(400, 44),
+            AutoEllipsis = false
         };
 
         var lblSub = new Label
         {
-            Text = "Autenticación SHA-256 sobre ModuloCrypto.db (SQLite)",
-            Font = HologramTheme.FontBody(9.5f),
+            Text = "Acceso al Nodo Criptográfico",
+            Font = new Font("Segoe UI", 10.5f, FontStyle.Regular),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(44, 78),
-            Size = new Size(410, 24)
+            Location = new Point(44, 88),
+            Size = new Size(400, 26),
+            AutoEllipsis = false
         };
 
-        var lblUser = CreateFieldLabel("USUARIO DEL OPERADOR", 44, 122);
+        var lblUser = CreateFieldLabel("USUARIO", 44, 142);
         _txtUsername = new TextBox
         {
-            Location = new Point(44, 146),
-            Size = new Size(405, 34),
+            Location = new Point(44, 168),
+            Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -152,11 +144,11 @@ public sealed class FormLogin : Form
             Text = "admin"
         };
 
-        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 196);
+        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 224);
         _txtPassword = new TextBox
         {
-            Location = new Point(44, 220),
-            Size = new Size(405, 34),
+            Location = new Point(44, 250),
+            Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -165,93 +157,65 @@ public sealed class FormLogin : Form
             Text = "admin123"
         };
 
-        _lblNode = CreateFieldLabel("NODO ASIGNADO (RED DE 8 NODOS)", 44, 268);
-        _cmbNode = new ComboBox
-        {
-            Location = new Point(44, 292),
-            Size = new Size(195, 32),
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            BackColor = HologramTheme.PanelInput,
-            ForeColor = HologramTheme.TextPrimary,
-            FlatStyle = FlatStyle.Flat,
-            Font = new Font("Segoe UI Semibold", 10f)
-        };
-        for (int i = 1; i <= 8; i++) _cmbNode.Items.Add($"NODO-0{i}");
-        _cmbNode.SelectedItem = "NODO-04";
-
-        _lblRole = CreateFieldLabel("ROL DEL OPERADOR", 254, 268);
-        _cmbRole = new ComboBox
-        {
-            Location = new Point(254, 292),
-            Size = new Size(195, 32),
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            BackColor = HologramTheme.PanelInput,
-            ForeColor = HologramTheme.TextPrimary,
-            FlatStyle = FlatStyle.Flat,
-            Font = new Font("Segoe UI Semibold", 10f)
-        };
-        _cmbRole.Items.AddRange(new object[] { "Operador Tor", "Arquitecto Seguridad", "Auditor Cripto" });
-        _cmbRole.SelectedIndex = 0;
-
         _lblFeedback = new Label
         {
-            Text = "Demo preconfigurada: admin / admin123  (NODO-04)",
-            Font = new Font("Segoe UI", 9f),
-            ForeColor = HologramTheme.HologramCyan,
-            Location = new Point(44, 344),
-            Size = new Size(405, 42)
+            Text = "",
+            Font = new Font("Segoe UI", 9.2f),
+            ForeColor = HologramTheme.Danger,
+            Location = new Point(44, 300),
+            Size = new Size(395, 28)
         };
 
-        _btnSubmit = new NeonButton
+        var btnLogin = new NeonButton
         {
-            Text = "ACCEDER AL DASHBOARD  →",
+            Text = "Iniciar Sesión",
             Variant = NeonButtonVariant.Primary,
-            Location = new Point(44, 404),
-            Size = new Size(405, 46),
+            Location = new Point(44, 344),
+            Size = new Size(395, 46),
             Font = new Font("Segoe UI Semibold", 10.5f, FontStyle.Bold)
         };
-        _btnSubmit.Click += (_, _) => HandleSubmit();
+        btnLogin.Click += (_, _) => HandleLogin();
 
-        _btnToggleMode = new NeonButton
+        var btnRegister = new NeonButton
         {
-            Text = "¿Nuevo integrante? Registrar Operador",
+            Text = "Registrar Nuevo Integrante",
             Variant = NeonButtonVariant.Secondary,
-            Location = new Point(44, 462),
-            Size = new Size(405, 40),
-            Font = new Font("Segoe UI Semibold", 9.5f)
+            Location = new Point(44, 404),
+            Size = new Size(395, 44),
+            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold)
         };
-        _btnToggleMode.Click += (_, _) => ToggleMode();
-
-        var btnExit = new NeonButton
-        {
-            Text = "Salir",
-            Variant = NeonButtonVariant.Danger,
-            Location = new Point(349, 516),
-            Size = new Size(100, 34),
-            Font = new Font("Segoe UI Semibold", 9f)
-        };
-        btnExit.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+        btnRegister.Click += (_, _) => OpenRegisterModal();
 
         rightPanel.Controls.AddRange(new Control[]
         {
-            _lblModeTitle, lblSub, lblUser, _txtUsername, lblPass, _txtPassword,
-            _lblNode, _cmbNode, _lblRole, _cmbRole, _lblFeedback,
-            _btnSubmit, _btnToggleMode, btnExit
+            lblTitle, lblSub,
+            lblUser, _txtUsername,
+            lblPass, _txtPassword,
+            _lblFeedback,
+            btnLogin, btnRegister
         });
 
         _mainCard.Controls.Add(rightPanel);
         _mainCard.Controls.Add(leftPanel);
 
-        ApplyModeVisibility();
         CenterCard();
 
-        Resize += (_, _) => CenterCard();
+        _cascadeTimer = new System.Windows.Forms.Timer { Interval = 50 };
+        _cascadeTimer.Tick += OnCascadeTick;
+        _cascadeTimer.Start();
+
+        Resize += (_, _) =>
+        {
+            CenterCard();
+            EnsureCascadeColumns();
+        };
+
         KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Enter)
             {
                 e.SuppressKeyPress = true;
-                HandleSubmit();
+                HandleLogin();
             }
         };
     }
@@ -259,10 +223,10 @@ public sealed class FormLogin : Form
     private static Label CreateFieldLabel(string text, int x, int y) => new()
     {
         Text = text,
-        Font = new Font("Segoe UI Semibold", 8.2f, FontStyle.Bold),
+        Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold),
         ForeColor = HologramTheme.HologramViolet,
         Location = new Point(x, y),
-        Size = new Size(260, 20)
+        Size = new Size(395, 22)
     };
 
     private void CenterCard()
@@ -272,109 +236,164 @@ public sealed class FormLogin : Form
             Math.Max(16, (ClientSize.Height - _mainCard.Height) / 2));
     }
 
-    private void ToggleMode()
+    private void EnsureCascadeColumns()
     {
-        _isRegisterMode = !_isRegisterMode;
-        ApplyModeVisibility();
-    }
+        int w = Math.Max(1280, ClientSize.Width);
+        int h = Math.Max(720, ClientSize.Height);
+        if (Math.Abs(w - _lastColumnsWidth) < 32 && _drops.Count > 0) return;
 
-    private void ApplyModeVisibility()
-    {
-        _lblNode.Visible = _isRegisterMode;
-        _cmbNode.Visible = _isRegisterMode;
-        _lblRole.Visible = _isRegisterMode;
-        _cmbRole.Visible = _isRegisterMode;
+        _lastColumnsWidth = w;
+        _drops.Clear();
+        const int colStep = 26;
+        int cols = w / colStep;
 
-        if (_isRegisterMode)
+        for (int i = 0; i < cols; i++)
         {
-            _lblModeTitle.Text = "Registrar Nuevo Operador";
-            _btnSubmit.Text = "CREAR CUENTA Y ACCEDER  →";
-            _btnToggleMode.Text = "Ya tengo cuenta • Volver a Iniciar Sesión";
-            _txtUsername.Text = "";
-            _txtPassword.Text = "";
-            _lblFeedback.ForeColor = HologramTheme.TextSecondary;
-            _lblFeedback.Text = "El perfil se almacenará con contraseña SHA-256 en ModuloCrypto.db.";
-            _previewHologram.TriggerDecryptAnimation("SHA256");
-        }
-        else
-        {
-            _lblModeTitle.Text = "Iniciar Sesión en el Nodo";
-            _btnSubmit.Text = "ACCEDER AL DASHBOARD  →";
-            _btnToggleMode.Text = "¿Nuevo integrante? Registrar Operador";
-            _lblFeedback.ForeColor = HologramTheme.HologramCyan;
-            _lblFeedback.Text = "Demo preconfigurada: admin / admin123  (NODO-04)";
-            _previewHologram.SetIdle("Sistema Criptográfico Holográfico • Listo");
+            int len = _rng.Next(8, 19);
+            var chars = new char[len];
+            for (int c = 0; c < len; c++)
+                chars[c] = CryptoGlyphPool[_rng.Next(CryptoGlyphPool.Length)];
+
+            _drops.Add(new CascadeDrop
+            {
+                X = i * colStep + 6,
+                Y = -_rng.Next(0, h),
+                Speed = _rng.Next(10, 24),
+                Length = len,
+                Chars = chars
+            });
         }
     }
 
-    private void HandleSubmit()
+    private void OnCascadeTick(object? sender, EventArgs e)
+    {
+        EnsureCascadeColumns();
+        int h = Math.Max(720, ClientSize.Height);
+
+        foreach (var drop in _drops)
+        {
+            drop.Y += drop.Speed;
+            if (drop.Chars.Length > 0)
+            {
+                int mutateIdx = _rng.Next(drop.Chars.Length);
+                drop.Chars[mutateIdx] = CryptoGlyphPool[_rng.Next(CryptoGlyphPool.Length)];
+            }
+
+            if (drop.Y - drop.Length * 18 > h)
+            {
+                drop.Y = -_rng.Next(20, 260);
+                drop.Speed = _rng.Next(10, 24);
+            }
+        }
+
+        _scanlineY += 9f;
+        if (_scanlineY > h) _scanlineY = 0f;
+
+        Invalidate();
+    }
+
+    private void HandleLogin()
     {
         string user = _txtUsername.Text.Trim();
         string pass = _txtPassword.Text;
 
-        if (_isRegisterMode)
+        var auth = AuthService.Authenticate(user, pass);
+        if (auth == null)
         {
-            string nodo = _cmbNode.SelectedItem?.ToString() ?? "NODO-04";
-            string rol = _cmbRole.SelectedItem?.ToString() ?? "Operador Tor";
-            var res = AuthService.Register(user, pass, nodo, rol);
-            if (!res.Success || res.User == null)
-            {
-                _lblFeedback.ForeColor = HologramTheme.Danger;
-                _lblFeedback.Text = res.Message;
-                return;
-            }
-            AuthenticatedUser = res.User;
-        }
-        else
-        {
-            var auth = AuthService.Authenticate(user, pass);
-            if (auth == null)
-            {
-                _lblFeedback.ForeColor = HologramTheme.Danger;
-                _lblFeedback.Text = "Credenciales inválidas. Verifica usuario y contraseña.";
-                _previewHologram.TriggerEncryptAnimation("DENIED");
-                return;
-            }
-            AuthenticatedUser = auth;
+            _lblFeedback.ForeColor = HologramTheme.Danger;
+            _lblFeedback.Text = "Credenciales inválidas. Verifica usuario y contraseña.";
+            _previewHologram.TriggerEncryptAnimation("DENIED");
+            return;
         }
 
-        NodeRuntimeState.CurrentNodeId = AuthenticatedUser.NodoAsignado;
+        AuthenticatedUser = auth;
+        NodeRuntimeState.CurrentNodeId = "NODO-01";
         DialogResult = DialogResult.OK;
         Close();
     }
 
-    protected override void OnPaintBackground(PaintEventArgs e)
+    private void OpenRegisterModal()
+    {
+        using var modal = new FormRegisterModal();
+        if (modal.ShowDialog(this) == DialogResult.OK && modal.RegisteredUser != null)
+        {
+            AuthenticatedUser = modal.RegisteredUser;
+            NodeRuntimeState.CurrentNodeId = "NODO-01";
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
-        using var bg = new LinearGradientBrush(
-            ClientRectangle,
-            ColorTranslator.FromHtml("#07050E"),
-            ColorTranslator.FromHtml("#120D24"),
-            135f);
-        g.FillRectangle(bg, ClientRectangle);
+        // 1. Fondo Base #0B0914
+        g.Clear(HologramTheme.BackgroundBase);
 
-        // Sutil cuadrícula espacial futurista
-        using var gridPen = new Pen(Color.FromArgb(14, 162, 155, 254), 1f);
-        for (int x = 0; x < Width; x += 48) g.DrawLine(gridPen, x, 0, x, Height);
-        for (int y = 0; y < Height; y += 48) g.DrawLine(gridPen, 0, y, Width, y);
+        // 2. Cascada de caracteres criptográficos (estela violeta #7D5FFF/#6C5CE7 y cabeza azul cian #00D2FF)
+        EnsureCascadeColumns();
+        const float charStepY = 18f;
 
-        // Resplandor ambiental superior izquierda (violeta) e inferior derecha (cian)
-        DrawGlowOrb(g, Width * 0.16f, Height * 0.22f, 320, Color.FromArgb(38, HologramTheme.AccentStart));
-        DrawGlowOrb(g, Width * 0.84f, Height * 0.78f, 360, Color.FromArgb(30, HologramTheme.HologramCyan));
+        foreach (var drop in _drops)
+        {
+            for (int i = 0; i < drop.Length; i++)
+            {
+                float cy = drop.Y - i * charStepY;
+                if (cy < -20 || cy > Height + 20) continue;
+
+                Color color;
+                if (i == 0)
+                {
+                    // Cabeza de gota en azul cian eléctrico #00D2FF
+                    color = Color.FromArgb(235, HologramTheme.HologramCyan);
+                }
+                else
+                {
+                    float fade = 1f - (i / (float)drop.Length);
+                    int alpha = (int)Math.Clamp(fade * 165f, 18f, 165f);
+                    Color baseTrail = i < 3 ? HologramTheme.AccentGlow : HologramTheme.AccentStart;
+                    color = Color.FromArgb(alpha, baseTrail);
+                }
+
+                using var brush = new SolidBrush(color);
+                g.DrawString(drop.Chars[i].ToString(), _cascadeFont, brush, drop.X, cy);
+            }
+        }
+
+        // 3. Línea de escaneo horizontal (Scanline)
+        if (Width > 0)
+        {
+            var scanRect = new RectangleF(0, _scanlineY - 18f, Width, 36f);
+            using (var scanBrush = new LinearGradientBrush(
+                scanRect,
+                Color.FromArgb(0, HologramTheme.AccentGlow),
+                Color.FromArgb(45, HologramTheme.HologramCyan),
+                90f))
+            {
+                g.FillRectangle(scanBrush, scanRect);
+            }
+
+            using var linePen = new Pen(Color.FromArgb(115, HologramTheme.HologramCyan), 1.2f);
+            g.DrawLine(linePen, 0, _scanlineY, Width, _scanlineY);
+        }
     }
 
-    private static void DrawGlowOrb(Graphics g, float cx, float cy, float radius, Color color)
+    protected override void OnPaintBackground(PaintEventArgs e)
     {
-        var rect = new RectangleF(cx - radius, cy - radius, radius * 2, radius * 2);
-        using var path = new GraphicsPath();
-        path.AddEllipse(rect);
-        using var pgb = new PathGradientBrush(path)
+        // Manejado en OnPaint con Doble Búfer para evitar parpadeos
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
         {
-            CenterColor = color,
-            SurroundColors = new[] { Color.Transparent }
-        };
-        g.FillEllipse(pgb, rect);
+            _cascadeTimer.Stop();
+            _cascadeTimer.Dispose();
+            _cascadeFont.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }

@@ -24,7 +24,7 @@ public class NeonButton : Control
     public NeonButtonVariant Variant { get; set; } = NeonButtonVariant.Primary;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public int CornerRadius { get; set; } = 11;
+    public int CornerRadius { get; set; } = 10;
 
     public NeonButton()
     {
@@ -32,8 +32,9 @@ public class NeonButton : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         Cursor = Cursors.Hand;
-        Size = new Size(150, 40);
-        Font = new Font("Segoe UI Semibold", 9.8f, FontStyle.Bold);
+        Size = new Size(160, 40);
+        BackColor = HologramTheme.PanelGlass;
+        Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
         ForeColor = HologramTheme.TextPrimary;
     }
 
@@ -48,19 +49,23 @@ public class NeonButton : Control
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
+        Color parentBg = Parent?.BackColor ?? HologramTheme.PanelGlass;
+        if (parentBg == Color.Transparent) parentBg = HologramTheme.PanelGlass;
+        g.Clear(parentBg);
+
         var rect = new Rectangle(2, 2, Width - 5, Height - 5);
         if (rect.Width <= 4 || rect.Height <= 4) return;
 
         (Color c1, Color c2, Color border, Color glow) = Variant switch
         {
             NeonButtonVariant.Cyan => (
-                Color.FromArgb(0, 180, 230),
-                Color.FromArgb(56, 97, 251),
+                Color.FromArgb(0, 178, 228),
+                Color.FromArgb(52, 92, 245),
                 HologramTheme.HologramCyan,
                 HologramTheme.HologramCyan),
             NeonButtonVariant.Success => (
-                Color.FromArgb(34, 180, 96),
-                Color.FromArgb(20, 128, 72),
+                Color.FromArgb(36, 185, 100),
+                Color.FromArgb(20, 130, 74),
                 HologramTheme.Success,
                 HologramTheme.Success),
             NeonButtonVariant.Danger => (
@@ -69,21 +74,21 @@ public class NeonButton : Control
                 HologramTheme.Danger,
                 HologramTheme.Danger),
             NeonButtonVariant.Secondary => (
-                _hovered ? Color.FromArgb(42, 36, 74) : Color.FromArgb(28, 24, 52),
-                _hovered ? Color.FromArgb(30, 25, 58) : Color.FromArgb(20, 17, 38),
-                _hovered ? HologramTheme.AccentGlow : HologramTheme.BorderSubtle,
+                _hovered ? Color.FromArgb(33, 28, 62) : HologramTheme.PanelGlass,
+                _hovered ? Color.FromArgb(26, 22, 50) : HologramTheme.PanelGlass,
+                _hovered ? HologramTheme.AccentGlow : HologramTheme.AccentStart,
                 HologramTheme.AccentGlow),
             _ => (
-                HologramTheme.AccentStart,
-                HologramTheme.AccentEnd,
+                _hovered ? HologramTheme.AccentGlow : HologramTheme.AccentStart,
+                _hovered ? HologramTheme.AccentStart : HologramTheme.AccentEnd,
                 HologramTheme.AccentGlow,
                 HologramTheme.AccentGlow)
         };
 
         if (!Enabled)
         {
-            c1 = Color.FromArgb(35, 32, 52);
-            c2 = Color.FromArgb(28, 25, 44);
+            c1 = Color.FromArgb(32, 28, 48);
+            c2 = Color.FromArgb(26, 22, 40);
             border = HologramTheme.BorderSubtle;
         }
         else if (_pressed)
@@ -91,23 +96,19 @@ public class NeonButton : Control
             c1 = ControlPaint.Dark(c1, 0.12f);
             c2 = ControlPaint.Dark(c2, 0.12f);
         }
-        else if (_hovered && Variant != NeonButtonVariant.Secondary)
-        {
-            c1 = ControlPaint.Light(c1, 0.12f);
-        }
 
         using var path = HologramTheme.CreateRoundedPath(rect, CornerRadius);
 
         if (_hovered && Enabled)
         {
-            using var glowPen = new Pen(Color.FromArgb(95, glow), 3.5f);
+            using var glowPen = new Pen(Color.FromArgb(95, glow), 3f);
             g.DrawPath(glowPen, path);
         }
 
         using (var brush = new LinearGradientBrush(rect, c1, c2, 135f))
             g.FillPath(brush, path);
 
-        using (var pen = new Pen(Enabled ? border : HologramTheme.BorderSubtle, 1f))
+        using (var pen = new Pen(Enabled ? border : HologramTheme.BorderSubtle, 1.2f))
             g.DrawPath(pen, path);
 
         TextRenderer.DrawText(
@@ -116,6 +117,6 @@ public class NeonButton : Control
             Font,
             rect,
             Enabled ? ForeColor : HologramTheme.TextSecondary,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
 }

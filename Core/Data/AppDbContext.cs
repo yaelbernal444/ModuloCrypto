@@ -54,27 +54,60 @@ public class AppDbContext : DbContext
         using var db = new AppDbContext();
         db.Database.EnsureCreated();
 
+        // Asegurar migración transparente si la tabla Usuarios ya existía sin NombreCompleto
+        try
+        {
+            db.Database.ExecuteSqlRaw("ALTER TABLE Usuarios ADD COLUMN NombreCompleto TEXT NOT NULL DEFAULT '';");
+        }
+        catch
+        {
+            // La columna ya existe
+        }
+
         if (!db.Usuarios.Any())
         {
             db.Usuarios.AddRange(
                 new Usuario
                 {
+                    NombreCompleto = "Yael Bernal",
                     NombreUsuario = "admin",
                     PasswordHash = ComputeSha256("admin123"),
-                    NodoAsignado = "NODO-04",
+                    NodoAsignado = "NODO-01",
                     Rol = "Arquitecto Seguridad",
                     FechaRegistro = DateTime.Now
                 },
                 new Usuario
                 {
+                    NombreCompleto = "Operador Red Tor",
                     NombreUsuario = "operador",
                     PasswordHash = ComputeSha256("crypto2026"),
-                    NodoAsignado = "NODO-04",
+                    NodoAsignado = "NODO-01",
                     Rol = "Operador Tor",
                     FechaRegistro = DateTime.Now
                 }
             );
             db.SaveChanges();
+        }
+        else
+        {
+            // Actualizar registros existentes a NODO-01 y asegurar NombreCompleto real
+            bool changed = false;
+            foreach (var u in db.Usuarios.ToList())
+            {
+                if (u.NodoAsignado == "NODO-04" || string.IsNullOrWhiteSpace(u.NodoAsignado))
+                {
+                    u.NodoAsignado = "NODO-01";
+                    changed = true;
+                }
+                if (string.IsNullOrWhiteSpace(u.NombreCompleto))
+                {
+                    u.NombreCompleto = u.NombreUsuario.Equals("admin", StringComparison.OrdinalIgnoreCase)
+                        ? "Yael Bernal"
+                        : u.NombreUsuario;
+                    changed = true;
+                }
+            }
+            if (changed) db.SaveChanges();
         }
     }
 

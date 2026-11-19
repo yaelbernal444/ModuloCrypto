@@ -8,6 +8,10 @@ public class Usuario
     public int Id { get; set; }
 
     [Required]
+    [MaxLength(120)]
+    public string NombreCompleto { get; set; } = string.Empty;
+
+    [Required]
     [MaxLength(64)]
     public string NombreUsuario { get; set; } = string.Empty;
 
@@ -17,11 +21,11 @@ public class Usuario
 
     [Required]
     [MaxLength(32)]
-    public string NodoAsignado { get; set; } = "NODO-04";
+    public string NodoAsignado { get; set; } = "NODO-01";
 
     [Required]
     [MaxLength(32)]
-    public string Rol { get; set; } = "Operador";
+    public string Rol { get; set; } = "Operador Tor";
 
     public DateTime FechaRegistro { get; set; } = DateTime.Now;
 

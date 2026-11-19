@@ -54,14 +54,14 @@ public class RegistroCifrado
     public string LinkDescifradoRemoto { get; set; } = string.Empty;
 
     [MaxLength(32)]
-    public string NodoRaiz { get; set; } = "NODO-04";
+    public string NodoRaiz { get; set; } = "NODO-01";
 
     public string FirmaRaizBase64 { get; set; } = string.Empty;
 
     /// <summary>
-    /// Arreglo JSON con los nodos recorridos en la ruta tipo Tor.
+    /// Arreglo JSON con los nodos recorridos en la ruta tipo Tor (hopHistory).
     /// </summary>
-    public string RutaSaltosJson { get; set; } = "[]";
+    public string RutaSaltosJson { get; set; } = "[\"NODO-01\"]";
 
     /// <summary>
     /// "Local" o "Recibido".

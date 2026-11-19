@@ -29,7 +29,7 @@ public static class HologramTheme
     public static readonly Color Success = ColorTranslator.FromHtml("#2ED573");
     public static readonly Color Warning = ColorTranslator.FromHtml("#FFA502");
 
-    public static Font FontTitle(float size = 18f) => new("Segoe UI Semibold", size, FontStyle.Bold);
+    public static Font FontTitle(float size = 18f) => new("Segoe UI", size, FontStyle.Bold);
     public static Font FontHeading(float size = 12f) => new("Segoe UI Semibold", size, FontStyle.Bold);
     public static Font FontBody(float size = 9.5f) => new("Segoe UI", size, FontStyle.Regular);
     public static Font FontMono(float size = 9f) => new("Cascadia Mono", size, FontStyle.Regular);
@@ -54,6 +54,32 @@ public static class HologramTheme
         path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
         path.CloseFigure();
         return path;
+    }
+
+    public static void StyleComboBox(ComboBox cmb, Color? textColor = null)
+    {
+        Color fg = textColor ?? TextPrimary;
+        cmb.DropDownStyle = ComboBoxStyle.DropDownList;
+        cmb.FlatStyle = FlatStyle.Flat;
+        cmb.BackColor = PanelGlass;
+        cmb.ForeColor = fg;
+        cmb.DrawMode = DrawMode.OwnerDrawFixed;
+        cmb.ItemHeight = 24;
+        cmb.DrawItem += (s, e) =>
+        {
+            if (e.Index < 0) return;
+            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            Color bg = selected ? AccentStart : PanelGlass;
+            Color itemFg = selected ? Color.White : fg;
+
+            using var bgBrush = new SolidBrush(bg);
+            e.Graphics.FillRectangle(bgBrush, e.Bounds);
+
+            string text = cmb.Items[e.Index]?.ToString() ?? string.Empty;
+            var textRect = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, e.Bounds.Width - 10, e.Bounds.Height);
+            TextRenderer.DrawText(e.Graphics, text, cmb.Font, textRect, itemFg,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        };
     }
 
     public static void StyleDataGrid(DataGridView grid)

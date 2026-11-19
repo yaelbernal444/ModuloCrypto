@@ -85,8 +85,9 @@ dotnet run --project ModuloCrypto.csproj
 ```
 
 **Credenciales preconfiguradas en SQLite (`ModuloCrypto.db`):**
+- **Nombre Completo:** `Yael Bernal`
 - **Usuario:** `admin`
 - **Contraseña:** `admin123`
-- **Nodo por defecto:** `NODO-04`
+- **Nodo por defecto:** `NODO-01` (Ciclo completo: Nodo Raíz, Nodo Intermedio y Nodo Final)
 
-> También puedes registrar nuevos operadores y asignar cualquiera de los 8 nodos (`NODO-01` a `NODO-08`) desde la pantalla de acceso.
+> También puedes registrar nuevos integrantes con su `NombreCompleto`, `Usuario` y `Contraseña` desde el modal de **Registrar Nuevo Integrante** en la pantalla de acceso.

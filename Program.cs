@@ -92,8 +92,12 @@ internal static class Program
                 passed++;
             }
 
-            // Verificar empaquetado .ZIP + firma X.509
+            // Verificar empaquetado .ZIP + firma X.509 + ciclo bidireccional (Inicio -> Intermedio -> Final)
             var aesRes = CryptoCatalog.GetStrategy("AESGCM").Encrypt(sample);
+            string origHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(aesRes.OutputBytes));
+            string rootSig = NodeCertificateService.SignPayload(Encoding.ASCII.GetBytes(origHash));
+            string rootCert = NodeCertificateService.ExportPublicCertBase64();
+
             var rec = new RegistroCifrado
             {
                 UsuarioId = admin.Id,
@@ -105,18 +109,18 @@ internal static class Program
                 ParametrosPublicosJson = aesRes.PublicParametersJson,
                 LlaveSecretaBase64 = aesRes.SecretKeyBase64,
                 LinkDescifradoRemoto = NodeRuntimeState.BuildRemoteDecryptUrl("test"),
-                NodoRaiz = "NODO-04",
-                FirmaRaizBase64 = NodeCertificateService.SignPayload(aesRes.OutputBytes),
-                RutaSaltosJson = "[\"NODO-04\"]",
+                NodoRaiz = "NODO-01",
+                FirmaRaizBase64 = rootSig,
+                RutaSaltosJson = "[\"NODO-01\"]",
                 Origen = "Local"
             };
-            string zip = PacketZipService.CreatePacketZip(rec, aesRes.OutputBytes);
+            string zip = PacketZipService.CreatePacketZip(rec, aesRes.OutputBytes, preservedRootCertBase64: rootCert, preservedOriginalHashHex: origHash);
             var parsed = PacketZipService.ReadPacketZip(zip);
-            if (!parsed.SignatureValid || !parsed.IntegrityValid)
+            if (!parsed.SignatureValid || !parsed.IntegrityValid || parsed.Manifest.NodoRaiz != "NODO-01")
                 throw new Exception("Verificación X.509 / SHA-256 de paquete .zip falló.");
             File.Delete(zip);
 
-            Console.WriteLine($"SELFTEST_OK: SQLite=OK, X509=OK, ZIP=OK, Algorithms={passed}/21");
+            Console.WriteLine($"SELFTEST_OK: Node={NodeRuntimeState.CurrentNodeId}, User={admin.NombreCompleto}, SQLite=OK, X509=OK, ZIP=OK, Algorithms={passed}/21");
             return 0;
         }
         catch (Exception ex)

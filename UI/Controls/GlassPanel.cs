@@ -15,10 +15,10 @@ public class GlassPanel : Panel
     public Color BorderColor { get; set; } = HologramTheme.BorderSubtle;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Color FillColorTop { get; set; } = Color.FromArgb(245, 25, 21, 46);
+    public Color FillColorTop { get; set; } = HologramTheme.PanelGlass;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Color FillColorBottom { get; set; } = Color.FromArgb(245, 19, 16, 35);
+    public Color FillColorBottom { get; set; } = Color.FromArgb(18, 15, 34);
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public bool ShowTopHighlight { get; set; } = true;
@@ -31,7 +31,8 @@ public class GlassPanel : Panel
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.Transparent;
+        BackColor = HologramTheme.PanelGlass;
+        ForeColor = HologramTheme.TextPrimary;
         Padding = new Padding(16);
     }
 
@@ -39,6 +40,10 @@ public class GlassPanel : Panel
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        Color parentBg = Parent?.BackColor ?? HologramTheme.BackgroundBase;
+        if (parentBg == Color.Transparent) parentBg = HologramTheme.BackgroundBase;
+        g.Clear(parentBg);
 
         var rect = new Rectangle(1, 1, Width - 3, Height - 3);
         if (rect.Width <= 4 || rect.Height <= 4) return;
@@ -49,13 +54,13 @@ public class GlassPanel : Panel
 
         if (ShowTopHighlight)
         {
-            using var hiPen = new Pen(Color.FromArgb(32, 162, 155, 254), 1f);
+            using var hiPen = new Pen(Color.FromArgb(40, 162, 155, 254), 1f);
             g.DrawLine(hiPen, rect.X + CornerRadius, rect.Y + 1, rect.Right - CornerRadius, rect.Y + 1);
         }
 
         if (NeonBorderGlow)
         {
-            using var glowPen = new Pen(Color.FromArgb(65, HologramTheme.AccentGlow), 3f);
+            using var glowPen = new Pen(Color.FromArgb(70, HologramTheme.AccentGlow), 2.5f);
             g.DrawPath(glowPen, path);
         }
 

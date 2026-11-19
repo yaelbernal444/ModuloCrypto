@@ -17,6 +17,7 @@ public sealed class ParsedZipPacket
 
 /// <summary>
 /// Empaqueta y desempaqueta archivos .zip compatibles con la red de 8 nodos (manifest.json + payload.bin + root_cert.cer).
+/// Soporta NODO-01 como Nodo Raíz (inicio), Nodo Intermedio (re-cifrado + hopHistory) y Nodo Final.
 /// </summary>
 public static class PacketZipService
 {
@@ -26,7 +27,9 @@ public static class PacketZipService
         RegistroCifrado registro,
         byte[] cipherBytes,
         List<string>? customHops = null,
-        string? destinationPath = null)
+        string? destinationPath = null,
+        string? preservedRootCertBase64 = null,
+        string? preservedOriginalHashHex = null)
     {
         string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
         Directory.CreateDirectory(outDir);
@@ -38,9 +41,17 @@ public static class PacketZipService
         var hops = customHops ?? TryDeserializeHops(registro.RutaSaltosJson);
         if (hops.Count == 0) hops.Add(registro.NodoRaiz);
 
-        string certBase64 = NodeCertificateService.ExportPublicCertBase64();
+        string payloadHashHex = Convert.ToHexString(SHA256.HashData(cipherBytes));
+        string originalHashHex = string.IsNullOrWhiteSpace(preservedOriginalHashHex)
+            ? payloadHashHex
+            : preservedOriginalHashHex;
+
+        string certBase64 = string.IsNullOrWhiteSpace(preservedRootCertBase64)
+            ? NodeCertificateService.ExportPublicCertBase64()
+            : preservedRootCertBase64;
+
         string signature = string.IsNullOrWhiteSpace(registro.FirmaRaizBase64)
-            ? NodeCertificateService.SignPayload(cipherBytes)
+            ? NodeCertificateService.SignPayload(Encoding.ASCII.GetBytes(originalHashHex))
             : registro.FirmaRaizBase64;
 
         var manifest = new PacketManifest
@@ -55,7 +66,8 @@ public static class PacketZipService
             FirmaRaizBase64 = signature,
             CertificadoRaizBase64 = certBase64,
             RutaSaltos = hops,
-            PayloadSha256 = Convert.ToHexString(SHA256.HashData(cipherBytes)),
+            PayloadSha256 = payloadHashHex,
+            OriginalHashSha256 = originalHashHex,
             TimestampUtc = DateTime.UtcNow
         };
 
@@ -117,9 +129,19 @@ public static class PacketZipService
                 certEntry.Open().CopyTo(ms);
                 certBase64 = Convert.ToBase64String(ms.ToArray());
             }
+            manifest.CertificadoRaizBase64 = certBase64;
         }
 
+        // Verifica firma sobre payload directo o sobre OriginalHashSha256 (cuando pasa por saltos intermedios re-cifrados)
         bool sigValid = NodeCertificateService.VerifyPayloadSignature(payload, manifest.FirmaRaizBase64, certBase64);
+        if (!sigValid && !string.IsNullOrWhiteSpace(manifest.OriginalHashSha256))
+        {
+            sigValid = NodeCertificateService.VerifyPayloadSignature(
+                Encoding.ASCII.GetBytes(manifest.OriginalHashSha256),
+                manifest.FirmaRaizBase64,
+                certBase64);
+        }
+
         bool hashValid = string.IsNullOrWhiteSpace(manifest.PayloadSha256) ||
                          string.Equals(manifest.PayloadSha256, Convert.ToHexString(SHA256.HashData(payload)), StringComparison.OrdinalIgnoreCase);
 

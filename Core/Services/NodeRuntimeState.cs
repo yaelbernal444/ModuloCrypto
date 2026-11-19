@@ -5,11 +5,11 @@ using System.Net.Sockets;
 namespace ModuloCrypto.Core.Services;
 
 /// <summary>
-/// Estado global en memoria del nodo actual, configuración de red de los 8 nodos y eventos de la API embebida.
+/// Estado global en memoria del nodo actual (NODO-01 por defecto), configuración de red de los 8 nodos y eventos de la API embebida.
 /// </summary>
 public static class NodeRuntimeState
 {
-    public static string CurrentNodeId { get; set; } = "NODO-04";
+    public static string CurrentNodeId { get; set; } = "NODO-01";
     public static int ApiPort { get; set; } = 5000;
     public static bool ApiOnline { get; set; }
     public static bool SqliteConnected { get; set; }
@@ -39,16 +39,10 @@ public static class NodeRuntimeState
             peers.Add(new PeerNode
             {
                 NodeId = id,
-                IpAddress = i == 4 ? "127.0.0.1" : $"192.168.1.{100 + i}",
+                IpAddress = i == 1 ? "127.0.0.1" : $"192.168.1.{100 + i}",
                 Port = 5000,
-                RoleLabel = i switch
-                {
-                    1 => "Guardia Entrada",
-                    4 => "Nodo Local Activo",
-                    8 => "Nodo Salida",
-                    _ => "Relay Intermedio"
-                },
-                IsOnline = i == 4
+                RoleLabel = i == 1 ? "Nodo Local (Inicio / Relay / Final)" : "Nodo Par (Inicio / Relay / Final)",
+                IsOnline = i == 1
             });
         }
         return peers;

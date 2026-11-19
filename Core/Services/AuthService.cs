@@ -20,28 +20,35 @@ public static class AuthService
     }
 
     public static (bool Success, string Message, Usuario? User) Register(
+        string nombreCompleto,
         string username,
         string password,
-        string nodoAsignado,
-        string rol)
+        string nodoAsignado = "NODO-01",
+        string rol = "Operador Tor")
     {
+        if (string.IsNullOrWhiteSpace(nombreCompleto) || nombreCompleto.Trim().Length < 3)
+            return (false, "Ingresa tu nombre completo (mínimo 3 caracteres).", null);
+
         if (string.IsNullOrWhiteSpace(username) || username.Trim().Length < 3)
             return (false, "El nombre de usuario debe tener al menos 3 caracteres.", null);
 
         if (string.IsNullOrWhiteSpace(password) || password.Length < 4)
             return (false, "La contraseña debe tener al menos 4 caracteres.", null);
 
-        string normalized = username.Trim();
+        string normalizedUser = username.Trim();
+        string normalizedName = nombreCompleto.Trim();
+
         using var db = new AppDbContext();
 
-        if (db.Usuarios.Any(u => u.NombreUsuario.ToLower() == normalized.ToLower()))
-            return (false, "Ese nombre de usuario ya existe en SQLite.", null);
+        if (db.Usuarios.Any(u => u.NombreUsuario.ToLower() == normalizedUser.ToLower()))
+            return (false, "Ese nombre de usuario ya está registrado.", null);
 
         var user = new Usuario
         {
-            NombreUsuario = normalized,
+            NombreCompleto = normalizedName,
+            NombreUsuario = normalizedUser,
             PasswordHash = AppDbContext.ComputeSha256(password),
-            NodoAsignado = string.IsNullOrWhiteSpace(nodoAsignado) ? "NODO-04" : nodoAsignado.Trim().ToUpperInvariant(),
+            NodoAsignado = string.IsNullOrWhiteSpace(nodoAsignado) ? "NODO-01" : nodoAsignado.Trim().ToUpperInvariant(),
             Rol = string.IsNullOrWhiteSpace(rol) ? "Operador Tor" : rol.Trim(),
             FechaRegistro = DateTime.Now
         };
@@ -49,6 +56,6 @@ public static class AuthService
         db.Usuarios.Add(user);
         db.SaveChanges();
 
-        return (true, "Operador registrado correctamente.", user);
+        return (true, "Integrante registrado correctamente.", user);
     }
 }
