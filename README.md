@@ -88,6 +88,6 @@ dotnet run --project ModuloCrypto.csproj
 - **Nombre Completo:** `Yael Bernal`
 - **Usuario:** `admin`
 - **Contraseña:** `admin123`
-- **Nodo por defecto:** `NODO-01` (Ciclo completo: Nodo Raíz, Nodo Intermedio y Nodo Final)
+- **Nodo por defecto:** `NODO-04`
 
 > También puedes registrar nuevos integrantes con su `NombreCompleto`, `Usuario` y `Contraseña` desde el modal de **Registrar Nuevo Integrante** en la pantalla de acceso.
