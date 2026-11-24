@@ -41,7 +41,8 @@ public static class NodeRuntimeState
                 NodeId = id,
                 IpAddress = i == 1 ? "127.0.0.1" : $"192.168.1.{100 + i}",
                 Port = 5000,
-                RoleLabel = i == 1 ? "Nodo Local (Inicio / Relay / Final)" : "Nodo Par (Inicio / Relay / Final)",
+                RoleLabel = i == 1 ? "Nodo Local (Inicio / Relay / Final)" : "Nodo Tor (Inicio / Relay / Final)",
+                ProtocolType = i == 1 ? "ModuloCrypto" : "Auto",
                 IsOnline = i == 1
             });
         }

@@ -5,7 +5,7 @@ using System.Security.Cryptography.X509Certificates;
 namespace ModuloCrypto.Network;
 
 /// <summary>
-/// Administra el certificado X.509 local del nodo (NODO-01) para firma raíz y verificación de paquetes Tor (.zip).
+/// Administra el certificado X.509 local del nodo (NODO-01) para firma raíz y verificación dual (PEM/DER y RSA-PSS/PKCS#1).
 /// </summary>
 public static class NodeCertificateService
 {
@@ -16,7 +16,7 @@ public static class NodeCertificateService
     public static X509Certificate2 CurrentCertificate => _currentCert ?? Initialize();
 
     public static string Subject => CurrentCertificate.Subject;
-    public static string Thumbprint => CurrentCertificate.Thumbprint;
+    public static string Thumbprint => GetThumbprintSha256Hex();
 
     public static X509Certificate2 Initialize(bool forceRegenerate = false)
     {
@@ -42,7 +42,7 @@ public static class NodeCertificateService
             }
             catch
             {
-                // Regenerar si el archivo está corrupto o corresponde a otro nodo
+                // Regenerar si el archivo está corrupto o pertenecía a otro nodo
             }
         }
 
@@ -72,33 +72,68 @@ public static class NodeCertificateService
         return Convert.ToBase64String(CurrentCertificate.Export(X509ContentType.Cert));
     }
 
-    public static string SignPayload(byte[] payload)
+    public static string ExportPublicCertPem()
+    {
+        return CurrentCertificate.ExportCertificatePem();
+    }
+
+    public static string GetThumbprintSha256Hex()
+    {
+        return Convert.ToHexString(CurrentCertificate.GetCertHash(HashAlgorithmName.SHA256));
+    }
+
+    public static string SignDataPss(byte[] data)
     {
         using RSA? rsa = CurrentCertificate.GetRSAPrivateKey();
         if (rsa == null)
             throw new InvalidOperationException("El certificado X.509 del nodo no contiene clave privada RSA.");
 
-        byte[] signature = rsa.SignData(payload, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        byte[] signature = rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
         return Convert.ToBase64String(signature);
     }
 
-    public static bool VerifyPayloadSignature(byte[] payload, string signatureBase64, string publicCertBase64)
+    public static string SignPayload(byte[] payload)
     {
-        if (string.IsNullOrWhiteSpace(signatureBase64) || string.IsNullOrWhiteSpace(publicCertBase64))
+        return SignDataPss(payload);
+    }
+
+    public static bool VerifyPayloadSignature(byte[] payload, string signatureBase64, string publicCertPemOrBase64)
+    {
+        return VerifyWithPem(payload, signatureBase64, publicCertPemOrBase64);
+    }
+
+    public static bool VerifyWithPem(byte[] data, string signatureBase64, string certPemOrBase64)
+    {
+        if (data == null || string.IsNullOrWhiteSpace(signatureBase64) || string.IsNullOrWhiteSpace(certPemOrBase64))
             return false;
 
         try
         {
-            byte[] certBytes = Convert.FromBase64String(publicCertBase64);
-            byte[] sigBytes = Convert.FromBase64String(signatureBase64);
-            using var cert = X509CertificateLoader.LoadCertificate(certBytes);
+            byte[] sigBytes = Convert.FromBase64String(signatureBase64.Trim());
+            using X509Certificate2 cert = LoadCertificateFromPemOrBase64(certPemOrBase64);
             using RSA? rsa = cert.GetRSAPublicKey();
             if (rsa == null) return false;
-            return rsa.VerifyData(payload, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+            if (rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pss))
+                return true;
+
+            return rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         }
         catch
         {
             return false;
         }
+    }
+
+    public static X509Certificate2 LoadCertificateFromPemOrBase64(string certPemOrBase64)
+    {
+        string trimmed = certPemOrBase64.Trim();
+        if (trimmed.Contains("-----BEGIN CERTIFICATE-----", StringComparison.OrdinalIgnoreCase))
+        {
+            return X509Certificate2.CreateFromPem(trimmed);
+        }
+
+        byte[] raw = Convert.FromBase64String(trimmed);
+        return X509CertificateLoader.LoadCertificate(raw);
     }
 }

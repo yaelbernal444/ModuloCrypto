@@ -1,5 +1,7 @@
 using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Models;
+using ModuloCrypto.Core.Services;
+using ModuloCrypto.Security;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,8 +18,8 @@ public sealed class ParsedZipPacket
 }
 
 /// <summary>
-/// Empaqueta y desempaqueta archivos .zip compatibles con la red de 8 nodos (manifest.json + payload.bin + root_cert.cer).
-/// Soporta NODO-01 como Nodo Raíz (inicio), Nodo Intermedio (re-cifrado + hopHistory) y Nodo Final.
+/// Empaqueta y desempaqueta archivos .zip en Formato Híbrido Universal compatible con ModuloCrypto y CentroCiberseguridad.Web.
+/// Incluye manifest.json, datos.enc, payload.bin, certificado.pem y root_cert.cer.
 /// </summary>
 public static class PacketZipService
 {
@@ -34,39 +36,89 @@ public static class PacketZipService
         string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
         Directory.CreateDirectory(outDir);
 
-        string zipPath = destinationPath ?? Path.Combine(
-            outDir,
-            $"{registro.NodoRaiz}_{registro.AlgoritmoCodigo}_{registro.PacketId[..8]}.zip");
+        string sha256Hex = Convert.ToHexString(SHA256.HashData(cipherBytes));
+        string sha8 = sha256Hex.Length >= 8 ? sha256Hex[..8] : sha256Hex;
+        string cleanNode = (string.IsNullOrWhiteSpace(registro.NodoRaiz) ? NodeRuntimeState.CurrentNodeId : registro.NodoRaiz)
+            .Replace("-", "")
+            .ToUpperInvariant();
+        string cleanAlg = registro.AlgoritmoCodigo.Trim().ToUpperInvariant();
+
+        string defaultFileName = $"{cleanNode}_{cleanAlg}_{DateTime.Now:yyyyMMdd_HHmmss}_{sha8}.zip";
+        string zipPath = destinationPath ?? Path.Combine(outDir, defaultFileName);
 
         var hops = customHops ?? TryDeserializeHops(registro.RutaSaltosJson);
         if (hops.Count == 0) hops.Add(registro.NodoRaiz);
 
-        string payloadHashHex = Convert.ToHexString(SHA256.HashData(cipherBytes));
         string originalHashHex = string.IsNullOrWhiteSpace(preservedOriginalHashHex)
-            ? payloadHashHex
+            ? sha256Hex
             : preservedOriginalHashHex;
 
         string certBase64 = string.IsNullOrWhiteSpace(preservedRootCertBase64)
             ? NodeCertificateService.ExportPublicCertBase64()
             : preservedRootCertBase64;
 
-        string signature = string.IsNullOrWhiteSpace(registro.FirmaRaizBase64)
-            ? NodeCertificateService.SignPayload(Encoding.ASCII.GetBytes(originalHashHex))
+        string certPem;
+        try
+        {
+            using var certObj = NodeCertificateService.LoadCertificateFromPemOrBase64(certBase64);
+            certPem = certObj.ExportCertificatePem();
+        }
+        catch
+        {
+            certPem = NodeCertificateService.ExportPublicCertPem();
+        }
+
+        // Firma canónica de manifiesto para CentroCiberseguridad.Web: "{PacketId}|{AlgoritmoCodigo}|{sha256Hex}"
+        string canonicalManifest = $"{registro.PacketId}|{cleanAlg}|{sha256Hex}";
+        string manifestSignaturePss = NodeCertificateService.SignDataPss(Encoding.UTF8.GetBytes(canonicalManifest));
+
+        // Firma de payload (RSA-PSS-SHA256)
+        string rootSignature = string.IsNullOrWhiteSpace(registro.FirmaRaizBase64)
+            ? NodeCertificateService.SignDataPss(cipherBytes)
             : registro.FirmaRaizBase64;
+
+        string algDisplayName = CryptoCatalog.IsOfficialCode(cleanAlg)
+            ? CryptoCatalog.GetStrategy(cleanAlg).Info.DisplayName
+            : cleanAlg;
+
+        JsonElement? pubParamsElem = null;
+        if (!string.IsNullOrWhiteSpace(registro.ParametrosPublicosJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(registro.ParametrosPublicosJson);
+                pubParamsElem = doc.RootElement.Clone();
+            }
+            catch { }
+        }
 
         var manifest = new PacketManifest
         {
+            Version = "1.0",
             PacketId = registro.PacketId,
-            AlgoritmoCodigo = registro.AlgoritmoCodigo,
+            AlgoritmoCodigo = cleanAlg,
+            AlgorithmCode = cleanAlg,
+            AlgorithmName = algDisplayName,
             NombreArchivo = registro.NombreArchivo,
+            OriginalFileName = registro.NombreArchivo,
             Extension = registro.Extension,
-            ParametrosPublicosJson = registro.ParametrosPublicosJson,
+            OriginalExtension = registro.Extension,
+            OriginalSizeBytes = cipherBytes.Length,
+            PayloadMode = "file",
+            ParametrosPublicosJson = string.IsNullOrWhiteSpace(registro.ParametrosPublicosJson) ? "{}" : registro.ParametrosPublicosJson,
+            PublicParameters = pubParamsElem,
             LinkDescifradoRemoto = registro.LinkDescifradoRemoto,
             NodoRaiz = registro.NodoRaiz,
-            FirmaRaizBase64 = signature,
+            SourceNode = registro.NodoRaiz,
+            SourceIp = NodeRuntimeState.LocalIpAddress,
+            FirmaRaizBase64 = rootSignature,
             CertificadoRaizBase64 = certBase64,
+            CertificateThumbprintSha256 = NodeCertificateService.GetThumbprintSha256Hex(),
+            SignatureAlgorithm = "RSA-PSS-SHA256",
+            ManifestSignatureBase64 = manifestSignaturePss,
             RutaSaltos = hops,
-            PayloadSha256 = payloadHashHex,
+            PayloadSha256 = sha256Hex,
+            EncryptedSha256 = sha256Hex,
             OriginalHashSha256 = originalHashHex,
             TimestampUtc = DateTime.UtcNow
         };
@@ -75,14 +127,27 @@ public static class PacketZipService
 
         using var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create);
 
+        // 1. manifest.json
         var manifestEntry = archive.CreateEntry("manifest.json");
-        using (var sw = new StreamWriter(manifestEntry.Open(), Encoding.UTF8))
+        using (var sw = new StreamWriter(manifestEntry.Open(), new UTF8Encoding(false)))
             sw.Write(JsonSerializer.Serialize(manifest, PrettyJson));
 
+        // 2. datos.enc (CentroCiberseguridad.Web)
+        var datosEntry = archive.CreateEntry("datos.enc");
+        using (var ds = datosEntry.Open())
+            ds.Write(cipherBytes, 0, cipherBytes.Length);
+
+        // 3. payload.bin (ModuloCrypto)
         var payloadEntry = archive.CreateEntry("payload.bin");
         using (var ps = payloadEntry.Open())
             ps.Write(cipherBytes, 0, cipherBytes.Length);
 
+        // 4. certificado.pem (CentroCiberseguridad.Web)
+        var pemEntry = archive.CreateEntry("certificado.pem");
+        using (var swPem = new StreamWriter(pemEntry.Open(), new UTF8Encoding(false)))
+            swPem.Write(certPem);
+
+        // 5. root_cert.cer (ModuloCrypto)
         var certEntry = archive.CreateEntry("root_cert.cer");
         using (var cs = certEntry.Open())
         {
@@ -97,10 +162,14 @@ public static class PacketZipService
     {
         using var archive = ZipFile.OpenRead(zipPath);
 
-        var manifestEntry = archive.GetEntry("manifest.json")
+        var manifestEntry = archive.Entries.FirstOrDefault(e =>
+            e.FullName.Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidDataException("El paquete .zip no contiene manifest.json.");
-        var payloadEntry = archive.GetEntry("payload.bin")
-            ?? throw new InvalidDataException("El paquete .zip no contiene payload.bin.");
+
+        var payloadEntry = archive.Entries.FirstOrDefault(e =>
+            e.FullName.Equals("datos.enc", StringComparison.OrdinalIgnoreCase) ||
+            e.FullName.Equals("payload.bin", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidDataException("El paquete .zip no contiene datos.enc ni payload.bin.");
 
         PacketManifest manifest;
         using (var sr = new StreamReader(manifestEntry.Open(), Encoding.UTF8))
@@ -119,31 +188,100 @@ public static class PacketZipService
             payload = ms.ToArray();
         }
 
-        string certBase64 = manifest.CertificadoRaizBase64;
-        if (string.IsNullOrWhiteSpace(certBase64))
+        // Normalización de campos entre CentroCiberseguridad.Web y ModuloCrypto
+        if (string.IsNullOrWhiteSpace(manifest.NodoRaiz))
+            manifest.NodoRaiz = "NODO-EXT";
+
+        if (string.IsNullOrWhiteSpace(manifest.NombreArchivo))
+            manifest.NombreArchivo = "datos.enc";
+
+        if (string.IsNullOrWhiteSpace(manifest.Extension))
+            manifest.Extension = Path.GetExtension(manifest.NombreArchivo);
+        if (string.IsNullOrWhiteSpace(manifest.Extension))
+            manifest.Extension = ".bin";
+
+        if ((string.IsNullOrWhiteSpace(manifest.ParametrosPublicosJson) || manifest.ParametrosPublicosJson == "{}")
+            && manifest.PublicParameters.HasValue
+            && manifest.PublicParameters.Value.ValueKind != JsonValueKind.Undefined
+            && manifest.PublicParameters.Value.ValueKind != JsonValueKind.Null)
         {
-            var certEntry = archive.GetEntry("root_cert.cer");
-            if (certEntry != null)
+            manifest.ParametrosPublicosJson = manifest.PublicParameters.Value.GetRawText();
+        }
+
+        if (string.IsNullOrWhiteSpace(manifest.FirmaRaizBase64) && !string.IsNullOrWhiteSpace(manifest.ManifestSignatureBase64))
+            manifest.FirmaRaizBase64 = manifest.ManifestSignatureBase64;
+
+        if (manifest.RutaSaltos == null || manifest.RutaSaltos.Count == 0)
+            manifest.RutaSaltos = new List<string> { manifest.NodoRaiz };
+
+        // Lectura de certificado desde certificado.pem, root_cert.cer o CertificadoRaizBase64
+        string certSource = manifest.CertificadoRaizBase64;
+        var pemEntry = archive.Entries.FirstOrDefault(e => e.FullName.Equals("certificado.pem", StringComparison.OrdinalIgnoreCase));
+        if (pemEntry != null)
+        {
+            using var sr = new StreamReader(pemEntry.Open(), Encoding.UTF8);
+            string pemText = sr.ReadToEnd();
+            if (!string.IsNullOrWhiteSpace(pemText))
+            {
+                certSource = pemText;
+                try
+                {
+                    using var cert = NodeCertificateService.LoadCertificateFromPemOrBase64(pemText);
+                    manifest.CertificadoRaizBase64 = Convert.ToBase64String(cert.Export(
+                        System.Security.Cryptography.X509Certificates.X509ContentType.Cert));
+                }
+                catch { }
+            }
+        }
+        else if (string.IsNullOrWhiteSpace(certSource))
+        {
+            var cerEntry = archive.Entries.FirstOrDefault(e => e.FullName.Equals("root_cert.cer", StringComparison.OrdinalIgnoreCase));
+            if (cerEntry != null)
             {
                 using var ms = new MemoryStream();
-                certEntry.Open().CopyTo(ms);
-                certBase64 = Convert.ToBase64String(ms.ToArray());
+                cerEntry.Open().CopyTo(ms);
+                certSource = Convert.ToBase64String(ms.ToArray());
+                manifest.CertificadoRaizBase64 = certSource;
             }
-            manifest.CertificadoRaizBase64 = certBase64;
         }
 
-        // Verifica firma sobre payload directo o sobre OriginalHashSha256 (cuando pasa por saltos intermedios re-cifrados)
-        bool sigValid = NodeCertificateService.VerifyPayloadSignature(payload, manifest.FirmaRaizBase64, certBase64);
-        if (!sigValid && !string.IsNullOrWhiteSpace(manifest.OriginalHashSha256))
+        string computedSha256 = Convert.ToHexString(SHA256.HashData(payload));
+        string declaredSha = !string.IsNullOrWhiteSpace(manifest.PayloadSha256) ? manifest.PayloadSha256 : computedSha256;
+        bool hashValid = string.Equals(declaredSha, computedSha256, StringComparison.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(manifest.PayloadSha256))
+            manifest.PayloadSha256 = computedSha256;
+
+        // Validación dual de firma X.509:
+        // 1) ManifestSignatureBase64 contra "{PacketId}|{AlgorithmCode}|{EncryptedSha256}" o payload crudo
+        // 2) FirmaRaizBase64 contra payload crudo o OriginalHashSha256
+        bool sigValid = false;
+
+        if (!string.IsNullOrWhiteSpace(manifest.ManifestSignatureBase64))
         {
-            sigValid = NodeCertificateService.VerifyPayloadSignature(
-                Encoding.ASCII.GetBytes(manifest.OriginalHashSha256),
-                manifest.FirmaRaizBase64,
-                certBase64);
+            string canonicalUpper = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToUpperInvariant()}";
+            string canonicalLower = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToLowerInvariant()}";
+            string canonicalRaw = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha}";
+
+            sigValid =
+                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalRaw), manifest.ManifestSignatureBase64, certSource) ||
+                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalUpper), manifest.ManifestSignatureBase64, certSource) ||
+                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalLower), manifest.ManifestSignatureBase64, certSource) ||
+                NodeCertificateService.VerifyWithPem(payload, manifest.ManifestSignatureBase64, certSource);
         }
 
-        bool hashValid = string.IsNullOrWhiteSpace(manifest.PayloadSha256) ||
-                         string.Equals(manifest.PayloadSha256, Convert.ToHexString(SHA256.HashData(payload)), StringComparison.OrdinalIgnoreCase);
+        if (!sigValid && !string.IsNullOrWhiteSpace(manifest.FirmaRaizBase64))
+        {
+            sigValid = NodeCertificateService.VerifyWithPem(payload, manifest.FirmaRaizBase64, certSource);
+
+            if (!sigValid && !string.IsNullOrWhiteSpace(manifest.OriginalHashSha256))
+            {
+                sigValid = NodeCertificateService.VerifyWithPem(
+                    Encoding.ASCII.GetBytes(manifest.OriginalHashSha256),
+                    manifest.FirmaRaizBase64,
+                    certSource);
+            }
+        }
 
         return new ParsedZipPacket
         {
