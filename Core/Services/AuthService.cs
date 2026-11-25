@@ -1,22 +1,105 @@
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ModuloCrypto.Core.Services;
 
+/// <summary>
+/// Servicio de autenticación de operadores con PBKDF2-SHA256 (100,000 iteraciones + Salt aleatorio de 16 bytes)
+/// y comparación en tiempo constante (FixedTimeEquals).
+/// </summary>
 public static class AuthService
 {
-    public static Usuario? Authenticate(string username, string password)
+    private const string Pbkdf2Prefix = "PBKDF2$";
+    private const int SaltSizeBytes = 16;
+    private const int HashSizeBytes = 32;
+    private const int Pbkdf2Iterations = 100_000;
+
+    public static string HashPasswordPbkdf2(string password)
+    {
+        byte[] salt = RandomNumberGenerator.GetBytes(SaltSizeBytes);
+        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(
+            Encoding.UTF8.GetBytes(password),
+            salt,
+            Pbkdf2Iterations,
+            HashAlgorithmName.SHA256,
+            HashSizeBytes);
+
+        return $"{Pbkdf2Prefix}{Convert.ToBase64String(salt)}${Convert.ToBase64String(hash)}";
+    }
+
+    public static bool VerifyPassword(string password, string storedHash, out bool requiresUpgrade)
+    {
+        requiresUpgrade = false;
+        if (string.IsNullOrEmpty(password) || string.IsNullOrWhiteSpace(storedHash))
+            return false;
+
+        if (storedHash.StartsWith(Pbkdf2Prefix, StringComparison.Ordinal))
+        {
+            string[] parts = storedHash.Split('$');
+            if (parts.Length != 3) return false;
+
+            try
+            {
+                byte[] salt = Convert.FromBase64String(parts[1]);
+                byte[] expectedHash = Convert.FromBase64String(parts[2]);
+                byte[] computedHash = Rfc2898DeriveBytes.Pbkdf2(
+                    Encoding.UTF8.GetBytes(password),
+                    salt,
+                    Pbkdf2Iterations,
+                    HashAlgorithmName.SHA256,
+                    expectedHash.Length);
+
+                return CryptographicOperations.FixedTimeEquals(computedHash, expectedHash);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Retrocompatibilidad de solo lectura para hashes SHA-256 hex previos (se migran a PBKDF2 al iniciar sesión)
+        try
+        {
+            byte[] legacyExpected = Convert.FromHexString(storedHash.Trim());
+            byte[] legacyComputed = SHA256.HashData(Encoding.UTF8.GetBytes(password));
+            if (CryptographicOperations.FixedTimeEquals(legacyComputed, legacyExpected))
+            {
+                requiresUpgrade = true;
+                return true;
+            }
+        }
+        catch
+        {
+            // Formato inválido
+        }
+
+        return false;
+    }
+
+    public static Usuario? Authenticate(string username, string password, string? customDatabasePath = null)
     {
         if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
             return null;
 
         string normalized = username.Trim();
-        string hash = AppDbContext.ComputeSha256(password);
 
-        using var db = new AppDbContext();
-        return db.Usuarios.FirstOrDefault(u =>
-            u.NombreUsuario.ToLower() == normalized.ToLower() &&
-            u.PasswordHash == hash);
+        using var db = new AppDbContext(customDatabasePath ?? AppDbContext.DatabasePath);
+        var user = db.Usuarios.FirstOrDefault(u => u.NombreUsuario.ToLower() == normalized.ToLower());
+        if (user == null)
+            return null;
+
+        if (!VerifyPassword(password, user.PasswordHash, out bool requiresUpgrade))
+            return null;
+
+        if (requiresUpgrade)
+        {
+            user.PasswordHash = HashPasswordPbkdf2(password);
+            db.SaveChanges();
+        }
+
+        return user;
     }
 
     public static (bool Success, string Message, Usuario? User) Register(
@@ -24,7 +107,8 @@ public static class AuthService
         string username,
         string password,
         string nodoAsignado = "NODO-01",
-        string rol = "Operador Tor")
+        string rol = "Operador Tor",
+        string? customDatabasePath = null)
     {
         if (string.IsNullOrWhiteSpace(nombreCompleto) || nombreCompleto.Trim().Length < 3)
             return (false, "Ingresa tu nombre completo (mínimo 3 caracteres).", null);
@@ -38,7 +122,7 @@ public static class AuthService
         string normalizedUser = username.Trim();
         string normalizedName = nombreCompleto.Trim();
 
-        using var db = new AppDbContext();
+        using var db = new AppDbContext(customDatabasePath ?? AppDbContext.DatabasePath);
 
         if (db.Usuarios.Any(u => u.NombreUsuario.ToLower() == normalizedUser.ToLower()))
             return (false, "Ese nombre de usuario ya está registrado.", null);
@@ -47,7 +131,7 @@ public static class AuthService
         {
             NombreCompleto = normalizedName,
             NombreUsuario = normalizedUser,
-            PasswordHash = AppDbContext.ComputeSha256(password),
+            PasswordHash = HashPasswordPbkdf2(password),
             NodoAsignado = string.IsNullOrWhiteSpace(nodoAsignado) ? "NODO-01" : nodoAsignado.Trim().ToUpperInvariant(),
             Rol = string.IsNullOrWhiteSpace(rol) ? "Operador Tor" : rol.Trim(),
             FechaRegistro = DateTime.Now

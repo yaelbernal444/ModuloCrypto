@@ -9,6 +9,18 @@ public class AppDbContext : DbContext
 {
     public static readonly string DatabasePath = Path.Combine(AppContext.BaseDirectory, "ModuloCrypto.db");
 
+    private readonly string _connectionDbPath;
+
+    public AppDbContext()
+    {
+        _connectionDbPath = DatabasePath;
+    }
+
+    public AppDbContext(string customDatabasePath)
+    {
+        _connectionDbPath = string.IsNullOrWhiteSpace(customDatabasePath) ? DatabasePath : customDatabasePath;
+    }
+
     public DbSet<Usuario> Usuarios => Set<Usuario>();
     public DbSet<RegistroCifrado> RegistrosCifrados => Set<RegistroCifrado>();
     public DbSet<SolicitudEntrante> SolicitudesEntrantes => Set<SolicitudEntrante>();
@@ -17,7 +29,7 @@ public class AppDbContext : DbContext
     {
         if (!optionsBuilder.IsConfigured)
         {
-            optionsBuilder.UseSqlite($"Data Source={DatabasePath}");
+            optionsBuilder.UseSqlite($"Data Source={_connectionDbPath}");
         }
     }
 
@@ -49,9 +61,12 @@ public class AppDbContext : DbContext
         });
     }
 
-    public static void InitializeDatabase()
+    /// <summary>
+    /// Inicializa el esquema SQLite sin sembrar usuarios ni contraseñas por defecto (Seguridad para repositorio público).
+    /// </summary>
+    public static void InitializeDatabase(string? customDatabasePath = null)
     {
-        using var db = new AppDbContext();
+        using var db = new AppDbContext(customDatabasePath ?? DatabasePath);
         db.Database.EnsureCreated();
 
         // Asegurar migración transparente si la tabla Usuarios ya existía sin NombreCompleto
@@ -64,33 +79,9 @@ public class AppDbContext : DbContext
             // La columna ya existe
         }
 
-        if (!db.Usuarios.Any())
+        // Si había usuarios creados previamente con NODO-04, actualizarlos a NODO-01 sin insertar usuarios nuevos
+        if (db.Usuarios.Any())
         {
-            db.Usuarios.AddRange(
-                new Usuario
-                {
-                    NombreCompleto = "Yael Bernal",
-                    NombreUsuario = "admin",
-                    PasswordHash = ComputeSha256("admin123"),
-                    NodoAsignado = "NODO-01",
-                    Rol = "Arquitecto Seguridad",
-                    FechaRegistro = DateTime.Now
-                },
-                new Usuario
-                {
-                    NombreCompleto = "Operador Red Tor",
-                    NombreUsuario = "operador",
-                    PasswordHash = ComputeSha256("crypto2026"),
-                    NodoAsignado = "NODO-01",
-                    Rol = "Operador Tor",
-                    FechaRegistro = DateTime.Now
-                }
-            );
-            db.SaveChanges();
-        }
-        else
-        {
-            // Actualizar registros existentes a NODO-01 y asegurar NombreCompleto real
             bool changed = false;
             foreach (var u in db.Usuarios.ToList())
             {
@@ -101,9 +92,7 @@ public class AppDbContext : DbContext
                 }
                 if (string.IsNullOrWhiteSpace(u.NombreCompleto))
                 {
-                    u.NombreCompleto = u.NombreUsuario.Equals("admin", StringComparison.OrdinalIgnoreCase)
-                        ? "Yael Bernal"
-                        : u.NombreUsuario;
+                    u.NombreCompleto = u.NombreUsuario;
                     changed = true;
                 }
             }

@@ -13,13 +13,14 @@ public sealed class ParsedZipPacket
 {
     public PacketManifest Manifest { get; init; } = new();
     public byte[] PayloadBytes { get; init; } = Array.Empty<byte>();
+    public bool HasSignature { get; init; }
     public bool SignatureValid { get; init; }
     public bool IntegrityValid { get; init; }
 }
 
 /// <summary>
 /// Empaqueta y desempaqueta archivos .zip en Formato Híbrido Universal compatible con ModuloCrypto y CentroCiberseguridad.Web.
-/// Incluye manifest.json, datos.enc, payload.bin, certificado.pem y root_cert.cer.
+/// Incluye manifest.json, datos.enc, payload.bin, certificado.pem y root_cert.cer. Soporta modo tolerante sin firma X.509.
 /// </summary>
 public static class PacketZipService
 {
@@ -163,22 +164,37 @@ public static class PacketZipService
         using var archive = ZipFile.OpenRead(zipPath);
 
         var manifestEntry = archive.Entries.FirstOrDefault(e =>
-            e.FullName.Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidDataException("El paquete .zip no contiene manifest.json.");
+            e.FullName.Equals("manifest.json", StringComparison.OrdinalIgnoreCase));
 
         var payloadEntry = archive.Entries.FirstOrDefault(e =>
             e.FullName.Equals("datos.enc", StringComparison.OrdinalIgnoreCase) ||
             e.FullName.Equals("payload.bin", StringComparison.OrdinalIgnoreCase))
+            ?? archive.Entries.FirstOrDefault(e =>
+                !e.FullName.EndsWith(".json", StringComparison.OrdinalIgnoreCase) &&
+                !e.FullName.EndsWith(".pem", StringComparison.OrdinalIgnoreCase) &&
+                !e.FullName.EndsWith(".cer", StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidDataException("El paquete .zip no contiene datos.enc ni payload.bin.");
 
         PacketManifest manifest;
-        using (var sr = new StreamReader(manifestEntry.Open(), Encoding.UTF8))
+        if (manifestEntry != null)
         {
+            using var sr = new StreamReader(manifestEntry.Open(), Encoding.UTF8);
             string json = sr.ReadToEnd();
             manifest = JsonSerializer.Deserialize<PacketManifest>(json, new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true
-            }) ?? throw new InvalidDataException("manifest.json inválido.");
+            }) ?? new PacketManifest();
+        }
+        else
+        {
+            manifest = new PacketManifest
+            {
+                PacketId = Guid.NewGuid().ToString(),
+                AlgoritmoCodigo = "AESGCM",
+                NombreArchivo = payloadEntry.Name,
+                Extension = Path.GetExtension(payloadEntry.Name),
+                NodoRaiz = "NODO-EXT"
+            };
         }
 
         byte[] payload;
@@ -214,8 +230,8 @@ public static class PacketZipService
         if (manifest.RutaSaltos == null || manifest.RutaSaltos.Count == 0)
             manifest.RutaSaltos = new List<string> { manifest.NodoRaiz };
 
-        // Lectura de certificado desde certificado.pem, root_cert.cer o CertificadoRaizBase64
-        string certSource = manifest.CertificadoRaizBase64;
+        // Lectura tolerante de certificado desde certificado.pem, root_cert.cer o CertificadoRaizBase64
+        string certSource = manifest.CertificadoRaizBase64 ?? string.Empty;
         var pemEntry = archive.Entries.FirstOrDefault(e => e.FullName.Equals("certificado.pem", StringComparison.OrdinalIgnoreCase));
         if (pemEntry != null)
         {
@@ -252,34 +268,38 @@ public static class PacketZipService
         if (string.IsNullOrWhiteSpace(manifest.PayloadSha256))
             manifest.PayloadSha256 = computedSha256;
 
-        // Validación dual de firma X.509:
-        // 1) ManifestSignatureBase64 contra "{PacketId}|{AlgorithmCode}|{EncryptedSha256}" o payload crudo
-        // 2) FirmaRaizBase64 contra payload crudo o OriginalHashSha256
+        bool hasSignature = !string.IsNullOrWhiteSpace(certSource) &&
+                            (!string.IsNullOrWhiteSpace(manifest.ManifestSignatureBase64) ||
+                             !string.IsNullOrWhiteSpace(manifest.FirmaRaizBase64));
+
+        // Modo Tolerante: si no hay certificado o firma, no lanza excepción; simplemente marca SignatureValid = false
         bool sigValid = false;
-
-        if (!string.IsNullOrWhiteSpace(manifest.ManifestSignatureBase64))
+        if (hasSignature)
         {
-            string canonicalUpper = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToUpperInvariant()}";
-            string canonicalLower = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToLowerInvariant()}";
-            string canonicalRaw = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha}";
-
-            sigValid =
-                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalRaw), manifest.ManifestSignatureBase64, certSource) ||
-                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalUpper), manifest.ManifestSignatureBase64, certSource) ||
-                NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalLower), manifest.ManifestSignatureBase64, certSource) ||
-                NodeCertificateService.VerifyWithPem(payload, manifest.ManifestSignatureBase64, certSource);
-        }
-
-        if (!sigValid && !string.IsNullOrWhiteSpace(manifest.FirmaRaizBase64))
-        {
-            sigValid = NodeCertificateService.VerifyWithPem(payload, manifest.FirmaRaizBase64, certSource);
-
-            if (!sigValid && !string.IsNullOrWhiteSpace(manifest.OriginalHashSha256))
+            if (!string.IsNullOrWhiteSpace(manifest.ManifestSignatureBase64))
             {
-                sigValid = NodeCertificateService.VerifyWithPem(
-                    Encoding.ASCII.GetBytes(manifest.OriginalHashSha256),
-                    manifest.FirmaRaizBase64,
-                    certSource);
+                string canonicalUpper = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToUpperInvariant()}";
+                string canonicalLower = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha.ToLowerInvariant()}";
+                string canonicalRaw = $"{manifest.PacketId}|{manifest.AlgoritmoCodigo}|{declaredSha}";
+
+                sigValid =
+                    NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalRaw), manifest.ManifestSignatureBase64, certSource) ||
+                    NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalUpper), manifest.ManifestSignatureBase64, certSource) ||
+                    NodeCertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonicalLower), manifest.ManifestSignatureBase64, certSource) ||
+                    NodeCertificateService.VerifyWithPem(payload, manifest.ManifestSignatureBase64, certSource);
+            }
+
+            if (!sigValid && !string.IsNullOrWhiteSpace(manifest.FirmaRaizBase64))
+            {
+                sigValid = NodeCertificateService.VerifyWithPem(payload, manifest.FirmaRaizBase64, certSource);
+
+                if (!sigValid && !string.IsNullOrWhiteSpace(manifest.OriginalHashSha256))
+                {
+                    sigValid = NodeCertificateService.VerifyWithPem(
+                        Encoding.ASCII.GetBytes(manifest.OriginalHashSha256),
+                        manifest.FirmaRaizBase64,
+                        certSource);
+                }
             }
         }
 
@@ -287,6 +307,7 @@ public static class PacketZipService
         {
             Manifest = manifest,
             PayloadBytes = payload,
+            HasSignature = hasSignature,
             SignatureValid = sigValid,
             IntegrityValid = hashValid
         };

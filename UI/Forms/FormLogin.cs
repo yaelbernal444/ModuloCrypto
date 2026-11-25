@@ -141,7 +141,8 @@ public sealed class FormLogin : Form
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
             Font = new Font("Segoe UI", 11.5f),
-            Text = "admin"
+            Text = "",
+            PlaceholderText = "Ingresa tu usuario"
         };
 
         var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 224);
@@ -154,7 +155,8 @@ public sealed class FormLogin : Form
             BorderStyle = BorderStyle.FixedSingle,
             Font = new Font("Segoe UI", 11.5f),
             UseSystemPasswordChar = true,
-            Text = "admin123"
+            Text = "",
+            PlaceholderText = "Ingresa tu contraseña"
         };
 
         _lblFeedback = new Label

@@ -5,11 +5,13 @@ using ModuloCrypto.Network;
 using ModuloCrypto.Security;
 using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Theme;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Windows.Forms;
 
 namespace ModuloCrypto.UI.Forms;
@@ -17,6 +19,16 @@ namespace ModuloCrypto.UI.Forms;
 public partial class FormDashboard : Form
 {
     public bool SignOutRequested { get; private set; }
+
+    private static readonly HashSet<string> PlainTextExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".txt", ".json", ".csv", ".xml", ".md", ".log", ".cs", ".html", ".css", ".js"
+    };
+
+    private static readonly HashSet<string> ImageViewerExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".png", ".jpg", ".jpeg", ".bmp"
+    };
 
     private readonly Usuario _currentUser;
     private readonly string _userFullName;
@@ -41,6 +53,7 @@ public partial class FormDashboard : Form
     private NeonButton _btnModeText = null!;
     private NeonButton _btnModeHex = null!;
     private NeonButton _btnModeImg = null!;
+    private CheckBox _chkAutoDownloadBinary = null!;
     private string _viewerMode = "TEXT";
 
     // Metadata (Tor Traceability)
@@ -58,6 +71,8 @@ public partial class FormDashboard : Form
     private string _currentExtension = ".txt";
     private RegistroCifrado? _activeRecord;
     private bool _isShowingEncrypted;
+    private string? _lastSavedDecryptedPath;
+    private string? _binarySummaryReport;
 
     // Contexto para ciclo bidireccional (Nodo Intermedio / Relay conservando rootOrigin)
     private string? _relayRootOrigin;
@@ -76,7 +91,7 @@ public partial class FormDashboard : Form
             ? currentUser.NombreUsuario
             : currentUser.NombreCompleto;
 
-        Text = "ModuloCrypto — NODO-01";
+        Text = $"ModuloCrypto — NODO-01 (:{NodeRuntimeState.ApiPort})";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1220, 740);
@@ -246,7 +261,7 @@ public partial class FormDashboard : Form
             btn.Location = new Point(12, curY);
             btn.Size = new Size(236, 46);
             navContainer.Controls.Add(btn);
-            curY += 46 + 12; // 12px exactos entre cada botón
+            curY += 46 + 12;
         }
         _navSolicitudes = _navButtons["inbox"];
 
@@ -274,7 +289,6 @@ public partial class FormDashboard : Form
             e.Graphics.DrawLine(pen, 0, topbar.Height - 1, topbar.Width, topbar.Height - 1);
         };
 
-        // Saludo con NombreCompleto real y subtítulo NODO-01 • Estado: Operativo
         var greetingPanel = new Panel
         {
             Dock = DockStyle.Left,
@@ -304,7 +318,6 @@ public partial class FormDashboard : Form
         greetingPanel.Controls.Add(lblWelcome);
         greetingPanel.Controls.Add(lblSubWelcome);
 
-        // Selector del algoritmo activo (21 oficiales exclusivamente)
         var algPanel = new Panel
         {
             Dock = DockStyle.Right,
@@ -335,7 +348,6 @@ public partial class FormDashboard : Form
         algPanel.Controls.Add(lblAlgCap);
         algPanel.Controls.Add(_cmbAlgorithm);
 
-        // Status pills centrales (autoajustadas para que jamás se corten con "...")
         var pillsFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -431,8 +443,8 @@ public partial class FormDashboard : Form
             RowCount = 1,
             BackColor = HologramTheme.BackgroundBase
         };
-        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52f));
-        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48f));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 51f));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49f));
         split.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
         // === COLUMNA IZQUIERDA / CENTRO: HOLOGRAMA 3D BINARIO + CONTROLES PRINCIPALES ===
@@ -472,7 +484,6 @@ public partial class FormDashboard : Form
         holoCard.Controls.Add(_hologram);
         holoCard.Controls.Add(_lblAlgDesc);
 
-        // Barra inferior de acciones criptográficas (Inicio, Intermedio/Relay, Final)
         var actionCard = new GlassPanel
         {
             Dock = DockStyle.Bottom,
@@ -495,7 +506,6 @@ public partial class FormDashboard : Form
         actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
 
-        // Fila 0: Passphrase opcional + Selector nodo destino (NODO-01 a NODO-08)
         _txtPassphrase = HologramTheme.CreateDarkTextBox();
         _txtPassphrase.Dock = DockStyle.Fill;
         _txtPassphrase.PlaceholderText = "Clave opcional (o auto-generar llave criptográfica)";
@@ -513,7 +523,6 @@ public partial class FormDashboard : Form
         RefreshTargetPeerCombo();
         actionGrid.Controls.Add(_cmbTargetPeer, 2, 0);
 
-        // Fila 1: Cargar Archivo, Cifrar (Iniciar / Raíz), Re-Cifrar Salto (Nodo Intermedio)
         var btnLoadFile = new NeonButton
         {
             Text = "📂 Cargar Archivo",
@@ -548,7 +557,6 @@ public partial class FormDashboard : Form
         actionGrid.Controls.Add(btnEncrypt, 1, 1);
         actionGrid.Controls.Add(btnRelayEncrypt, 2, 1);
 
-        // Fila 2: Descifrar Local, Descifrar Remoto, Enviar .ZIP a IP
         var btnDecryptLocal = new NeonButton
         {
             Text = "🔓 Descifrar Local",
@@ -590,7 +598,7 @@ public partial class FormDashboard : Form
         leftCol.Controls.Add(spacer);
         leftCol.Controls.Add(actionCard);
 
-        // === COLUMNA DERECHA: VISOR (TEXTO/HEX/IMAGEN) + TRAZABILIDAD TOR • METADATOS ===
+        // === COLUMNA DERECHA: VISOR (TEXTO/HEX/IMAGEN + DESCARGA/APERTURA) + TRAZABILIDAD TOR ===
         var rightCol = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -599,10 +607,10 @@ public partial class FormDashboard : Form
             Padding = new Padding(8, 0, 0, 0),
             BackColor = HologramTheme.BackgroundBase
         };
-        rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 53f));
-        rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 47f));
+        rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 55f));
+        rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 45f));
 
-        // Top Right Card: Visor Texto / Hex / Imagen
+        // Top Right Card: Visor Texto / Hex / Imagen + Barra Multimedia/Binarios
         var viewerCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -611,11 +619,11 @@ public partial class FormDashboard : Form
             Margin = new Padding(0, 0, 0, 12)
         };
 
-        var viewerHeader = new Panel { Dock = DockStyle.Top, Height = 36, BackColor = HologramTheme.PanelGlass };
+        var viewerHeader = new Panel { Dock = DockStyle.Top, Height = 34, BackColor = HologramTheme.PanelGlass };
         _lblFileBadge = new Label
         {
             Text = "VISOR DE CARGA • mensaje_seguro.txt",
-            Font = new Font("Segoe UI Semibold", 9.6f, FontStyle.Bold),
+            Font = new Font("Segoe UI Semibold", 9.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -635,24 +643,69 @@ public partial class FormDashboard : Form
         _btnModeHex = new NeonButton { Text = "Hex", Size = new Size(66, 28), CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Font = new Font("Segoe UI Semibold", 8.3f) };
         _btnModeImg = new NeonButton { Text = "Imagen", Size = new Size(74, 28), CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Font = new Font("Segoe UI Semibold", 8.3f) };
 
-        _btnModeText.Click += (_, _) => SetViewerMode("TEXT");
-        _btnModeHex.Click += (_, _) => SetViewerMode("HEX");
-        _btnModeImg.Click += (_, _) => SetViewerMode("IMG");
+        _btnModeText.Click += (_, _) => { _binarySummaryReport = null; SetViewerMode("TEXT"); };
+        _btnModeHex.Click += (_, _) => { SetViewerMode("HEX"); };
+        _btnModeImg.Click += (_, _) => { SetViewerMode("IMG"); };
         modeButtons.Controls.AddRange(new Control[] { _btnModeText, _btnModeHex, _btnModeImg });
 
         viewerHeader.Controls.Add(_lblFileBadge);
         viewerHeader.Controls.Add(modeButtons);
 
-        var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 0), BackColor = HologramTheme.PanelGlass };
+        // Segunda barra del Visor: Botones Descargar Archivo, Abrir Archivo y CheckBox Auto-descarga
+        var fileActionsBar = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 38,
+            Padding = new Padding(0, 4, 0, 2),
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        var btnDownloadFile = new NeonButton
+        {
+            Text = "💾 Descargar Archivo",
+            Variant = NeonButtonVariant.Cyan,
+            Location = new Point(0, 4),
+            Size = new Size(156, 30),
+            CornerRadius = 8,
+            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+        };
+        btnDownloadFile.Click += (_, _) => HandleDownloadCurrentFile();
+
+        var btnOpenFile = new NeonButton
+        {
+            Text = "▶ Abrir Archivo",
+            Variant = NeonButtonVariant.Success,
+            Location = new Point(164, 4),
+            Size = new Size(134, 30),
+            CornerRadius = 8,
+            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+        };
+        btnOpenFile.Click += (_, _) => HandleOpenCurrentFileInWindows();
+
+        _chkAutoDownloadBinary = new CheckBox
+        {
+            Text = "Auto-descargar multimedia/binarios al descifrar",
+            Checked = true,
+            AutoSize = true,
+            Location = new Point(308, 9),
+            Font = new Font("Segoe UI", 8.5f),
+            ForeColor = HologramTheme.HologramViolet,
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, btnOpenFile, _chkAutoDownloadBinary });
+
+        var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 6, 0, 0), BackColor = HologramTheme.PanelGlass };
         _txtDataViewer = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: false, mono: true);
         _txtDataViewer.Dock = DockStyle.Fill;
         _txtDataViewer.TextChanged += (_, _) =>
         {
-            if (_viewerMode == "TEXT" && !_isShowingEncrypted && _txtDataViewer.Focused)
+            if (_viewerMode == "TEXT" && !_isShowingEncrypted && _binarySummaryReport == null && _txtDataViewer.Focused)
             {
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
                 _currentFileName = "mensaje_manual.txt";
                 _currentExtension = ".txt";
+                _lastSavedDecryptedPath = null;
                 _lblFileBadge.Text = $"VISOR DE CARGA • {_currentFileName} ({_currentBytes.Length} B)";
             }
         };
@@ -669,9 +722,10 @@ public partial class FormDashboard : Form
         viewerBody.Controls.Add(_picImageViewer);
 
         viewerCard.Controls.Add(viewerBody);
+        viewerCard.Controls.Add(fileActionsBar);
         viewerCard.Controls.Add(viewerHeader);
 
-        // Bottom Right Card: TRAZABILIDAD TOR • METADATOS (sin textos cortados)
+        // Bottom Right Card: TRAZABILIDAD TOR • METADATOS
         var metaCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -696,7 +750,7 @@ public partial class FormDashboard : Form
             Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Right,
-            Width = 210,
+            Width = 235,
             TextAlign = ContentAlignment.MiddleRight,
             BackColor = HologramTheme.PanelGlass
         };
@@ -796,7 +850,7 @@ public partial class FormDashboard : Form
 
     private void RenderCurrentBytesInViewer()
     {
-        _lblFileBadge.Text = $"VISOR • {_currentFileName} ({_currentBytes.Length:N0} bytes)" +
+        _lblFileBadge.Text = $"VISOR • {_currentFileName} ({FormatFileSize(_currentBytes.Length)})" +
                              (_isShowingEncrypted ? " [CIFRADO]" : " [PLANO]");
 
         if (_viewerMode == "IMG")
@@ -852,6 +906,13 @@ public partial class FormDashboard : Form
         }
         else
         {
+            if (!_isShowingEncrypted && !string.IsNullOrEmpty(_binarySummaryReport))
+            {
+                _txtDataViewer.ReadOnly = true;
+                _txtDataViewer.Text = _binarySummaryReport;
+                return;
+            }
+
             _txtDataViewer.ReadOnly = _isShowingEncrypted;
             if (_isShowingEncrypted)
             {
@@ -870,27 +931,103 @@ public partial class FormDashboard : Form
         using var ofd = new OpenFileDialog
         {
             Title = "Seleccionar archivo para cifrar o inspeccionar",
-            Filter = "Todos los archivos (*.*)|*.*|Imágenes (*.png;*.bmp;*.jpg)|*.png;*.bmp;*.jpg|Texto / JSON (*.txt;*.json)|*.txt;*.json"
+            Filter = "Todos los archivos (*.*)|*.*|Multimedia y Documentos (*.mp4;*.mkv;*.avi;*.mp3;*.wav;*.pdf;*.docx;*.xlsx;*.pptx;*.zip)|*.mp4;*.mkv;*.avi;*.mp3;*.wav;*.pdf;*.docx;*.xlsx;*.pptx;*.zip|Imágenes (*.png;*.bmp;*.jpg;*.jpeg)|*.png;*.bmp;*.jpg;*.jpeg|Texto / JSON (*.txt;*.json;*.csv;*.xml)|*.txt;*.json;*.csv;*.xml"
         };
         if (ofd.ShowDialog(this) != DialogResult.OK) return;
 
         _currentBytes = File.ReadAllBytes(ofd.FileName);
         _currentFileName = Path.GetFileName(ofd.FileName);
         _currentExtension = Path.GetExtension(ofd.FileName);
+        if (string.IsNullOrWhiteSpace(_currentExtension)) _currentExtension = ".bin";
         _isShowingEncrypted = false;
+        _lastSavedDecryptedPath = ofd.FileName;
+        _binarySummaryReport = null;
 
-        // Al cargar un archivo nuevo desde disco, NODO-01 inicia un nuevo circuito como Nodo Raíz
         ClearRelayContext();
 
-        _hologram.SetIdle($"Archivo cargado en NODO-01: {_currentFileName} ({_currentBytes.Length:N0} bytes)");
+        _hologram.SetIdle($"Archivo cargado en NODO-01: {_currentFileName} ({FormatFileSize(_currentBytes.Length)})");
 
-        string ext = _currentExtension.ToLowerInvariant();
-        if (ext is ".png" or ".bmp" or ".jpg" or ".jpeg")
+        if (ImageViewerExtensions.Contains(_currentExtension))
+        {
             SetViewerMode("IMG");
-        else if (_currentBytes.Length > 65536 || _currentBytes.Take(256).Any(b => b == 0))
-            SetViewerMode("HEX");
-        else
+        }
+        else if (!PlainTextExtensions.Contains(_currentExtension))
+        {
+            _binarySummaryReport =
+                $"╔══════════════════════════════════════════════════════════════════╗\r\n" +
+                $"║  ARCHIVO MULTIMEDIA / BINARIO CARGADO EN MEMORIA                 ║\r\n" +
+                $"╚══════════════════════════════════════════════════════════════════╝\r\n\r\n" +
+                $"• Archivo Original : {_currentFileName}\r\n" +
+                $"• Extensión        : {_currentExtension}\r\n" +
+                $"• Tamaño Exacto    : {FormatFileSize(_currentBytes.Length)} ({_currentBytes.Length:N0} bytes)\r\n" +
+                $"• Ruta Origen      : {ofd.FileName}\r\n\r\n" +
+                $"Listo para cifrar con cualquiera de los 21 algoritmos oficiales o inspeccionar en la pestaña [Hex].";
             SetViewerMode("TEXT");
+        }
+        else
+        {
+            SetViewerMode("TEXT");
+        }
+    }
+
+    private void HandleDownloadCurrentFile()
+    {
+        if (_currentBytes == null || _currentBytes.Length == 0)
+        {
+            MessageBox.Show(this, "No hay bytes activos en el visor para guardar.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string suggestedName = string.IsNullOrWhiteSpace(_currentFileName) ? $"archivo{_currentExtension}" : _currentFileName;
+        string ext = string.IsNullOrWhiteSpace(_currentExtension) ? Path.GetExtension(suggestedName) : _currentExtension;
+        if (string.IsNullOrWhiteSpace(ext)) ext = ".bin";
+
+        using var sfd = new SaveFileDialog
+        {
+            Title = "Guardar archivo en disco",
+            FileName = suggestedName,
+            DefaultExt = ext.TrimStart('.'),
+            Filter = $"Archivo (*{ext})|*{ext}|Todos los archivos (*.*)|*.*"
+        };
+
+        if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+        File.WriteAllBytes(sfd.FileName, _currentBytes);
+        _lastSavedDecryptedPath = sfd.FileName;
+        MessageBox.Show(this, $"Archivo guardado correctamente:\n{sfd.FileName}\nTamaño: {FormatFileSize(_currentBytes.Length)}",
+            "Archivo Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void HandleOpenCurrentFileInWindows()
+    {
+        if (_currentBytes == null || _currentBytes.Length == 0)
+        {
+            MessageBox.Show(this, "No hay ningún archivo cargado o descifrado para abrir.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            string targetPath = _lastSavedDecryptedPath ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(targetPath) || !File.Exists(targetPath))
+            {
+                string decDir = Path.Combine(AppContext.BaseDirectory, "DecryptedFiles");
+                Directory.CreateDirectory(decDir);
+                targetPath = GetUniqueFilePath(decDir, _currentFileName, _currentExtension);
+                File.WriteAllBytes(targetPath, _currentBytes);
+                _lastSavedDecryptedPath = targetPath;
+            }
+
+            Process.Start(new ProcessStartInfo(targetPath)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"No se pudo abrir el archivo con el visor de Windows:\n{ex.Message}",
+                "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void ClearRelayContext()
@@ -902,20 +1039,26 @@ public partial class FormDashboard : Form
         _relayHopHistory = null;
     }
 
-    /// <summary>
-    /// Ejecuta cifrado como Nodo Raíz (rootOrigin = NODO-01) o como Nodo Intermedio (conservando rootOrigin y agregando NODO-01 a hopHistory).
-    /// </summary>
     private void HandleEncryptAction(bool asIntermediateHop)
     {
         if (_cmbAlgorithm.SelectedItem is not CryptoAlgorithmInfo algInfo) return;
 
         try
         {
-            if (_viewerMode == "TEXT" && !_isShowingEncrypted)
+            if (_viewerMode == "TEXT" && !_isShowingEncrypted && _binarySummaryReport == null)
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
+
+            string origFileNameBeforeEncrypt = _currentFileName;
+            string origExtensionBeforeEncrypt = _currentExtension;
 
             var strategy = CryptoCatalog.GetStrategy(algInfo.Code);
             var result = strategy.Encrypt(_currentBytes, _txtPassphrase.Text);
+
+            // Conservar nombre y extensión original en ParametrosPublicosJson (vital para LSBSTEGO y archivos multimedia/binarios)
+            string enrichedPubJson = EnrichPublicParametersWithOriginalFileMeta(
+                result.PublicParametersJson,
+                origFileNameBeforeEncrypt,
+                origExtensionBeforeEncrypt);
 
             string packetId = Guid.NewGuid().ToString();
             string remoteLink = NodeRuntimeState.BuildRemoteDecryptUrl(packetId);
@@ -926,7 +1069,6 @@ public partial class FormDashboard : Form
 
             if (asIntermediateHop && !string.IsNullOrWhiteSpace(_relayRootOrigin))
             {
-                // Actuar como Nodo Intermedio: conservar rootOrigin y firma original, agregar NODO-01 a hopHistory
                 rootOrigin = _relayRootOrigin!;
                 rootSignature = _relayRootSignatureBase64 ?? NodeCertificateService.SignPayload(result.OutputBytes);
                 hops = _relayHopHistory != null ? new List<string>(_relayHopHistory) : new List<string> { rootOrigin };
@@ -935,7 +1077,6 @@ public partial class FormDashboard : Form
             }
             else
             {
-                // Iniciar circuito nuevo: NODO-01 es el Nodo Raíz
                 ClearRelayContext();
                 rootOrigin = "NODO-01";
                 string payloadHashHex = Convert.ToHexString(SHA256.HashData(result.OutputBytes));
@@ -958,7 +1099,7 @@ public partial class FormDashboard : Form
                 Extension = outExt,
                 BytesCifrados = Convert.ToBase64String(result.OutputBytes),
                 AlgoritmoCodigo = algInfo.Code,
-                ParametrosPublicosJson = result.PublicParametersJson,
+                ParametrosPublicosJson = enrichedPubJson,
                 LlaveSecretaBase64 = result.SecretKeyBase64,
                 LinkDescifradoRemoto = remoteLink,
                 NodoRaiz = rootOrigin,
@@ -979,6 +1120,8 @@ public partial class FormDashboard : Form
             _currentFileName = outName;
             _currentExtension = outExt;
             _isShowingEncrypted = true;
+            _binarySummaryReport = null;
+            _lastSavedDecryptedPath = null;
 
             _hologram.TriggerEncryptAnimation(algInfo.Code);
             UpdateMetadataPanel(registro, signatureValid: true);
@@ -997,6 +1140,45 @@ public partial class FormDashboard : Form
         }
     }
 
+    private static string EnrichPublicParametersWithOriginalFileMeta(string pubJson, string origFileName, string origExt)
+    {
+        try
+        {
+            var node = JsonNode.Parse(string.IsNullOrWhiteSpace(pubJson) ? "{}" : pubJson) as JsonObject ?? new JsonObject();
+            if (!string.IsNullOrWhiteSpace(origFileName))
+                node["originalFileName"] = origFileName;
+            if (!string.IsNullOrWhiteSpace(origExt))
+                node["originalExtension"] = origExt;
+            return node.ToJsonString();
+        }
+        catch
+        {
+            return pubJson;
+        }
+    }
+
+    private static (string? OrigName, string? OrigExt) ExtractOriginalFileMetaFromJson(string? pubJson)
+    {
+        if (string.IsNullOrWhiteSpace(pubJson)) return (null, null);
+        try
+        {
+            using var doc = JsonDocument.Parse(pubJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+
+            string? name = doc.RootElement.TryGetProperty("originalFileName", out var nProp) && nProp.ValueKind == JsonValueKind.String
+                ? nProp.GetString()
+                : null;
+            string? ext = doc.RootElement.TryGetProperty("originalExtension", out var eProp) && eProp.ValueKind == JsonValueKind.String
+                ? eProp.GetString()
+                : null;
+            return (name, ext);
+        }
+        catch
+        {
+            return (null, null);
+        }
+    }
+
     private void HandleDecryptLocalAction()
     {
         if (_activeRecord == null)
@@ -1006,7 +1188,11 @@ public partial class FormDashboard : Form
             return;
         }
 
-        ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, _activeRecord.LlaveSecretaBase64, _activeRecord.ParametrosPublicosJson);
+        string keyToUse = string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
+            ? _txtPassphrase.Text
+            : _activeRecord.LlaveSecretaBase64;
+
+        ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, keyToUse, _activeRecord.ParametrosPublicosJson);
     }
 
     private async Task HandleDecryptRemoteActionAsync()
@@ -1040,6 +1226,27 @@ public partial class FormDashboard : Form
 
             _currentBytes = res.OutputBytes;
             _isShowingEncrypted = false;
+            _binarySummaryReport = null;
+            _lastSavedDecryptedPath = null;
+
+            // Restaurar nombre y extensión original (especialmente útil tras LSBSTEGO o paquetes recibidos)
+            var (origName, origExt) = ExtractOriginalFileMetaFromJson(pubJson);
+            if (!string.IsNullOrWhiteSpace(origExt))
+                _currentExtension = origExt;
+            if (!string.IsNullOrWhiteSpace(origName))
+                _currentFileName = origName;
+            else if (algCode.Equals("LSBSTEGO", StringComparison.OrdinalIgnoreCase) &&
+                     _currentExtension.Equals(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                _currentExtension = DetectLikelyExtension(_currentBytes);
+                _currentFileName = Path.ChangeExtension(_currentFileName, _currentExtension);
+            }
+
+            if (string.IsNullOrWhiteSpace(_currentExtension))
+                _currentExtension = Path.GetExtension(_currentFileName);
+            if (string.IsNullOrWhiteSpace(_currentExtension))
+                _currentExtension = ".bin";
+
             _hologram.TriggerDecryptAnimation(algCode);
 
             if (_activeRecord != null)
@@ -1048,16 +1255,117 @@ public partial class FormDashboard : Form
                 _hologram.StatusSubtitle = $"DESCIFRADO EN NODO-01 • Origen Raíz: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
             }
 
-            if (_viewerMode == "IMG" && algCode == "LSBSTEGO")
+            bool isPlainText = PlainTextExtensions.Contains(_currentExtension);
+            bool isViewerImage = ImageViewerExtensions.Contains(_currentExtension);
+
+            if (!isPlainText && !isViewerImage)
+            {
+                // Archivo multimedia o binario (.mp4, .pdf, .docx, .xlsx, .mp3, .zip, etc.)
+                string autoSavedInfo = "Auto-descarga desactivada (usa [💾 Descargar Archivo] o [▶ Abrir Archivo]).";
+
+                if (_chkAutoDownloadBinary != null && _chkAutoDownloadBinary.Checked)
+                {
+                    string savedPath = SaveDecryptedBinaryAutomatically(_currentBytes, _currentFileName, _currentExtension);
+                    _lastSavedDecryptedPath = savedPath;
+                    autoSavedInfo = savedPath;
+                }
+
+                _binarySummaryReport =
+                    $"╔══════════════════════════════════════════════════════════════════╗\r\n" +
+                    $"║  ARCHIVO MULTIMEDIA / BINARIO DESCIFRADO CON ÉXITO               ║\r\n" +
+                    $"╚══════════════════════════════════════════════════════════════════╝\r\n\r\n" +
+                    $"• Archivo Recuperado : {_currentFileName}\r\n" +
+                    $"• Extensión          : {_currentExtension}\r\n" +
+                    $"• Tamaño Exacto      : {FormatFileSize(_currentBytes.Length)} ({_currentBytes.Length:N0} bytes)\r\n" +
+                    $"• Algoritmo Aplicado : {algCode}\r\n" +
+                    $"• Descarga Automática: {autoSavedInfo}\r\n\r\n" +
+                    $"ACCIONES DISPONIBLES:\r\n" +
+                    $"  1. Haz clic en [▶ Abrir Archivo] para reproducirlo o visualizarlo con Windows.\r\n" +
+                    $"  2. Haz clic en [💾 Descargar Archivo] para guardarlo en otra carpeta.\r\n" +
+                    $"  3. Cambia a la pestaña [Hex] si deseas inspeccionar los bytes crudos.";
+
                 SetViewerMode("TEXT");
+            }
+            else if (isViewerImage)
+            {
+                SetViewerMode("IMG");
+            }
             else
-                RenderCurrentBytesInViewer();
+            {
+                SetViewerMode("TEXT");
+            }
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Error al descifrar ({algCode}):\n{ex.Message}",
                 "ModuloCrypto — Error de Descifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    public static string SaveDecryptedBinaryAutomatically(byte[] bytes, string fileName, string extension)
+    {
+        string targetDir;
+        try
+        {
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            targetDir = Path.Combine(userProfile, "Downloads", "ModuloCrypto_Descifrados");
+            Directory.CreateDirectory(targetDir);
+        }
+        catch
+        {
+            targetDir = Path.Combine(AppContext.BaseDirectory, "DecryptedFiles");
+            Directory.CreateDirectory(targetDir);
+        }
+
+        string finalPath = GetUniqueFilePath(targetDir, fileName, extension);
+        File.WriteAllBytes(finalPath, bytes);
+        return finalPath;
+    }
+
+    private static string GetUniqueFilePath(string directory, string fileName, string extension)
+    {
+        string ext = string.IsNullOrWhiteSpace(extension) ? Path.GetExtension(fileName) : extension;
+        if (string.IsNullOrWhiteSpace(ext)) ext = ".bin";
+        if (!ext.StartsWith('.')) ext = "." + ext;
+
+        string baseName = Path.GetFileNameWithoutExtension(fileName);
+        if (string.IsNullOrWhiteSpace(baseName)) baseName = "archivo_descifrado";
+
+        foreach (char invalid in Path.GetInvalidFileNameChars())
+            baseName = baseName.Replace(invalid, '_');
+
+        string candidate = Path.Combine(directory, baseName + ext);
+        int counter = 1;
+        while (File.Exists(candidate))
+        {
+            candidate = Path.Combine(directory, $"{baseName}_{counter}{ext}");
+            counter++;
+        }
+        return candidate;
+    }
+
+    private static string DetectLikelyExtension(byte[] data)
+    {
+        if (data.Length >= 4)
+        {
+            if (data[0] == 0x25 && data[1] == 0x50 && data[2] == 0x44 && data[3] == 0x46) return ".pdf";
+            if (data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04) return ".zip";
+            if (data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47) return ".png";
+            if (data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) return ".jpg";
+        }
+        if (data.Length >= 12 &&
+            data[4] == 0x66 && data[5] == 0x74 && data[6] == 0x79 && data[7] == 0x70)
+            return ".mp4";
+
+        bool looksUtf8Text = !data.Take(Math.Min(data.Length, 256)).Any(b => b == 0);
+        return looksUtf8Text ? ".txt" : ".bin";
+    }
+
+    private static string FormatFileSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F2} KB";
+        return $"{bytes / (1024.0 * 1024.0):F2} MB";
     }
 
     private async Task HandleSendZipToPeerAsync()
@@ -1087,11 +1395,13 @@ public partial class FormDashboard : Form
                 preservedRootCertBase64: _relayRootCertBase64,
                 preservedOriginalHashHex: _relayOriginalHashHex);
 
-            var sendResult = await NodeNetworkClient.SendZipPacketAsync(peer.BaseUrl, zipPath);
+            var sendResult = await NodeNetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
+            RefreshNetworkGrid();
 
             MessageBox.Show(this,
                 $"{sendResult.Message}\n\n" +
                 $"• Nodo Raíz (rootOrigin): {_activeRecord.NodoRaiz}\n" +
+                $"• Protocolo Destino: {peer.ProtocolType}\n" +
                 $"• Ruta de Saltos (hopHistory): {string.Join(" → ", hops)}",
                 sendResult.Success ? "Envío Tor .ZIP Exitoso" : "Error de Envío .ZIP",
                 MessageBoxButtons.OK,
@@ -1104,7 +1414,7 @@ public partial class FormDashboard : Form
         }
     }
 
-    private void UpdateMetadataPanel(RegistroCifrado r, bool signatureValid)
+    private void UpdateMetadataPanel(RegistroCifrado r, bool signatureValid, bool hasSignature = true)
     {
         var hops = PacketZipService.TryDeserializeHops(r.RutaSaltosJson);
         if (hops.Count == 0) hops.Add(r.NodoRaiz);
@@ -1112,7 +1422,9 @@ public partial class FormDashboard : Form
         _txtMetaPacketId.Text = r.PacketId;
         _txtMetaRootNode.Text = $"{r.NodoRaiz}  (Originador del Circuito)";
         _txtMetaHops.Text = string.Join("  →  ", hops);
-        _txtMetaRemoteLink.Text = r.LinkDescifradoRemoto;
+        _txtMetaRemoteLink.Text = string.IsNullOrWhiteSpace(r.LinkDescifradoRemoto)
+            ? "(Paquete externo — Clave local)"
+            : r.LinkDescifradoRemoto;
 
         try
         {
@@ -1124,10 +1436,18 @@ public partial class FormDashboard : Form
             _txtMetaPublicJson.Text = r.ParametrosPublicosJson;
         }
 
-        _lblMetaSignatureBadge.Text = signatureValid
-            ? $"● Firma Raíz ({r.NodoRaiz}) VÁLIDA"
-            : $"● Firma Raíz ({r.NodoRaiz}) INVÁLIDA";
-        _lblMetaSignatureBadge.ForeColor = signatureValid ? HologramTheme.Success : HologramTheme.Danger;
+        if (!hasSignature)
+        {
+            _lblMetaSignatureBadge.Text = "⚠ Sin firma X.509 (Modo Tolerante)";
+            _lblMetaSignatureBadge.ForeColor = HologramTheme.Warning;
+        }
+        else
+        {
+            _lblMetaSignatureBadge.Text = signatureValid
+                ? $"● Firma Raíz ({r.NodoRaiz}) VÁLIDA"
+                : $"● Firma Raíz ({r.NodoRaiz}) INVÁLIDA";
+            _lblMetaSignatureBadge.ForeColor = signatureValid ? HologramTheme.Success : HologramTheme.Danger;
+        }
     }
 
     private void HandleIncomingPacketEvent(SolicitudEntrante solicitud)

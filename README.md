@@ -1,6 +1,6 @@
 # ModuloCrypto — Nodo Criptográfico Distribuido (.NET 10)
 
-**ModuloCrypto** es un nodo de escritorio y servidor API REST embebido diseñado en **C# (.NET 10)** para operar dentro de una **red distribuida de 8 nodos** con enrutamiento tipo Tor e intercambio de paquetes `.zip` firmados con certificados **X.509**.
+**ModuloCrypto** es un nodo de escritorio y servidor API REST embebido diseñado en **C# (.NET 10)** para operar como **`NODO-01`** dentro de una **red distribuida de 8 nodos** con enrutamiento tipo Tor e intercambio bidireccional de paquetes `.zip` firmados con certificados **X.509** (compatible tanto con nodos `ModuloCrypto` como con `CentroCiberseguridad.Web`).
 
 ---
 
@@ -8,8 +8,8 @@
 
 El proyecto utiliza `<Project Sdk="Microsoft.NET.Sdk.Web">` con `<UseWindowsForms>true</UseWindowsForms>` para unificar:
 - **Interfaz de Escritorio Holográfica (WinForms + GDI+ 60 FPS)** en pantalla completa (`Maximized`) con estética *Dark Violet Glassmorphism*.
-- **Servidor ASP.NET Core Minimal API Embebido** escuchando en `http://0.0.0.0:5000`.
-- **Persistencia Local en SQLite (`ModuloCrypto.db`)** mediante Entity Framework Core (`EnsureCreated()`).
+- **Servidor ASP.NET Core Minimal API Embebido** escuchando en `http://0.0.0.0:5000` (o puerto configurable con `--port <puerto>`).
+- **Persistencia Local en SQLite (`ModuloCrypto.db`)** mediante Entity Framework Core (`EnsureCreated()`) con contraseñas protegidas mediante **PBKDF2-SHA256 + Salt aleatorio**.
 
 ```text
 ModuloCrypto/
@@ -17,23 +17,23 @@ ModuloCrypto/
 ├── ModuloCrypto.csproj
 ├── Program.cs
 ├── Core/
-│   ├── Contracts/PacketManifest.cs     # Contrato JSON de manifest.json y respuestas REST
+│   ├── Contracts/PacketManifest.cs     # Contrato JSON híbrido de manifest.json y respuestas REST
 │   ├── Data/AppDbContext.cs            # EF Core + SQLite (Usuarios, RegistrosCifrados, SolicitudesEntrantes)
 │   ├── Models/                         # Entidades SQLite y modelo PeerNode (8 nodos)
-│   └── Services/                       # AuthService (SHA-256) y NodeRuntimeState
+│   └── Services/                       # AuthService (PBKDF2-SHA256) y NodeRuntimeState
 ├── Security/
 │   ├── ICryptoStrategy.cs              # Patrón Strategy para algoritmos criptográficos
 │   ├── CryptoCatalog.cs                # Registro exclusivo de los 21 códigos oficiales
 │   └── Strategies/                     # Implementaciones de los 21 algoritmos estándar
 ├── Network/
-│   ├── ApiHostService.cs               # Minimal API embebida en http://0.0.0.0:5000
-│   ├── NodeCertificateService.cs       # Generación, firma y verificación X.509 RSA-2048
-│   ├── PacketZipService.cs             # Empaquetado/lectura .zip (manifest.json + payload.bin + root_cert.cer)
-│   └── NodeNetworkClient.cs            # Cliente HTTP para ping, envío .zip y descifrado remoto
+│   ├── ApiHostService.cs               # Minimal API dual embebida (/api/health, /api/status, /api/packets/receive, /api/requests/receive)
+│   ├── NodeCertificateService.cs       # Certificado X.509 RSA-2048 protegido con Windows DPAPI
+│   ├── PacketZipService.cs             # Empaquetado/lectura .zip híbrido (manifest.json, datos.enc, payload.bin, certificado.pem, root_cert.cer)
+│   └── NodeNetworkClient.cs            # Cliente HTTP dual y escáner de subred LAN y puertos localhost
 └── UI/
     ├── Theme/HologramTheme.cs          # Paleta oficial (#0B0914, #151226, #6C5CE7, #00D2FF, #A29BFE)
     ├── Controls/                       # GlassPanel, NeonButton, SidebarNavButton, StatusPill, HologramLockControl
-    └── Forms/                          # FormLogin, FormDashboard y vistas integradas
+    └── Forms/                          # FormLogin, FormRegisterModal, FormDashboard y vistas integradas
 ```
 
 ---
@@ -68,14 +68,14 @@ ModuloCrypto/
 
 ## Endpoints REST de la API Embebida (`:5000`)
 
-- `GET /api/health` — Estado del nodo, puerto, algoritmo soportados (21) y huella del certificado X.509.
+- `GET /api/health` y `GET /api/status` — Estado del nodo (`NODO-01`), protocolo y huella SHA-256 del certificado X.509.
 - `GET /api/algorithms` — Catálogo JSON de los 21 algoritmos oficiales.
-- `POST /api/packets/receive` — Recibe un paquete `.zip`, valida `manifest.json` y la firma X.509, registra en `SolicitudesEntrantes` y actualiza el contador en tiempo real.
-- `GET /api/crypto/decrypt/{packetId}` — Responde a peticiones de descifrado remoto devolviendo la llave registrada en SQLite para el `PacketId`.
+- `POST /api/packets/receive` y `POST /api/requests/receive` — Recepción dual de paquetes `.zip`, validación de `manifest.json` y firma X.509 (`RSA-PSS-SHA256` / `PKCS#1`), y registro en `SolicitudesEntrantes`.
+- `GET /api/crypto/decrypt/{packetId}` — Entrega de llave para peticiones de descifrado remoto.
 
 ---
 
-## Ejecución Rápida
+## Ejecución Rápida y Seguridad
 
 Requisitos: **Windows 10/11** y **.NET 10 SDK**.
 
@@ -84,10 +84,10 @@ dotnet build ModuloCrypto.sln
 dotnet run --project ModuloCrypto.csproj
 ```
 
-**Credenciales preconfiguradas en SQLite (`ModuloCrypto.db`):**
-- **Nombre Completo:** `Yael Bernal`
-- **Usuario:** `admin`
-- **Contraseña:** `admin123`
-- **Nodo por defecto:** `NODO-04`
+Para ejecutar en un puerto alternativo (ej. pruebas locales multi-nodo):
+```bash
+dotnet run --project ModuloCrypto.csproj -- --port 5002
+```
 
-> También puedes registrar nuevos integrantes con su `NombreCompleto`, `Usuario` y `Contraseña` desde el modal de **Registrar Nuevo Integrante** en la pantalla de acceso.
+**Primer Inicio (Sin Credenciales Precargadas):**
+Por seguridad del repositorio público, la base de datos `ModuloCrypto.db` inicia sin usuarios ni contraseñas preconfiguradas. Al abrir la aplicación por primera vez, haz clic en **`Registrar Nuevo Integrante`** para crear tu cuenta de operador con tu **Nombre Completo**, **Usuario** y **Contraseña** (almacenada con **PBKDF2-SHA256** y salt aleatorio).

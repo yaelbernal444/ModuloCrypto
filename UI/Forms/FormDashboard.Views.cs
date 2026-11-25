@@ -50,11 +50,11 @@ public partial class FormDashboard
         };
         var lblSub = new Label
         {
-            Text = "Recibe paquetes, descifra como Nodo Final o re-cifra con otro algoritmo para reenviar como Nodo Intermedio",
+            Text = "Recibe paquetes nativos o de CentroCiberseguridad.Web (con o sin firma X.509), descifra o re-cifra como salto Tor",
             Font = HologramTheme.FontBody(9f),
             ForeColor = HologramTheme.TextSecondary,
             Location = new Point(0, 30),
-            Size = new Size(640, 20),
+            Size = new Size(650, 20),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -90,7 +90,7 @@ public partial class FormDashboard
         _gridSolicitudes.CellFormatting += (_, e) =>
         {
             if (_gridSolicitudes.Columns[e.ColumnIndex].Name == "FirmaX509" && e.Value is string s)
-                e.CellStyle!.ForeColor = s.Contains("Válida") ? HologramTheme.Success : HologramTheme.Danger;
+                e.CellStyle!.ForeColor = s.Contains("Válida") ? HologramTheme.Success : HologramTheme.Warning;
             else if (_gridSolicitudes.Columns[e.ColumnIndex].Name == "Estado" && e.Value is string st)
                 e.CellStyle!.ForeColor = st == "Aceptada" ? HologramTheme.Success :
                                          st == "Rechazada" ? HologramTheme.Danger : HologramTheme.Warning;
@@ -118,7 +118,7 @@ public partial class FormDashboard
                 s.IpOrigen,
                 s.NombreZip,
                 Algoritmo = s.AlgoritmoCodigo,
-                FirmaX509 = s.FirmaX509Valida ? "✓ Válida" : "✕ Inválida",
+                FirmaX509 = s.FirmaX509Valida ? "✓ Válida" : "⚠ Sin firma / No verificada",
                 s.Estado,
                 Recibido = s.FechaRecepcion.ToString("yyyy-MM-dd HH:mm:ss")
             })
@@ -128,7 +128,7 @@ public partial class FormDashboard
 
     private void HandleImportZipToInbox()
     {
-        using var ofd = new OpenFileDialog { Filter = "Paquete ModuloCrypto (*.zip)|*.zip" };
+        using var ofd = new OpenFileDialog { Filter = "Paquete ModuloCrypto / CentroCiberseguridad (*.zip)|*.zip" };
         if (ofd.ShowDialog(this) != DialogResult.OK) return;
 
         try
@@ -195,36 +195,46 @@ public partial class FormDashboard
             string? secretKey = null;
             string pubJson = parsed.Manifest.ParametrosPublicosJson;
 
+            // 1. Intentar obtener llave vía LinkDescifradoRemoto
             if (!string.IsNullOrWhiteSpace(parsed.Manifest.LinkDescifradoRemoto))
             {
                 var remote = await NodeNetworkClient.RequestRemoteKeyAsync(parsed.Manifest.LinkDescifradoRemoto);
                 if (remote.Success)
                 {
                     secretKey = remote.LlaveSecretaBase64;
-                    if (!string.IsNullOrWhiteSpace(remote.ParametrosPublicosJson))
+                    if (!string.IsNullOrWhiteSpace(remote.ParametrosPublicosJson) && remote.ParametrosPublicosJson != "{}")
                         pubJson = remote.ParametrosPublicosJson;
                 }
             }
 
+            // 2. Buscar coincidencia local por PacketId
             if (string.IsNullOrWhiteSpace(secretKey))
             {
                 var localMatch = db.RegistrosCifrados.FirstOrDefault(r => r.PacketId == parsed.Manifest.PacketId);
                 if (localMatch != null)
+                {
                     secretKey = localMatch.LlaveSecretaBase64;
+                    if (string.IsNullOrWhiteSpace(pubJson) || pubJson == "{}")
+                        pubJson = localMatch.ParametrosPublicosJson;
+                }
             }
 
+            // 3. Respaldo para paquetes externos (CentroCiberseguridad.Web o sin LinkDescifradoRemoto)
             if (string.IsNullOrWhiteSpace(secretKey))
             {
-                MessageBox.Show(this, $"No se pudo obtener la llave remota desde:\n{parsed.Manifest.LinkDescifradoRemoto}",
-                    "Llave No Disponible", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                string? manualKey = PromptExternalPassphraseModal(parsed.Manifest.AlgoritmoCodigo, parsed.Manifest.NodoRaiz, parsed.HasSignature);
+                if (manualKey == null)
+                    return; // Cancelado por el usuario
+                secretKey = manualKey;
             }
 
             var hops = parsed.Manifest.RutaSaltos ?? new List<string>();
             if (hops.Count == 0) hops.Add(parsed.Manifest.NodoRaiz);
             if (hops[^1] != "NODO-01") hops.Add("NODO-01");
 
-            // Guardar contexto de relay por si NODO-01 desea actuar como Nodo Intermedio (re-cifrar con otro algoritmo y reenviar)
+            // Conservar nombre/extensión original dentro de pubJson para restaurar en ExecuteDecryption
+            pubJson = EnrichPublicParametersWithOriginalFileMeta(pubJson, parsed.Manifest.NombreArchivo, parsed.Manifest.Extension);
+
             _relayRootOrigin = parsed.Manifest.NodoRaiz;
             _relayRootSignatureBase64 = parsed.Manifest.FirmaRaizBase64;
             _relayRootCertBase64 = parsed.Manifest.CertificadoRaizBase64;
@@ -258,7 +268,7 @@ public partial class FormDashboard
             _currentExtension = registroRecibido.Extension;
             _currentBytes = parsed.PayloadBytes;
             SelectAlgorithmInCombo(registroRecibido.AlgoritmoCodigo);
-            UpdateMetadataPanel(registroRecibido, parsed.SignatureValid && parsed.IntegrityValid);
+            UpdateMetadataPanel(registroRecibido, parsed.SignatureValid && parsed.IntegrityValid, parsed.HasSignature);
 
             RefreshSolicitudesGrid();
             RefreshPendingSolicitudesBadge();
@@ -271,6 +281,127 @@ public partial class FormDashboard
         {
             MessageBox.Show(this, $"Error al procesar solicitud:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private string? PromptExternalPassphraseModal(string algCode, string sourceNode, bool hasSignature)
+    {
+        string defaultKey = algCode.ToUpperInvariant() switch
+        {
+            "AESGCM" => "clave-aes-256-segura",
+            "CHACHA20" => "chacha20-llave-32bytes",
+            "DES" => "claveDES",
+            "TRIPLEDES" => "clave-3des-96-ede",
+            "VIGENERE" => "CRIPTOGRAFIA",
+            "CAESAR" => "3",
+            _ => "clave-prueba"
+        };
+
+        using var dlg = new Form
+        {
+            Text = "Clave de Descifrado de Paquete Externo",
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(470, 300),
+            BackColor = HologramTheme.BackgroundBase,
+            ForeColor = HologramTheme.TextPrimary,
+            KeyPreview = true
+        };
+
+        var card = new GlassPanel
+        {
+            Dock = DockStyle.Fill,
+            CornerRadius = 16,
+            NeonBorderGlow = true,
+            BorderColor = HologramTheme.AccentStart,
+            Padding = new Padding(24)
+        };
+
+        var lblTitle = new Label
+        {
+            Text = $"Descifrar Paquete Externo ({algCode})",
+            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
+            ForeColor = HologramTheme.HologramCyan,
+            Location = new Point(24, 20),
+            Size = new Size(420, 28),
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        string sigNote = hasSignature ? "Firma X.509 detectada" : "⚠ Paquete sin firma X.509 (Modo Tolerante)";
+        var lblSub = new Label
+        {
+            Text = $"Origen: {sourceNode} • {sigNote}\nIngresa la clave o passphrase del paquete para descifrarlo:",
+            Font = new Font("Segoe UI", 9.2f),
+            ForeColor = HologramTheme.TextSecondary,
+            Location = new Point(24, 54),
+            Size = new Size(420, 42),
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        var txtKey = HologramTheme.CreateDarkTextBox();
+        txtKey.Location = new Point(24, 112);
+        txtKey.Size = new Size(420, 34);
+        txtKey.Font = new Font("Cascadia Mono", 10.5f);
+        txtKey.Text = defaultKey;
+
+        var lblHint = new Label
+        {
+            Text = "Prellenado con la clave estándar del protocolo compatible.",
+            Font = new Font("Segoe UI", 8.4f),
+            ForeColor = HologramTheme.HologramViolet,
+            Location = new Point(24, 152),
+            Size = new Size(420, 22),
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        string? resultKey = null;
+
+        var btnOk = new NeonButton
+        {
+            Text = "🔓 Aceptar y Descifrar",
+            Variant = NeonButtonVariant.Success,
+            Location = new Point(24, 204),
+            Size = new Size(204, 42)
+        };
+        btnOk.Click += (_, _) =>
+        {
+            resultKey = txtKey.Text;
+            dlg.DialogResult = DialogResult.OK;
+            dlg.Close();
+        };
+
+        var btnCancel = new NeonButton
+        {
+            Text = "Cancelar",
+            Variant = NeonButtonVariant.Secondary,
+            Location = new Point(240, 204),
+            Size = new Size(204, 42)
+        };
+        btnCancel.Click += (_, _) =>
+        {
+            dlg.DialogResult = DialogResult.Cancel;
+            dlg.Close();
+        };
+
+        card.Controls.AddRange(new Control[] { lblTitle, lblSub, txtKey, lblHint, btnOk, btnCancel });
+        dlg.Controls.Add(card);
+
+        dlg.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                resultKey = txtKey.Text;
+                dlg.DialogResult = DialogResult.OK;
+                dlg.Close();
+            }
+            else if (e.KeyCode == Keys.Escape)
+            {
+                dlg.DialogResult = DialogResult.Cancel;
+                dlg.Close();
+            }
+        };
+
+        return dlg.ShowDialog(this) == DialogResult.OK ? resultKey : null;
     }
 
     private void BuildConsultasView()
@@ -414,13 +545,15 @@ public partial class FormDashboard
         _currentFileName = r.NombreArchivo;
         _currentExtension = r.Extension;
         _isShowingEncrypted = true;
+        _binarySummaryReport = null;
+        _lastSavedDecryptedPath = null;
 
         _relayRootOrigin = r.NodoRaiz;
         _relayRootSignatureBase64 = r.FirmaRaizBase64;
         _relayHopHistory = PacketZipService.TryDeserializeHops(r.RutaSaltosJson);
 
         SelectAlgorithmInCombo(r.AlgoritmoCodigo);
-        UpdateMetadataPanel(r, !string.IsNullOrWhiteSpace(r.FirmaRaizBase64));
+        UpdateMetadataPanel(r, !string.IsNullOrWhiteSpace(r.FirmaRaizBase64), !string.IsNullOrWhiteSpace(r.FirmaRaizBase64));
         _hologram.TriggerEncryptAnimation(r.AlgoritmoCodigo);
 
         if (r.AlgoritmoCodigo == "LSBSTEGO") SetViewerMode("IMG");
@@ -450,23 +583,33 @@ public partial class FormDashboard
 
         var card = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(18) };
 
-        var header = new Panel { Dock = DockStyle.Top, Height = 58, BackColor = HologramTheme.PanelGlass };
+        var header = new Panel { Dock = DockStyle.Top, Height = 64, BackColor = HologramTheme.PanelGlass };
         var lblTitle = new Label
         {
             Text = "Topología de Red Distribuida (8 Nodos Bidireccionales)",
-            Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Location = new Point(0, 0),
-            Size = new Size(520, 28),
+            Size = new Size(460, 28),
             BackColor = HologramTheme.PanelGlass
         };
         var lblSub = new Label
         {
-            Text = "Nuestro equipo es NODO-01. Todos los nodos pueden iniciar circuitos, actuar como salto intermedio o nodo final.",
-            Font = HologramTheme.FontBody(9f),
+            Text = "Detección automática dual: ModuloCrypto (/api/health) y CentroCiberseguridad.Web (/api/status)",
+            Font = HologramTheme.FontBody(8.8f),
             ForeColor = HologramTheme.TextSecondary,
             Location = new Point(0, 30),
-            Size = new Size(640, 20),
+            Size = new Size(480, 20),
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        var netBtnFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Right,
+            Width = 650,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(0, 10, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -474,14 +617,13 @@ public partial class FormDashboard
         {
             Text = "📡 Escanear / Ping 8 Nodos",
             Variant = NeonButtonVariant.Cyan,
-            Dock = DockStyle.Right,
-            Width = 225,
-            Height = 38
+            Size = new Size(195, 38),
+            Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold)
         };
         btnPingAll.Click += async (_, _) =>
         {
             btnPingAll.Enabled = false;
-            btnPingAll.Text = "Escaneando red...";
+            btnPingAll.Text = "Escaneando...";
             foreach (var peer in NodeRuntimeState.NetworkPeers)
             {
                 var (online, latency, info) = await NodeNetworkClient.PingNodeAsync(peer);
@@ -495,9 +637,61 @@ public partial class FormDashboard
             btnPingAll.Enabled = true;
         };
 
+        var btnScanLocalhost = new NeonButton
+        {
+            Text = "💻 Escanear Localhost (5000-5008)",
+            Variant = NeonButtonVariant.Primary,
+            Size = new Size(228, 38),
+            Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold)
+        };
+        btnScanLocalhost.Click += async (_, _) =>
+        {
+            btnScanLocalhost.Enabled = false;
+            btnScanLocalhost.Text = "Escaneando 127.0.0.1...";
+            var found = await NodeNetworkClient.ScanLocalhostPortsAsync(5000, 5008);
+            int integrated = IntegrateDiscoveredPeers(found);
+            RefreshNetworkGrid();
+            RefreshTargetPeerCombo();
+            btnScanLocalhost.Text = "💻 Escanear Localhost (5000-5008)";
+            btnScanLocalhost.Enabled = true;
+
+            MessageBox.Show(this,
+                $"Escaneo de Localhost (puertos 5000-5008) completado.\n" +
+                $"• Instancias activas detectadas: {found.Count}\n" +
+                $"• Nodos actualizados en tabla: {integrated}",
+                "Descubrimiento Localhost", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+
+        var btnScanLan = new NeonButton
+        {
+            Text = "🔍 Auto-Descubrir Red LAN",
+            Variant = NeonButtonVariant.Secondary,
+            Size = new Size(205, 38),
+            Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold)
+        };
+        btnScanLan.Click += async (_, _) =>
+        {
+            btnScanLan.Enabled = false;
+            btnScanLan.Text = "Escaneando subred /24...";
+            var found = await NodeNetworkClient.ScanLanSubnetAsync(NodeRuntimeState.LocalIpAddress, NodeRuntimeState.ApiPort);
+            int integrated = IntegrateDiscoveredPeers(found);
+            RefreshNetworkGrid();
+            RefreshTargetPeerCombo();
+            btnScanLan.Text = "🔍 Auto-Descubrir Red LAN";
+            btnScanLan.Enabled = true;
+
+            MessageBox.Show(this,
+                $"Auto-descubrimiento en subred LAN (:{NodeRuntimeState.ApiPort}) completado.\n" +
+                $"• Nodos activos detectados: {found.Count}\n" +
+                $"• Nodos integrados en tabla: {integrated}",
+                "Auto-Descubrimiento LAN", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+
+        netBtnFlow.Controls.AddRange(new Control[] { btnPingAll, btnScanLocalhost, btnScanLan });
+
         header.Controls.Add(lblTitle);
         header.Controls.Add(lblSub);
-        header.Controls.Add(btnPingAll);
+        header.Controls.Add(netBtnFlow);
 
         var editBar = new Panel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
         var lblIp = new Label
@@ -566,6 +760,9 @@ public partial class FormDashboard
         {
             if (_gridPeers.Columns[e.ColumnIndex].Name == "Estado" && e.Value is string s)
                 e.CellStyle!.ForeColor = s.Contains("Online") ? HologramTheme.Success : HologramTheme.Danger;
+            else if (_gridPeers.Columns[e.ColumnIndex].Name == "Protocolo" && e.Value is string proto)
+                e.CellStyle!.ForeColor = proto == "CentroCiberseguridad" ? HologramTheme.HologramCyan :
+                                         proto == "ModuloCrypto" ? HologramTheme.HologramViolet : HologramTheme.TextSecondary;
         };
 
         var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
@@ -577,6 +774,60 @@ public partial class FormDashboard
         panel.Controls.Add(card);
     }
 
+    private static int IntegrateDiscoveredPeers(List<PeerNode> discovered)
+    {
+        int count = 0;
+        foreach (var d in discovered)
+        {
+            var existingByEndpoint = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                p.IpAddress.Equals(d.IpAddress, StringComparison.OrdinalIgnoreCase) && p.Port == d.Port);
+
+            if (existingByEndpoint != null)
+            {
+                existingByEndpoint.IsOnline = true;
+                existingByEndpoint.LastLatency = d.LastLatency;
+                existingByEndpoint.ProtocolType = d.ProtocolType;
+                existingByEndpoint.CertThumbprint = d.CertThumbprint;
+                count++;
+                continue;
+            }
+
+            var existingById = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                p.NodeId.Equals(d.NodeId, StringComparison.OrdinalIgnoreCase) && p.NodeId != "NODO-01");
+
+            if (existingById != null)
+            {
+                existingById.IpAddress = d.IpAddress;
+                existingById.Port = d.Port;
+                existingById.IsOnline = true;
+                existingById.LastLatency = d.LastLatency;
+                existingById.ProtocolType = d.ProtocolType;
+                existingById.CertThumbprint = d.CertThumbprint;
+                count++;
+                continue;
+            }
+
+            // Asignar al primer slot offline libre (NODO-02..NODO-08)
+            var freeSlot = NodeRuntimeState.NetworkPeers.FirstOrDefault(p => p.NodeId != "NODO-01" && !p.IsOnline);
+            if (freeSlot != null)
+            {
+                freeSlot.IpAddress = d.IpAddress;
+                freeSlot.Port = d.Port;
+                freeSlot.IsOnline = true;
+                freeSlot.LastLatency = d.LastLatency;
+                freeSlot.ProtocolType = d.ProtocolType;
+                freeSlot.CertThumbprint = d.CertThumbprint;
+                count++;
+            }
+            else
+            {
+                NodeRuntimeState.NetworkPeers.Add(d);
+                count++;
+            }
+        }
+        return count;
+    }
+
     private void RefreshNetworkGrid()
     {
         if (_gridPeers == null) return;
@@ -584,6 +835,7 @@ public partial class FormDashboard
         {
             p.NodeId,
             Rol = p.RoleLabel,
+            Protocolo = p.ProtocolType,
             Endpoint = p.BaseUrl,
             Estado = p.IsOnline ? "● Online" : "● Offline",
             Latencia = p.LastLatency,
@@ -607,11 +859,10 @@ public partial class FormDashboard
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
 
-        // Izquierda: Certificado X.509 & API (NODO-01)
         var leftCard = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(20), Margin = new Padding(0, 0, 10, 0) };
         var lblCertTitle = new Label
         {
-            Text = "Identidad NODO-01 & Certificado X.509",
+            Text = "Identidad NODO-01 & Certificado X.509 (DPAPI)",
             Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Top,
@@ -632,7 +883,7 @@ public partial class FormDashboard
         {
             NodeCertificateService.Initialize(forceRegenerate: true);
             RefreshSettingsStats();
-            MessageBox.Show(this, "Nuevo certificado X.509 RSA-2048 generado para CN=NODO-01 y guardado en node_identity.pfx.",
+            MessageBox.Show(this, "Nuevo certificado X.509 RSA-2048 generado para CN=NODO-01 y protegido con Windows DPAPI.",
                 "Certificado X.509 — NODO-01", MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
 
@@ -642,7 +893,6 @@ public partial class FormDashboard
         leftCard.Controls.Add(btnRegen);
         leftCard.Controls.Add(lblCertTitle);
 
-        // Derecha: Base de Datos SQLite & Pruebas de Animación Holograma
         var rightCard = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(20), Margin = new Padding(10, 0, 0, 0) };
         var lblDbTitle = new Label
         {
@@ -717,7 +967,8 @@ public partial class FormDashboard
             $"Estado API         : {(NodeRuntimeState.ApiOnline ? "Online" : "Offline")}\r\n" +
             $"---------------------------------------------------\r\n" +
             $"X.509 Subject      : {cert.Subject}\r\n" +
-            $"X.509 Thumbprint   : {cert.Thumbprint}\r\n" +
+            $"X.509 SHA-256      : {NodeCertificateService.GetThumbprintSha256Hex()}\r\n" +
+            $"Protección Llave   : Windows DPAPI (CurrentUser)\r\n" +
             $"Válido Desde       : {cert.NotBefore:yyyy-MM-dd HH:mm}\r\n" +
             $"Válido Hasta       : {cert.NotAfter:yyyy-MM-dd HH:mm}\r\n" +
             $"Algoritmos Activos : {CryptoCatalog.OfficialAlgorithms.Count} oficiales";
@@ -730,7 +981,7 @@ public partial class FormDashboard
 
         _lblSettingsDbStats.Text =
             $"Archivo SQLite     : {AppDbContext.DatabasePath}\r\n" +
-            $"Tabla Usuarios     : {uCount} integrante(s)\r\n" +
+            $"Tabla Usuarios     : {uCount} integrante(s) (PBKDF2-SHA256)\r\n" +
             $"Tabla Consultas    : {rCount} registro(s) cifrado(s)\r\n" +
             $"Tabla Solicitudes  : {sCount} total ({sPend} pendiente(s))\r\n" +
             $"Rol de Red         : NODO-01 (Inicio / Intermedio / Final)";
