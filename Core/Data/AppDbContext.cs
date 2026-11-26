@@ -29,6 +29,7 @@ public class AppDbContext : DbContext
     public DbSet<SolicitudEntrante> SolicitudesEntrantes => Set<SolicitudEntrante>();
     public DbSet<PeerNode> TrustedPeers => Set<PeerNode>();
     public DbSet<SeenPacketEntity> SeenPackets => Set<SeenPacketEntity>();
+    public DbSet<AsymmetricKeyEntity> AsymmetricKeys => Set<AsymmetricKeyEntity>();
 
     public static string BuildSqliteConnectionString(string dbPath)
     {
@@ -113,6 +114,12 @@ public class AppDbContext : DbContext
         {
             entity.ToTable("SeenPackets");
             entity.HasIndex(p => p.PacketId).IsUnique();
+        });
+
+        modelBuilder.Entity<AsymmetricKeyEntity>(entity =>
+        {
+            entity.ToTable("AsymmetricKeys");
+            entity.HasIndex(k => k.KeyId).IsUnique();
         });
     }
 
@@ -231,6 +238,18 @@ public class AppDbContext : DbContext
                 ReceivedAtUtc TEXT NOT NULL DEFAULT ''
             );");
 
+        db.Database.ExecuteSqlRaw(@"
+            CREATE TABLE IF NOT EXISTS AsymmetricKeys (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                KeyId TEXT NOT NULL UNIQUE,
+                AlgorithmCode TEXT NOT NULL DEFAULT 'RSA',
+                OwnerNode TEXT NOT NULL DEFAULT 'EQ01',
+                PublicKeyPem TEXT NOT NULL DEFAULT '',
+                ProtectedPrivateKeyBase64 TEXT NOT NULL DEFAULT '',
+                ParametersJson TEXT NOT NULL DEFAULT '{{}}',
+                CreatedAtUtc TEXT NOT NULL DEFAULT ''
+            );");
+
         // 4. Asegurar todas las columnas de cada tabla consultando PRAGMA table_info
         EnsureColumnExists(db, "Usuarios", "NombreCompleto", "TEXT NOT NULL DEFAULT ''");
         EnsureColumnExists(db, "Usuarios", "NombreUsuario", "TEXT NOT NULL DEFAULT ''");
@@ -285,6 +304,14 @@ public class AppDbContext : DbContext
         EnsureColumnExists(db, "SeenPackets", "PacketTimestampUtc", "TEXT NOT NULL DEFAULT ''");
         EnsureColumnExists(db, "SeenPackets", "ReceivedAtUtc", "TEXT NOT NULL DEFAULT ''");
 
+        EnsureColumnExists(db, "AsymmetricKeys", "KeyId", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "AsymmetricKeys", "AlgorithmCode", "TEXT NOT NULL DEFAULT 'RSA'");
+        EnsureColumnExists(db, "AsymmetricKeys", "OwnerNode", "TEXT NOT NULL DEFAULT 'EQ01'");
+        EnsureColumnExists(db, "AsymmetricKeys", "PublicKeyPem", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "AsymmetricKeys", "ProtectedPrivateKeyBase64", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "AsymmetricKeys", "ParametersJson", "TEXT NOT NULL DEFAULT '{}'");
+        EnsureColumnExists(db, "AsymmetricKeys", "CreatedAtUtc", "TEXT NOT NULL DEFAULT ''");
+
         // 5. Validar conexión y consulta real sobre las entidades
         if (!db.Database.CanConnect())
             throw new InvalidOperationException("SQLite CanConnect() devolvió false.");
@@ -299,7 +326,7 @@ public class AppDbContext : DbContext
             bool changed = false;
             foreach (var u in db.Usuarios.ToList())
             {
-                if (!NodeRuntimeState.IsValidNodeId(u.NodoAsignado))
+                if (!NodeRuntimeState.IsValidAnyVersionNodeId(u.NodoAsignado))
                 {
                     u.NodoAsignado = NodeRuntimeState.CurrentNodeId;
                     changed = true;
@@ -313,7 +340,7 @@ public class AppDbContext : DbContext
             if (changed) db.SaveChanges();
         }
 
-        if (targetPath == DatabasePath)
+        if (targetPath == DatabasePath && NodeRuntimeState.IsV2)
         {
             LoadPersistedPeersIntoRuntime(db);
         }

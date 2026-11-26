@@ -5,19 +5,25 @@ using ModuloCrypto.Core.Services;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 
-namespace ModuloCrypto.Network;
+namespace ModuloCrypto.Network.V2;
 
 /// <summary>
-/// Cliente HTTP v2.0 para comunicación entre nodos (EQ01–EQ08), escaneo de subred /24 en puertos 5001–5020
-/// (timeout 500 ms, máx. 64 conexiones paralelas, cooldown automático de 5 minutos) y validación TOFU.
+/// Cliente HTTP v2.0 con SocketsHttpHandler optimizado, cabeceras X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id,
+/// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1), escaneo de subred /24 en puertos 5001–5020
+/// (SemaphoreSlim(64, 64), timeout 500 ms, cooldown 5 min) y validación TOFU.
 /// </summary>
-public static class NodeNetworkClient
+public static class V2NetworkClient
 {
-    private static readonly HttpClient Http = new()
+    private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
-        Timeout = TimeSpan.FromSeconds(12)
+        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+        ConnectTimeout = TimeSpan.FromSeconds(3)
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(35)
     };
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -28,6 +34,17 @@ public static class NodeNetworkClient
     private static DateTime _lastAutoSubnetScanUtc = DateTime.MinValue;
     public static readonly TimeSpan AutoScanCooldown = TimeSpan.FromMinutes(5);
 
+    private static void AddStandardV2Headers(HttpRequestMessage req, string? requestId = null)
+    {
+        string reqId = string.IsNullOrWhiteSpace(requestId)
+            ? Guid.NewGuid().ToString("D").ToLowerInvariant()
+            : requestId;
+
+        req.Headers.TryAddWithoutValidation("X-CC-Node", NodeRuntimeState.CurrentNodeId);
+        req.Headers.TryAddWithoutValidation("X-CC-Protocol", "2.0");
+        req.Headers.TryAddWithoutValidation("X-CC-Request-Id", reqId);
+    }
+
     public static async Task<(bool Online, string Latency, PeerStatusResponse? Info)> PingNodeAsync(
         PeerNode node,
         int? customTimeoutMs = null)
@@ -36,7 +53,10 @@ public static class NodeNetworkClient
         try
         {
             using var cts = new CancellationTokenSource(customTimeoutMs ?? 1500);
-            var resp = await Http.GetAsync($"{node.BaseUrl}/api/status", cts.Token);
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"{node.BaseUrl}/api/status");
+            AddStandardV2Headers(req);
+
+            var resp = await Http.SendAsync(req, cts.Token);
             sw.Stop();
 
             if (!resp.IsSuccessStatusCode)
@@ -83,10 +103,9 @@ public static class NodeNetworkClient
 
         peer.CertThumbprint = cleanThumb;
 
-        // Si el nodo ya tenía una huella fijada (IsConfirmed) y la huella nueva es diferente -> BLOQUEAR INMEDIATAMENTE
         if (peer.IsConfirmed &&
             !string.IsNullOrWhiteSpace(peer.PinnedThumbprintSha256) &&
-            !NodeCertificateService.FixedTimeEqualsHex(peer.PinnedThumbprintSha256, cleanThumb))
+            !V2CertificateService.FixedTimeEqualsHex(peer.PinnedThumbprintSha256, cleanThumb))
         {
             peer.HasThumbprintMismatch = true;
             peer.Status = "blocked";
@@ -103,7 +122,10 @@ public static class NodeNetworkClient
         try
         {
             using var cts = new CancellationTokenSource(timeoutMs);
-            var resp = await Http.GetAsync($"{peer.BaseUrl}/api/certificate", cts.Token);
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"{peer.BaseUrl}/api/certificate");
+            AddStandardV2Headers(req);
+
+            var resp = await Http.SendAsync(req, cts.Token);
             if (!resp.IsSuccessStatusCode) return false;
 
             string body = await resp.Content.ReadAsStringAsync(cts.Token);
@@ -120,15 +142,23 @@ public static class NodeNetworkClient
 
             if (string.IsNullOrWhiteSpace(pem)) return false;
 
-            using var cert = NodeCertificateService.LoadCertificateFromPemOrBase64(pem);
-            if (!NodeCertificateService.ValidateCertificateMetadata(cert, peer.NodeId, peer.CertThumbprint, out _))
+            using var cert = V2CertificateService.LoadCertificateFromPemOrBase64(pem);
+            if (!V2CertificateService.ValidateCertificateMetadata(cert, peer.NodeId, out _))
             {
                 peer.HasThumbprintMismatch = true;
                 peer.Status = "blocked";
                 return false;
             }
 
-            string actualThumb = NodeCertificateService.GetThumbprintSha256Hex(cert);
+            string actualThumb = V2CertificateService.GetThumbprintSha256Hex(cert);
+            if (!string.IsNullOrWhiteSpace(peer.CertThumbprint) &&
+                !V2CertificateService.FixedTimeEqualsHex(actualThumb, peer.CertThumbprint))
+            {
+                peer.HasThumbprintMismatch = true;
+                peer.Status = "blocked";
+                return false;
+            }
+
             peer.CertificatePem = pem;
             ApplyTofuThumbprintCheck(peer, actualThumb);
             return !peer.HasThumbprintMismatch;
@@ -139,9 +169,6 @@ public static class NodeNetworkClient
         }
     }
 
-    /// <summary>
-    /// Fija (TOFU) o re-confirma explícitamente la huella X.509 de un nodo en SQLite.
-    /// </summary>
     public static void ConfirmPeerTofu(PeerNode peer)
     {
         if (string.IsNullOrWhiteSpace(peer.CertThumbprint)) return;
@@ -161,11 +188,11 @@ public static class NodeNetworkClient
     {
         if (targetPeer.HasThumbprintMismatch || string.Equals(targetPeer.Status, "blocked", StringComparison.OrdinalIgnoreCase))
         {
-            return (false, $"BLOQUEO TOFU (E-CERT-UNTRUSTED): El nodo {targetPeer.NodeId} presentó un cambio de huella X.509. Debes reconfirmar su huella en 'Red de Nodos (IP)' antes de enviar paquetes.");
+            return (false, $"BLOQUEO TOFU (E-CERT-UNTRUSTED): El nodo {targetPeer.NodeId} presentó un cambio de huella X.509. Reconfirma su huella en 'Red de Nodos (IP)' antes de enviar paquetes.");
         }
 
         byte[] fileBytes = await File.ReadAllBytesAsync(zipPath);
-        if (fileBytes.Length > PacketZipService.MaxCompressedZipBytes)
+        if (fileBytes.Length > V2PacketZipService.MaxCompressedZipBytes)
         {
             return (false, "E-SIZE: El paquete .zip supera el límite máximo de 50 MB.");
         }
@@ -188,9 +215,7 @@ public static class NodeNetworkClient
             {
                 Content = form
             };
-            req.Headers.TryAddWithoutValidation("X-Source-Node", NodeRuntimeState.CurrentNodeId);
-            req.Headers.TryAddWithoutValidation("X-Packet-Id", packetId);
-            req.Headers.TryAddWithoutValidation("X-Protocol-Version", "2.0");
+            AddStandardV2Headers(req, packetId);
 
             var resp = await Http.SendAsync(req);
             string body = await resp.Content.ReadAsStringAsync();
@@ -210,6 +235,139 @@ public static class NodeNetworkClient
         }
     }
 
+    /// <summary>
+    /// Invoca POST /api/crypto/forward en un nodo proveedor v2.0 (firmando los bytes crudos de 'request' con RSA-PSS-SHA256).
+    /// </summary>
+    public static async Task<(bool Success, V2CryptoForwardResponse? Response, string ErrorMessage)> CallRemoteForwardAsync(
+        PeerNode providerPeer,
+        string algorithmCode,
+        byte[] payloadBytes,
+        string fileName,
+        string extension,
+        int keySizeBits = 256)
+    {
+        if (providerPeer.HasThumbprintMismatch)
+            return (false, null, $"El nodo {providerPeer.NodeId} está bloqueado por cambio de huella TOFU.");
+
+        string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+        string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+
+        var fwdReq = new V2CryptoForwardRequest
+        {
+            RequestId = requestId,
+            PacketId = packetId,
+            RequesterNode = NodeRuntimeState.CurrentNodeId,
+            AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
+            Operation = "forward",
+            OriginalFileName = fileName,
+            OriginalExtension = extension,
+            KeySizeBits = keySizeBits,
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        };
+
+        byte[] rawRequestBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(fwdReq));
+        string requestSigBase64 = V2CertificateService.SignDataPss(rawRequestBytes);
+        string requesterCertPem = V2CertificateService.ExportPublicCertPem();
+
+        using var form = new MultipartFormDataContent();
+        var reqContent = new ByteArrayContent(rawRequestBytes);
+        reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        form.Add(reqContent, "request", "request.json");
+        form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
+        form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
+
+        var payloadContent = new ByteArrayContent(payloadBytes);
+        payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        form.Add(payloadContent, "payload", string.IsNullOrWhiteSpace(fileName) ? "payload.bin" : fileName);
+
+        string url = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/crypto/forward";
+        using var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
+        AddStandardV2Headers(httpReq, requestId);
+
+        var resp = await Http.SendAsync(httpReq);
+        string body = await resp.Content.ReadAsStringAsync();
+
+        if (!resp.IsSuccessStatusCode)
+            return (false, null, $"HTTP {(int)resp.StatusCode}: {body}");
+
+        var parsed = JsonSerializer.Deserialize<V2CryptoForwardResponse>(body, JsonOpts);
+        return (parsed != null, parsed, parsed != null ? "OK" : "Respuesta vacía");
+    }
+
+    /// <summary>
+    /// Invoca POST /api/crypto/inverse en un nodo proveedor v2.0 y abre el sobre CC-ENV-1 de resultado.enc.
+    /// </summary>
+    public static async Task<(bool Success, byte[]? DecryptedPlainBytes, V2ParsedZipPacket? ResultZip, string ErrorMessage)> CallRemoteInverseAsync(
+        PeerNode providerPeer,
+        string algorithmCode,
+        string packetId,
+        byte[] cipherOrPackageBytes,
+        Dictionary<string, string> publicParameters,
+        CcHybridEnvelope? secretEnvelope = null,
+        string? keyId = null)
+    {
+        if (providerPeer.HasThumbprintMismatch)
+            return (false, null, null, $"El nodo {providerPeer.NodeId} está bloqueado por cambio de huella TOFU.");
+
+        string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+        var invReq = new V2CryptoInverseRequest
+        {
+            RequestId = requestId,
+            PacketId = packetId,
+            RequesterNode = NodeRuntimeState.CurrentNodeId,
+            AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
+            Operation = "inverse",
+            KeyId = keyId ?? packetId,
+            SecretEnvelope = secretEnvelope,
+            PublicParameters = publicParameters,
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        };
+
+        byte[] rawRequestBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(invReq));
+        string requestSigBase64 = V2CertificateService.SignDataPss(rawRequestBytes);
+        string requesterCertPem = V2CertificateService.ExportPublicCertPem();
+
+        using var form = new MultipartFormDataContent();
+        var reqContent = new ByteArrayContent(rawRequestBytes);
+        reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        form.Add(reqContent, "request", "request.json");
+        form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
+        form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
+
+        var payloadContent = new ByteArrayContent(cipherOrPackageBytes);
+        payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        form.Add(payloadContent, "payload", "datos.enc");
+
+        string url = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/crypto/inverse";
+        using var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
+        AddStandardV2Headers(httpReq, requestId);
+
+        var resp = await Http.SendAsync(httpReq);
+        if (!resp.IsSuccessStatusCode)
+        {
+            string errBody = await resp.Content.ReadAsStringAsync();
+            return (false, null, null, $"HTTP {(int)resp.StatusCode}: {errBody}");
+        }
+
+        byte[] resultZipBytes = await resp.Content.ReadAsByteArrayAsync();
+        string tempResZip = Path.Combine(Path.GetTempPath(), $"RES_recv_{Guid.NewGuid():N}.zip");
+        try
+        {
+            await File.WriteAllBytesAsync(tempResZip, resultZipBytes);
+            var parsedRes = V2PacketZipService.ReadPacketZip(tempResZip, enforceStrictSignature: true);
+            string envJson = Encoding.UTF8.GetString(parsedRes.PayloadBytes);
+            var resultEnv = JsonSerializer.Deserialize<CcHybridEnvelope>(envJson, JsonOpts)
+                ?? throw new PacketValidationException("E-ENV-DECRYPT", 400, "resultado.enc no contiene un sobre CC-ENV-1 válido.");
+
+            byte[] plainBytes = V2EnvelopeService.Open(resultEnv, requestId);
+            return (true, plainBytes, parsedRes, "OK");
+        }
+        finally
+        {
+            try { if (File.Exists(tempResZip)) File.Delete(tempResZip); } catch { }
+        }
+    }
+
     public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5001, int endPort = 5020)
     {
         var found = new ConcurrentBag<PeerNode>();
@@ -219,7 +377,7 @@ public static class NodeNetworkClient
         {
             var probe = new PeerNode
             {
-                NodeId = $"EQ{(port - 5000):D2}",
+                NodeId = $"EQ{Math.Clamp(port - 5000, 1, 99):D2}",
                 TeamNumber = Math.Clamp(port - 5000, 1, 99),
                 IpAddress = "127.0.0.1",
                 Port = port,
@@ -237,10 +395,6 @@ public static class NodeNetworkClient
         return found.OrderBy(p => p.Port).ToList();
     }
 
-    /// <summary>
-    /// Escaneo HTTP de respaldo en subred /24 sobre puertos 5001–5020 (timeout 500 ms, máx. 64 conexiones paralelas,
-    /// cooldown de 5 minutos para ejecuciones automáticas).
-    /// </summary>
     public static async Task<(List<PeerNode> Found, bool SkippedByCooldown)> ScanLanSubnetAsync(
         string localIp,
         int startPort = 5001,
@@ -260,7 +414,6 @@ public static class NodeNetworkClient
         if (parts.Length == 4 && parts[0] != "127")
             prefix = $"{parts[0]}.{parts[1]}.{parts[2]}.";
 
-        // En escaneo manual de red LAN priorizamos el rango oficial de equipos (5001..5008 o startPort..endPort) con 64 conexiones en paralelo y 500ms timeout
         var targets = new List<(string Ip, int Port)>();
         for (int host = 1; host <= 254; host++)
         {
@@ -269,7 +422,7 @@ public static class NodeNetworkClient
                 targets.Add((ip, port));
         }
 
-        using var sem = new SemaphoreSlim(64);
+        using var sem = new SemaphoreSlim(64, 64);
         var tasks = targets.Select(async target =>
         {
             await sem.WaitAsync();

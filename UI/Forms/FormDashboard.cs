@@ -1,8 +1,9 @@
-using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
-using ModuloCrypto.Network;
+using ModuloCrypto.Network.Shared;
+using ModuloCrypto.Network.V1;
+using ModuloCrypto.Network.V2;
 using ModuloCrypto.Security;
 using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Theme;
@@ -32,6 +33,7 @@ public partial class FormDashboard : Form
     };
 
     private readonly Usuario _currentUser;
+    private readonly INodeProtocolRuntime _runtime;
     private readonly string _userFullName;
     private readonly ToolTip _dashboardToolTip = new();
     private readonly Font _logoGlyphFont = new("Segoe UI Symbol", 15f, FontStyle.Bold);
@@ -49,6 +51,12 @@ public partial class FormDashboard : Form
     private StatusPill _pillSqlite = null!;
     private StatusPill _pillCert = null!;
 
+    // Recuadros dinámicos de IP local (Topbar + Red de Nodos)
+    private readonly List<Label> _ipEndpointLabels = new();
+    private readonly List<Label> _ipInterfaceBadges = new();
+    private readonly List<ComboBox> _ipAdapterCombos = new();
+    private bool _suppressAdapterComboEvent;
+
     // Dashboard / Crypto Stage Controls
     private HologramLockControl _hologram = null!;
     private Label _lblAlgDesc = null!;
@@ -63,7 +71,7 @@ public partial class FormDashboard : Form
     private CheckBox _chkAutoDownloadBinary = null!;
     private string _viewerMode = "TEXT";
 
-    // Metadata (v2.0 Traceability)
+    // Metadata (V1 / V2 Traceability)
     private TextBox _txtMetaPacketId = null!;
     private TextBox _txtMetaRootNode = null!;
     private Label _lblMetaSignatureBadge = null!;
@@ -73,7 +81,7 @@ public partial class FormDashboard : Form
     private ComboBox _cmbTargetPeer = null!;
 
     // Current working payload state
-    private byte[] _currentBytes = Encoding.UTF8.GetBytes("Mensaje confidencial ModuloCrypto — Estándar de Comunicación v2.0 (EQ01).");
+    private byte[] _currentBytes;
     private string _currentFileName = "mensaje_seguro.txt";
     private string _currentExtension = ".txt";
     private RegistroCifrado? _activeRecord;
@@ -82,29 +90,41 @@ public partial class FormDashboard : Form
     private string? _lastSavedDecryptedPath;
     private string? _binarySummaryReport;
 
-    // Contexto para reenvío / salto intermedio v2.0 (ProducerNode original)
+    // Contexto para reenvío / salto intermedio
     private string? _relayProducerNode;
+    private string? _relayRootSignatureBase64;
+    private string? _relayRootCertBase64;
+    private string? _relayRemoteDecryptLink;
     private string? _relaySourceZipPath;
     private List<string>? _relayHopHistory;
 
-    public FormDashboard(Usuario currentUser)
+    public FormDashboard(Usuario currentUser, INodeProtocolRuntime? runtime = null)
     {
         _currentUser = currentUser;
+        _runtime = runtime ?? NodeRuntimeState.ActiveRuntime ?? (NodeRuntimeState.IsV2 ? new V2ProtocolRuntime() : new V1ProtocolRuntime());
         _currentUser.NodoAsignado = NodeRuntimeState.CurrentNodeId;
 
         _userFullName = string.IsNullOrWhiteSpace(currentUser.NombreCompleto)
             ? currentUser.NombreUsuario
             : currentUser.NombreCompleto;
 
-        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} (Estándar v2.0 • HTTP :{NodeRuntimeState.ApiPort} • UDP :{NodeRuntimeState.UdpDiscoveryPort})";
+        _currentBytes = Encoding.UTF8.GetBytes(
+            NodeRuntimeState.IsV2
+                ? $"Mensaje confidencial ModuloCrypto — Estándar de Comunicación v2.0 ({NodeRuntimeState.CurrentNodeId})."
+                : $"Mensaje confidencial ModuloCrypto — Versión 1.0 Legado ({NodeRuntimeState.CurrentNodeId}).");
+
+        string protoDesc = NodeRuntimeState.IsV2
+            ? $"Estándar v2.0 • HTTP :{NodeRuntimeState.ApiPort} • UDP :{NodeRuntimeState.UdpDiscoveryPort}"
+            : $"Versión 1.0 Legado • HTTP :{NodeRuntimeState.ApiPort}";
+
+        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} ({protoDesc})";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1220, 740);
+        MinimumSize = new Size(1240, 760);
         BackColor = HologramTheme.BackgroundBase;
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
 
-        // Verificar conexión real a SQLite al abrir el Dashboard
         NodeRuntimeState.SqliteConnected = AppDbContext.TestConnection(out string diag);
         NodeRuntimeState.SqliteDiagnostic = diag;
 
@@ -115,6 +135,7 @@ public partial class FormDashboard : Form
         BuildNetworkView();
         BuildSettingsView();
 
+        RefreshActiveIpCardsUi();
         UpdateSqlitePillState();
         SwitchView("dashboard");
         RefreshPendingSolicitudesBadge();
@@ -123,16 +144,248 @@ public partial class FormDashboard : Form
 
         NodeRuntimeState.OnPacketReceived += HandleIncomingPacketEvent;
         NodeRuntimeState.OnPeerDiscoveredOrChanged += HandlePeerChangedEvent;
+        NetworkAddressService.OnNetworkEndpointsChanged += HandleNetworkEndpointsChangedEvent;
+
+        Shown += (_, _) =>
+        {
+            if (!_runtime.IsApiOnline && !string.IsNullOrWhiteSpace(_runtime.LastStartupError))
+            {
+                MessageBox.Show(this,
+                    $"El servidor HTTP embebido no pudo escuchar en http://0.0.0.0:{NodeRuntimeState.ApiPort}.\n\n" +
+                    $"Detalle: {_runtime.LastStartupError}\n\n" +
+                    $"Verifica que ningún otro proceso ocupe el puerto {NodeRuntimeState.ApiPort} o los permisos del Firewall de Windows.",
+                    $"Advertencia de Puerto HTTP :{NodeRuntimeState.ApiPort}",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        };
+
         FormClosed += (_, _) =>
         {
             NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
             NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
+            NetworkAddressService.OnNetworkEndpointsChanged -= HandleNetworkEndpointsChangedEvent;
             _dashboardToolTip.Dispose();
             _logoGlyphFont.Dispose();
             _logoTitleFont.Dispose();
             _logoSubFont.Dispose();
             _avatarInitialsFont.Dispose();
         };
+    }
+
+    /// <summary>
+    /// Crea un recuadro destacado (tarjeta glass con borde cian neón) que muestra el Badge de Versión,
+    /// Mi IP / Endpoint activo en Cascadia Mono grande (#00D2FF), interfaz activa, selector de adaptador,
+    /// botón [📋 Copiar IP] y botón [↻ Refrescar IP].
+    /// </summary>
+    private GlassPanel CreateActiveIpCardControl()
+    {
+        var ipCard = new GlassPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            MinimumSize = new Size(0, 56),
+            CornerRadius = 12,
+            NeonBorderGlow = true,
+            BorderColor = HologramTheme.HologramCyan,
+            FillColorTop = Color.FromArgb(24, 21, 44),
+            FillColorBottom = HologramTheme.PanelGlass,
+            Padding = new Padding(12, 8, 12, 8),
+            Margin = new Padding(0, 4, 0, 4)
+        };
+
+        var flow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = Color.Transparent,
+            Margin = new Padding(0)
+        };
+
+        var lblVersionBadge = new Label
+        {
+            Text = $" {(_runtime.VersionBadgeText)} ",
+            Font = new Font("Cascadia Mono", 8.8f, FontStyle.Bold),
+            ForeColor = Color.White,
+            BackColor = NodeRuntimeState.IsV2 ? HologramTheme.AccentStart : Color.FromArgb(65, 110, 215),
+            AutoSize = true,
+            Padding = new Padding(8, 5, 8, 5),
+            Margin = new Padding(0, 4, 12, 4),
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+
+        var lblCaption = new Label
+        {
+            Text = "MI IP ACTIVA:",
+            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
+            ForeColor = HologramTheme.TextSecondary,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 6, 4),
+            BackColor = Color.Transparent
+        };
+
+        var lblIpEndpoint = new Label
+        {
+            Text = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}",
+            Font = new Font("Cascadia Mono", 12f, FontStyle.Bold),
+            ForeColor = HologramTheme.HologramCyan,
+            AutoSize = true,
+            Margin = new Padding(0, 3, 10, 4),
+            BackColor = Color.Transparent
+        };
+        _ipEndpointLabels.Add(lblIpEndpoint);
+
+        var lblInterfaceBadge = new Label
+        {
+            Text = $"[{NodeRuntimeState.ActiveInterfaceName}]",
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
+            ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success,
+            AutoSize = true,
+            Margin = new Padding(0, 7, 12, 4),
+            BackColor = Color.Transparent
+        };
+        _ipInterfaceBadges.Add(lblInterfaceBadge);
+
+        var cmbAdapter = new ComboBox
+        {
+            Size = new Size(215, 28),
+            Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
+            Margin = new Padding(0, 4, 10, 4)
+        };
+        HologramTheme.StyleComboBox(cmbAdapter, HologramTheme.HologramCyan);
+        cmbAdapter.SelectedIndexChanged += async (_, _) =>
+        {
+            if (_suppressAdapterComboEvent) return;
+            if (cmbAdapter.SelectedItem is LocalNetworkEndpoint ep)
+            {
+                NetworkAddressService.SelectActiveEndpoint(ep.Ipv4Address);
+                RefreshActiveIpCardsUi();
+                await _runtime.AnnouncePresenceAsync();
+            }
+        };
+        _ipAdapterCombos.Add(cmbAdapter);
+
+        var btnCopyIp = new NeonButton
+        {
+            Text = "📋 Copiar IP",
+            Variant = NeonButtonVariant.Cyan,
+            CornerRadius = 8,
+            Margin = new Padding(0, 2, 8, 2)
+        };
+        btnCopyIp.FitToText(minWidth: 118, height: 32);
+        btnCopyIp.Click += async (_, _) =>
+        {
+            string epText = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
+            Clipboard.SetText(epText);
+            btnCopyIp.Text = "✓ Copiada";
+            btnCopyIp.Variant = NeonButtonVariant.Success;
+            btnCopyIp.FitToText(minWidth: 118, height: 32);
+            await Task.Delay(1300);
+            if (!btnCopyIp.IsDisposed)
+            {
+                btnCopyIp.Text = "📋 Copiar IP";
+                btnCopyIp.Variant = NeonButtonVariant.Cyan;
+                btnCopyIp.FitToText(minWidth: 118, height: 32);
+            }
+        };
+
+        var btnRefreshIp = new NeonButton
+        {
+            Text = "↻ Refrescar IP",
+            Variant = NeonButtonVariant.Secondary,
+            CornerRadius = 8,
+            Margin = new Padding(0, 2, 4, 2)
+        };
+        btnRefreshIp.FitToText(minWidth: 128, height: 32);
+        btnRefreshIp.Click += async (_, _) =>
+        {
+            btnRefreshIp.Enabled = false;
+            NetworkAddressService.RefreshRuntimePrimaryEndpoint();
+            RefreshActiveIpCardsUi();
+            await _runtime.AnnouncePresenceAsync();
+            RefreshNetworkGrid();
+            btnRefreshIp.Enabled = true;
+        };
+
+        flow.Controls.AddRange(new Control[]
+        {
+            lblVersionBadge,
+            lblCaption,
+            lblIpEndpoint,
+            lblInterfaceBadge,
+            cmbAdapter,
+            btnCopyIp,
+            btnRefreshIp
+        });
+
+        ipCard.Controls.Add(flow);
+        return ipCard;
+    }
+
+    private void RefreshActiveIpCardsUi()
+    {
+        var endpoints = NetworkAddressService.GetAvailableIpv4Endpoints();
+        string endpointDisplay = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
+        string ifaceDisplay = NodeRuntimeState.IsLoopbackFallback
+            ? "[Sin red LAN]"
+            : $"[{NodeRuntimeState.ActiveInterfaceName} • Bcast {NodeRuntimeState.SubnetBroadcastAddress}]";
+
+        foreach (var lbl in _ipEndpointLabels)
+        {
+            lbl.Text = endpointDisplay;
+        }
+
+        foreach (var badge in _ipInterfaceBadges)
+        {
+            badge.Text = ifaceDisplay;
+            badge.ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success;
+        }
+
+        _suppressAdapterComboEvent = true;
+        try
+        {
+            foreach (var cmb in _ipAdapterCombos)
+            {
+                cmb.Items.Clear();
+                int selIdx = 0;
+                for (int i = 0; i < endpoints.Count; i++)
+                {
+                    cmb.Items.Add(endpoints[i]);
+                    if (string.Equals(endpoints[i].Ipv4Address, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase))
+                        selIdx = i;
+                }
+                if (cmb.Items.Count > 0)
+                    cmb.SelectedIndex = selIdx;
+                cmb.Visible = endpoints.Count > 1;
+            }
+        }
+        finally
+        {
+            _suppressAdapterComboEvent = false;
+        }
+
+        // Actualizar también el nodo propio en NetworkPeers
+        var selfPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+            string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase));
+        if (selfPeer != null)
+        {
+            selfPeer.IpAddress = NodeRuntimeState.LocalIpAddress;
+            selfPeer.Port = NodeRuntimeState.ApiPort;
+        }
+    }
+
+    private void HandleNetworkEndpointsChangedEvent(LocalNetworkEndpoint ep)
+    {
+        if (IsDisposed) return;
+        BeginInvoke(async () =>
+        {
+            RefreshActiveIpCardsUi();
+            RefreshNetworkGrid();
+            RefreshTargetPeerCombo();
+            await _runtime.AnnouncePresenceAsync();
+        });
     }
 
     private void UpdateSqlitePillState()
@@ -183,7 +436,11 @@ public partial class FormDashboard : Form
                 new Rectangle(62, 18, 200, 26), HologramTheme.TextPrimary,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
 
-            TextRenderer.DrawText(g, $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}", _logoSubFont,
+            string subLabel = NodeRuntimeState.IsV2
+                ? $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}"
+                : $"VERSIÓN 1.0 • {NodeRuntimeState.CurrentNodeId}";
+
+            TextRenderer.DrawText(g, subLabel, _logoSubFont,
                 new Rectangle(62, 45, 200, 18), HologramTheme.HologramCyan,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
 
@@ -191,7 +448,7 @@ public partial class FormDashboard : Form
             g.DrawLine(sepPen, 16, logoPanel.Height - 1, logoPanel.Width - 16, logoPanel.Height - 1);
         };
 
-        // Tarjeta de Perfil Inferior con TableLayoutPanel interno para cero encimamientos
+        // Tarjeta de Perfil Inferior
         var profileWrap = new Panel
         {
             Dock = DockStyle.Bottom,
@@ -212,7 +469,7 @@ public partial class FormDashboard : Form
 
         var btnLogout = new NeonButton
         {
-            Text = "Cerrar Sesión",
+            Text = "Cerrar Sesión / Cambiar Versión",
             Variant = NeonButtonVariant.Secondary,
             Dock = DockStyle.Bottom,
             Height = 34,
@@ -277,7 +534,7 @@ public partial class FormDashboard : Form
         };
         var lblProfStatus = new Label
         {
-            Text = $"● Online • {NodeRuntimeState.CurrentNodeId}",
+            Text = $"● Online • {NodeRuntimeState.CurrentNodeId} (v{NodeRuntimeState.ProtocolVersion})",
             Font = new Font("Cascadia Mono", 8f, FontStyle.Bold),
             ForeColor = HologramTheme.Success,
             Dock = DockStyle.Fill,
@@ -334,7 +591,7 @@ public partial class FormDashboard : Form
         sidebar.Controls.Add(profileWrap);
         sidebar.Controls.Add(logoPanel);
 
-        // 2. Contenedor Principal Derecho (Topbar de 2 filas + ViewHost)
+        // 2. Contenedor Principal Derecho (Topbar con Recuadro de IP Activa + ViewHost)
         var mainRight = new Panel
         {
             Dock = DockStyle.Fill,
@@ -345,14 +602,15 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Top,
             AutoSize = true,
-            MinimumSize = new Size(0, 96),
+            MinimumSize = new Size(0, 146),
             ColumnCount = 2,
-            RowCount = 2,
+            RowCount = 3,
             BackColor = HologramTheme.PanelGlass,
-            Padding = new Padding(22, 10, 22, 10)
+            Padding = new Padding(20, 8, 20, 8)
         };
         topbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         topbar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.Paint += (_, e) =>
@@ -365,36 +623,40 @@ public partial class FormDashboard : Form
         var greetingStack = new Panel
         {
             Dock = DockStyle.Fill,
-            Height = 52,
+            Height = 50,
             BackColor = HologramTheme.PanelGlass
         };
         var lblWelcome = new Label
         {
             Text = $"Bienvenido, {_userFullName}",
-            Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Top,
-            Height = 28,
+            Height = 26,
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = true
         };
+        string subWelcomeText = NodeRuntimeState.IsV2
+            ? $"Nodo activo: {NodeRuntimeState.CurrentNodeId} (Estándar v2.0) • Dueño oficial: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}"
+            : $"Nodo activo: {NodeRuntimeState.CurrentNodeId} (Versión 1.0 Legado) • 21 Algoritmos Oficiales Habilitados";
+
         var lblSubWelcome = new Label
         {
-            Text = $"Nodo activo: {NodeRuntimeState.CurrentNodeId} • Estado: Operativo • Dueño: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}",
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Text = subWelcomeText,
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Top,
-            Height = 22,
+            Height = 20,
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = true
         };
         greetingStack.Controls.Add(lblSubWelcome);
         greetingStack.Controls.Add(lblWelcome);
 
-        // Fila 0, Col 1: Selector de algoritmo activo (Width = 320)
+        // Fila 0, Col 1: Selector de algoritmo activo
         var algPanel = new Panel
         {
-            Size = new Size(320, 52),
+            Size = new Size(320, 50),
             Margin = new Padding(12, 0, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
@@ -422,19 +684,22 @@ public partial class FormDashboard : Form
         algPanel.Controls.Add(_cmbAlgorithm);
         algPanel.Controls.Add(lblAlgCap);
 
-        // Fila 1 (Span 2 columnas): FlowLayoutPanel con las 3 píldoras autoajustadas
+        // Fila 1 (Span 2 columnas): Recuadro Dinámico de IP Local Activa (estilo tarjeta glass con borde cian neón)
+        var topIpCard = CreateActiveIpCardControl();
+
+        // Fila 2 (Span 2 columnas): FlowLayoutPanel con las 3 píldoras autoajustadas
         var pillsFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
             AutoSize = true,
-            Padding = new Padding(0, 6, 0, 2),
+            Padding = new Padding(0, 4, 0, 2),
             BackColor = HologramTheme.PanelGlass
         };
         _pillApi = new StatusPill
         {
-            Text = NodeRuntimeState.ApiOnline ? $"API: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
+            Text = NodeRuntimeState.ApiOnline ? $"API v{NodeRuntimeState.ProtocolVersion}: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
             IsActive = NodeRuntimeState.ApiOnline,
             Margin = new Padding(0, 2, 10, 2)
         };
@@ -454,14 +719,16 @@ public partial class FormDashboard : Form
 
         topbar.Controls.Add(greetingStack, 0, 0);
         topbar.Controls.Add(algPanel, 1, 0);
-        topbar.Controls.Add(pillsFlow, 0, 1);
+        topbar.Controls.Add(topIpCard, 0, 1);
+        topbar.SetColumnSpan(topIpCard, 2);
+        topbar.Controls.Add(pillsFlow, 0, 2);
         topbar.SetColumnSpan(pillsFlow, 2);
 
         _viewHost = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = HologramTheme.BackgroundBase,
-            Padding = new Padding(18)
+            Padding = new Padding(16)
         };
 
         mainRight.Controls.Add(_viewHost);
@@ -473,7 +740,7 @@ public partial class FormDashboard : Form
 
     private static string BuildInitials(string fullName)
     {
-        if (string.IsNullOrWhiteSpace(fullName)) return "EQ";
+        if (string.IsNullOrWhiteSpace(fullName)) return "MC";
         var parts = fullName.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length >= 2)
             return $"{char.ToUpperInvariant(parts[0][0])}{char.ToUpperInvariant(parts[1][0])}";
@@ -524,7 +791,7 @@ public partial class FormDashboard : Form
         split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49f));
         split.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-        // === COLUMNA IZQUIERDA / CENTRO: HOLOGRAMA 3D BINARIO + PANEL DE ACCIONES (182 px) ===
+        // === COLUMNA IZQUIERDA: HOLOGRAMA 3D BINARIO + PANEL DE ACCIONES (182 px) ===
         var leftCol = new Panel
         {
             Dock = DockStyle.Fill,
@@ -545,7 +812,7 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Fill,
             ActiveAlgorithmLabel = "AESGCM",
-            StatusSubtitle = $"{NodeRuntimeState.CurrentNodeId} • Cubo Binario 3D en Reposo"
+            StatusSubtitle = $"{NodeRuntimeState.CurrentNodeId} (v{NodeRuntimeState.ProtocolVersion}) • Cubo Binario 3D en Reposo"
         };
 
         _lblAlgDesc = new Label
@@ -648,20 +915,39 @@ public partial class FormDashboard : Form
             Dock = DockStyle.Fill,
             Margin = new Padding(4)
         };
-        btnSendZip.Click += async (_, _) => await HandleSendZipToPeerAsync();
-
-        var btnExportZip = new NeonButton
+        btnSendZip.Click += async (_, _) =>
         {
-            Text = "📦 Exportar .ZIP",
+            btnSendZip.Enabled = false;
+            try { await HandleSendZipToPeerAsync(); }
+            finally { if (!btnSendZip.IsDisposed) btnSendZip.Enabled = true; }
+        };
+
+        var btnThirdAction = new NeonButton
+        {
+            Text = NodeRuntimeState.IsV2 ? "📦 Exportar .ZIP" : "🌐 Descifrar Remoto",
             Variant = NeonButtonVariant.Secondary,
             Dock = DockStyle.Fill,
             Margin = new Padding(4)
         };
-        btnExportZip.Click += (_, _) => HandleExportV2ZipLocally();
+        btnThirdAction.Click += async (_, _) =>
+        {
+            btnThirdAction.Enabled = false;
+            try
+            {
+                if (NodeRuntimeState.IsV2)
+                    HandleExportZipLocally();
+                else
+                    await HandleRemoteDecryptActionV1Async();
+            }
+            finally
+            {
+                if (!btnThirdAction.IsDisposed) btnThirdAction.Enabled = true;
+            }
+        };
 
         actionGrid.Controls.Add(btnRelayEncrypt, 0, 2);
         actionGrid.Controls.Add(btnSendZip, 1, 2);
-        actionGrid.Controls.Add(btnExportZip, 2, 2);
+        actionGrid.Controls.Add(btnThirdAction, 2, 2);
 
         actionCard.Controls.Add(actionGrid);
 
@@ -670,7 +956,7 @@ public partial class FormDashboard : Form
         leftCol.Controls.Add(spacer);
         leftCol.Controls.Add(actionCard);
 
-        // === COLUMNA DERECHA: VISOR (CON TABLELAYOUTPANEL HEADER) + METADATOS ===
+        // === COLUMNA DERECHA: VISOR + METADATOS ===
         var rightCol = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -810,7 +1096,6 @@ public partial class FormDashboard : Form
         viewerCard.Controls.Add(fileActionsBar);
         viewerCard.Controls.Add(viewerHeader);
 
-        // Card de Metadatos con TableLayoutPanel en el encabezado para evitar encimamientos
         var metaCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -831,7 +1116,9 @@ public partial class FormDashboard : Form
 
         var lblMetaTitle = new Label
         {
-            Text = "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA",
+            Text = NodeRuntimeState.IsV2
+                ? "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA (11 CAMPOS)"
+                : "MANIFIESTO v1.0 • TRAZABILIDAD TOR Y FIRMA X.509",
             Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Fill,
@@ -841,7 +1128,7 @@ public partial class FormDashboard : Form
         };
         _lblMetaSignatureBadge = new Label
         {
-            Text = $"● RSA-PSS Listo ({NodeRuntimeState.CurrentNodeId})",
+            Text = $"● X.509 Listo ({NodeRuntimeState.CurrentNodeId})",
             Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             AutoSize = true,
@@ -860,7 +1147,7 @@ public partial class FormDashboard : Form
             Padding = new Padding(0, 6, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
-        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 156));
+        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
         metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
@@ -868,10 +1155,10 @@ public partial class FormDashboard : Form
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "packetId (UUID v4):", "---");
-        _txtMetaRootNode = AddMetaRow(metaGrid, 1, "producerNode / source:", NodeRuntimeState.CurrentNodeId);
+        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "PacketId (UUID):", "---");
+        _txtMetaRootNode = AddMetaRow(metaGrid, 1, NodeRuntimeState.IsV2 ? "producerNode / source:" : "Nodo Raíz (Origen):", NodeRuntimeState.CurrentNodeId);
         _txtMetaHops = AddMetaRow(metaGrid, 2, "Ruta / Trazabilidad:", NodeRuntimeState.CurrentNodeId);
-        _txtMetaKeyRef = AddMetaRow(metaGrid, 3, "keyRef (Custodia):", $"ownerNode={NodeRuntimeState.CurrentNodeId}");
+        _txtMetaKeyRef = AddMetaRow(metaGrid, 3, NodeRuntimeState.IsV2 ? "keyRef (Custodia):" : "Link Descifrado Remoto:", $"owner={NodeRuntimeState.CurrentNodeId}");
 
         var lblPub = new Label
         {
@@ -928,7 +1215,7 @@ public partial class FormDashboard : Form
         {
             string owner = CryptoCatalog.GetOwnerNode(info.Code);
             _hologram.ActiveAlgorithmLabel = info.Code;
-            _lblAlgDesc.Text = $"[#{CryptoCatalog.GetAlgorithmId(info.Code)} • Dueño: {owner} • {info.Category}]  {info.Description}";
+            _lblAlgDesc.Text = $"[#{CryptoCatalog.GetAlgorithmId(info.Code)} • Dueño v2.0: {owner} • {info.Category}]  {info.Description}";
         }
     }
 
@@ -1103,9 +1390,9 @@ public partial class FormDashboard : Form
         if (_isFromNetworkUntrusted)
         {
             MessageBox.Show(this,
-                "Por política de seguridad del Estándar v2.0, está prohibido abrir o ejecutar directamente archivos recibidos desde la red.\n\n" +
+                "Por política de seguridad, está prohibido abrir o ejecutar directamente archivos recibidos desde la red.\n\n" +
                 "Puedes guardar los bytes de forma segura usando [💾 Descargar Archivo] o inspeccionarlos en [Hex].",
-                "Política de Seguridad v2.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                "Política de Seguridad", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -1142,6 +1429,9 @@ public partial class FormDashboard : Form
     private void ClearRelayContext()
     {
         _relayProducerNode = null;
+        _relayRootSignatureBase64 = null;
+        _relayRootCertBase64 = null;
+        _relayRemoteDecryptLink = null;
         _relaySourceZipPath = null;
         _relayHopHistory = null;
     }
@@ -1167,14 +1457,20 @@ public partial class FormDashboard : Form
                 origExtensionBeforeEncrypt);
 
             string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
-            string keyId = $"key-{packetId}";
-
             string producerNode;
+            string rootSignature;
+            string remoteLink;
             List<string> hops;
 
             if (asIntermediateHop && !string.IsNullOrWhiteSpace(_relayProducerNode))
             {
                 producerNode = _relayProducerNode!;
+                rootSignature = !string.IsNullOrWhiteSpace(_relayRootSignatureBase64)
+                    ? _relayRootSignatureBase64!
+                    : SignBytesCurrentVersion(result.OutputBytes);
+                remoteLink = !string.IsNullOrWhiteSpace(_relayRemoteDecryptLink)
+                    ? _relayRemoteDecryptLink!
+                    : BuildDefaultKeyLink(packetId);
                 hops = _relayHopHistory != null ? new List<string>(_relayHopHistory) : new List<string> { producerNode };
                 if (hops.Count == 0 || hops[^1] != NodeRuntimeState.CurrentNodeId)
                     hops.Add(NodeRuntimeState.CurrentNodeId);
@@ -1183,6 +1479,8 @@ public partial class FormDashboard : Form
             {
                 ClearRelayContext();
                 producerNode = NodeRuntimeState.CurrentNodeId;
+                rootSignature = SignBytesCurrentVersion(result.OutputBytes);
+                remoteLink = BuildDefaultKeyLink(packetId);
                 hops = new List<string> { NodeRuntimeState.CurrentNodeId };
             }
 
@@ -1201,9 +1499,9 @@ public partial class FormDashboard : Form
                 AlgoritmoCodigo = algInfo.Code,
                 ParametrosPublicosJson = enrichedPubJson,
                 LlaveSecretaBase64 = result.SecretKeyBase64,
-                LinkDescifradoRemoto = keyId,
+                LinkDescifradoRemoto = remoteLink,
                 NodoRaiz = producerNode,
-                FirmaRaizBase64 = NodeCertificateService.SignDataPss(result.OutputBytes),
+                FirmaRaizBase64 = rootSignature,
                 RutaSaltosJson = JsonSerializer.Serialize(hops),
                 Origen = asIntermediateHop && producerNode != NodeRuntimeState.CurrentNodeId ? "Relay" : "Local",
                 FechaOperacion = DateTime.Now
@@ -1239,6 +1537,14 @@ public partial class FormDashboard : Form
                 "ModuloCrypto — Error de Cifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
+
+    private static string SignBytesCurrentVersion(byte[] data) =>
+        NodeRuntimeState.IsV2 ? V2CertificateService.SignDataPss(data) : V1CertificateService.SignPayload(data);
+
+    private static string BuildDefaultKeyLink(string packetId) =>
+        NodeRuntimeState.IsV2
+            ? $"key-{packetId}"
+            : $"http://{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}/api/crypto/decrypt/{packetId}";
 
     private static string EnrichPublicParametersWithOriginalFileMeta(string pubJson, string origFileName, string origExt)
     {
@@ -1295,6 +1601,32 @@ public partial class FormDashboard : Form
         ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, keyToUse, _activeRecord.ParametrosPublicosJson);
     }
 
+    private async Task HandleRemoteDecryptActionV1Async()
+    {
+        if (_activeRecord == null)
+        {
+            MessageBox.Show(this, "Carga primero un paquete desde Consultas o Bandeja de Solicitudes.",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string url = _activeRecord.LinkDescifradoRemoto;
+        if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            url = $"http://{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}/api/crypto/decrypt/{_activeRecord.PacketId}";
+        }
+
+        var remote = await V1NetworkClient.RequestRemoteKeyAsync(url);
+        if (!remote.Success)
+        {
+            MessageBox.Show(this, $"Fallo en Descifrado Remoto v1.0 ({url}):\n{remote.Message}",
+                "Descifrado Remoto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        ExecuteDecryption(remote.AlgoritmoCodigo, _currentBytes, remote.LlaveSecretaBase64, remote.ParametrosPublicosJson);
+    }
+
     private void ExecuteDecryption(string algCode, byte[] cipherBytes, string secretKeyBase64, string pubJson)
     {
         try
@@ -1328,8 +1660,8 @@ public partial class FormDashboard : Form
 
             if (_activeRecord != null)
             {
-                string hopsStr = string.Join(" → ", PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson));
-                _hologram.StatusSubtitle = $"DESCIFRADO EN {NodeRuntimeState.CurrentNodeId} • Producer: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
+                string hopsStr = string.Join(" → ", V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson));
+                _hologram.StatusSubtitle = $"DESCIFRADO EN {NodeRuntimeState.CurrentNodeId} • Origen: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
             }
 
             bool isPlainText = PlainTextExtensions.Contains(_currentExtension);
@@ -1445,11 +1777,11 @@ public partial class FormDashboard : Form
         return $"{bytes / (1024.0 * 1024.0):F2} MB";
     }
 
-    private void HandleExportV2ZipLocally()
+    private void HandleExportZipLocally()
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Primero cifra un paquete para exportarlo en formato .zip v2.0 (3 archivos en raíz).",
+            MessageBox.Show(this, "Primero cifra un paquete para exportarlo en formato .zip.",
                 $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1460,74 +1792,110 @@ public partial class FormDashboard : Form
 
         using var sfd = new SaveFileDialog
         {
-            Filter = "Paquete Estándar v2.0 (*.zip)|*.zip",
+            Filter = $"Paquete Protocolo v{NodeRuntimeState.ProtocolVersion} (*.zip)|*.zip",
             FileName = defaultName
         };
         if (sfd.ShowDialog(this) != DialogResult.OK) return;
 
-        PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, destinationPath: sfd.FileName);
-        MessageBox.Show(this,
-            $"Paquete .zip v2.0 exportado con 3 archivos planos (datos.enc, certificado.pem, manifest.json):\n{sfd.FileName}",
-            "Exportación v2.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        if (NodeRuntimeState.IsV2)
+        {
+            V2PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, destinationPath: sfd.FileName);
+            MessageBox.Show(this,
+                $"Paquete .zip v2.0 exportado con 3 archivos planos (datos.enc, certificado.pem, manifest.json):\n{sfd.FileName}",
+                "Exportación v2.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        else
+        {
+            var hops = V1PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
+            if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
+            V1PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, hops, destinationPath: sfd.FileName);
+            MessageBox.Show(this,
+                $"Paquete .zip v1.0 exportado con 5 archivos híbridos:\n{sfd.FileName}",
+                "Exportación v1.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
     }
 
     private async Task HandleSendZipToPeerAsync()
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Primero cifra un mensaje o archivo para generar un paquete .zip v2.0.",
+            MessageBox.Show(this, "Primero cifra un mensaje o archivo para generar un paquete .zip.",
                 $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        string targetPeerId = _cmbTargetPeer.SelectedItem?.ToString()?.Split(' ')[0] ?? "EQ02";
+        string targetPeerId = _cmbTargetPeer.SelectedItem?.ToString()?.Split(' ')[0] ?? "";
         var peer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p => p.NodeId == targetPeerId)
                    ?? NodeRuntimeState.NetworkPeers.First();
 
         try
         {
             byte[] cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
-            var hops = PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
+            var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
             if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
             if (hops[^1] != peer.NodeId) hops.Add(peer.NodeId);
 
-            string zipPath = !string.IsNullOrWhiteSpace(_relaySourceZipPath) &&
-                             File.Exists(_relaySourceZipPath) &&
-                             string.Equals(_activeRecord.Origen, "Recibido", StringComparison.OrdinalIgnoreCase)
-                ? PacketZipService.RepackageForForwarding(_relaySourceZipPath)
-                : PacketZipService.CreatePacketZip(
+            if (NodeRuntimeState.IsV2)
+            {
+                string zipPath = !string.IsNullOrWhiteSpace(_relaySourceZipPath) &&
+                                 File.Exists(_relaySourceZipPath) &&
+                                 string.Equals(_activeRecord.Origen, "Recibido", StringComparison.OrdinalIgnoreCase)
+                    ? V2PacketZipService.RepackageForForwarding(_relaySourceZipPath)
+                    : V2PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, producerNode: _activeRecord.NodoRaiz);
+
+                var sendResult = await V2NetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
+                RefreshNetworkGrid();
+
+                MessageBox.Show(this,
+                    $"{sendResult.Message}\n\n" +
+                    $"• Emisor (sourceNode): {NodeRuntimeState.CurrentNodeId}\n" +
+                    $"• Productor (producerNode): {_activeRecord.NodoRaiz}\n" +
+                    $"• Ruta: {string.Join(" → ", hops)}",
+                    sendResult.Success ? "Envío v2.0 .ZIP Exitoso" : "Error de Envío .ZIP v2.0",
+                    MessageBoxButtons.OK,
+                    sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            }
+            else
+            {
+                string zipPath = V1PacketZipService.CreatePacketZip(
                     _activeRecord,
                     cipherBytes,
-                    producerNode: _activeRecord.NodoRaiz);
+                    hops,
+                    rootSignatureOverride: _relayRootSignatureBase64,
+                    rootCertBase64Override: _relayRootCertBase64);
 
-            var sendResult = await NodeNetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
-            RefreshNetworkGrid();
+                var sendResult = await V1NetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
+                RefreshNetworkGrid();
 
-            MessageBox.Show(this,
-                $"{sendResult.Message}\n\n" +
-                $"• Emisor (sourceNode): {NodeRuntimeState.CurrentNodeId}\n" +
-                $"• Productor (producerNode): {_activeRecord.NodoRaiz}\n" +
-                $"• Ruta: {string.Join(" → ", hops)}",
-                sendResult.Success ? "Envío v2.0 .ZIP Exitoso" : "Error de Envío .ZIP",
-                MessageBoxButtons.OK,
-                sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                MessageBox.Show(this,
+                    $"{sendResult.Message}\n\n" +
+                    $"• Nodo Raíz: {_activeRecord.NodoRaiz}\n" +
+                    $"• Ruta Tor: {string.Join(" → ", hops)}",
+                    sendResult.Success ? "Envío v1.0 .ZIP Exitoso" : "Error de Envío .ZIP v1.0",
+                    MessageBoxButtons.OK,
+                    sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            }
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"No se pudo empaquetar/enviar el .ZIP v2.0:\n{ex.Message}",
+            MessageBox.Show(this, $"No se pudo empaquetar/enviar el .ZIP:\n{ex.Message}",
                 $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
     private void UpdateMetadataPanel(RegistroCifrado r, bool signatureValid, bool hasSignature = true)
     {
-        var hops = PacketZipService.TryDeserializeHops(r.RutaSaltosJson);
+        var hops = V2PacketZipService.TryDeserializeHops(r.RutaSaltosJson);
         if (hops.Count == 0) hops.Add(r.NodoRaiz);
 
         _txtMetaPacketId.Text = r.PacketId;
-        _txtMetaRootNode.Text = $"producer={r.NodoRaiz} | source={NodeRuntimeState.CurrentNodeId}";
+        _txtMetaRootNode.Text = NodeRuntimeState.IsV2
+            ? $"producer={r.NodoRaiz} | source={NodeRuntimeState.CurrentNodeId}"
+            : r.NodoRaiz;
         _txtMetaHops.Text = string.Join("  →  ", hops);
-        _txtMetaKeyRef.Text = $"keyId={r.LinkDescifradoRemoto} | ownerNode={r.NodoRaiz}";
+        _txtMetaKeyRef.Text = NodeRuntimeState.IsV2
+            ? $"keyId={r.LinkDescifradoRemoto} | ownerNode={r.NodoRaiz}"
+            : r.LinkDescifradoRemoto;
 
         try
         {
@@ -1547,8 +1915,8 @@ public partial class FormDashboard : Form
         else
         {
             _lblMetaSignatureBadge.Text = signatureValid
-                ? $"● RSA-PSS ({r.NodoRaiz}) VÁLIDA"
-                : $"● RSA-PSS ({r.NodoRaiz}) INVÁLIDA";
+                ? $"● X.509 ({r.NodoRaiz}) VÁLIDA"
+                : $"● X.509 ({r.NodoRaiz}) INVÁLIDA";
             _lblMetaSignatureBadge.ForeColor = signatureValid ? HologramTheme.Success : HologramTheme.Danger;
         }
     }
@@ -1560,7 +1928,7 @@ public partial class FormDashboard : Form
         {
             RefreshPendingSolicitudesBadge();
             RefreshSolicitudesGrid();
-            _hologram.StatusSubtitle = $"Paquete v2.0 recibido en {NodeRuntimeState.CurrentNodeId} desde {solicitud.NodoOrigen} ({solicitud.AlgoritmoCodigo})";
+            _hologram.StatusSubtitle = $"Paquete v{NodeRuntimeState.ProtocolVersion} recibido en {NodeRuntimeState.CurrentNodeId} desde {solicitud.NodoOrigen} ({solicitud.AlgoritmoCodigo})";
         });
     }
 

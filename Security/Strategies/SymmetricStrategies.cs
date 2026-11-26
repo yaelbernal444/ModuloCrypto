@@ -134,15 +134,49 @@ public sealed class AesGcmStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 32);
+        int keyLen = 32;
+        if (!string.IsNullOrWhiteSpace(secretKeyBase64))
+        {
+            try
+            {
+                byte[] probe = Convert.FromBase64String(secretKeyBase64.Trim());
+                if (probe.Length is 16 or 32) keyLen = probe.Length;
+                CryptographicOperations.ZeroMemory(probe);
+            }
+            catch { }
+        }
+
+        byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, keyLen);
         try
         {
-            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) &&
-                SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag))
+            bool hasNonce = SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) ||
+                            SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonceBase64", out nonce);
+            bool hasTag = SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag) ||
+                          SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tagBase64", out tag);
+
+            if (hasNonce && hasTag)
             {
                 byte[] plain = new byte[cipherBytes.Length];
                 using var aes = new AesGcm(key, 16);
-                aes.Decrypt(nonce, cipherBytes, tag, plain);
+                string aadStr = SymmetricKeyHelper.TryGetJsonString(publicParametersJson, "aad");
+                if (string.IsNullOrEmpty(aadStr))
+                    aadStr = SymmetricKeyHelper.TryGetJsonString(publicParametersJson, "packetId");
+
+                if (!string.IsNullOrEmpty(aadStr))
+                {
+                    try
+                    {
+                        aes.Decrypt(nonce, cipherBytes, tag, plain, Encoding.UTF8.GetBytes(aadStr));
+                    }
+                    catch
+                    {
+                        aes.Decrypt(nonce, cipherBytes, tag, plain);
+                    }
+                }
+                else
+                {
+                    aes.Decrypt(nonce, cipherBytes, tag, plain);
+                }
 
                 return new CryptoOperationResult
                 {
@@ -150,7 +184,7 @@ public sealed class AesGcmStrategy : ICryptoStrategy
                     OutputBytes = plain,
                     SecretKeyBase64 = secretKeyBase64,
                     PublicParametersJson = publicParametersJson,
-                    Summary = $"AES-256-GCM autenticado y descifrado ({plain.Length} bytes)."
+                    Summary = $"AES-GCM autenticado y descifrado ({plain.Length} bytes)."
                 };
             }
 
@@ -265,7 +299,8 @@ public sealed class DesStrategy : ICryptoStrategy
             byte[] iv;
             byte[] actualCipher;
 
-            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv) ||
+                SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "ivBase64", out jsonIv))
             {
                 iv = jsonIv;
                 actualCipher = cipherBytes;
@@ -360,7 +395,8 @@ public sealed class TripleDesStrategy : ICryptoStrategy
             byte[] iv;
             byte[] actualCipher;
 
-            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv) ||
+                SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "ivBase64", out jsonIv))
             {
                 iv = jsonIv;
                 actualCipher = cipherBytes;

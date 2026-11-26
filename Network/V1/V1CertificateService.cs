@@ -2,39 +2,29 @@ using ModuloCrypto.Core.Services;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Text.RegularExpressions;
 
-namespace ModuloCrypto.Network;
+namespace ModuloCrypto.Network.V1;
 
 /// <summary>
-/// Administra el certificado X.509 RSA-2048 del nodo conforme al Estándar v2.0 (Sección 4):
-/// - Sujeto/Emisor: CN=EQ01, OU=Equipo 01, O=Centro de Ciberseguridad, C=MX
-/// - Vigencia exacta: 365 días
-/// - Serial aleatorio >= 64 bits
-/// - Firma exclusiva: RSA-PSS-SHA256 (MGF1-SHA256, sal 32 bytes)
-/// - Huella SHA-256 en HEX MAYÚSCULAS (64 caracteres)
-/// - Llave privada protegida localmente con Windows DPAPI (CurrentUser) y ZeroMemory.
+/// Administra el certificado X.509 RSA-2048 de la Versión 1.0 (node_identity_v1.pfx, protegido con Windows DPAPI)
+/// con soporte dual de firma y verificación (RSA-PSS y PKCS#1 v1.5).
 /// </summary>
-public static class NodeCertificateService
+public static class V1CertificateService
 {
-    private static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("ModuloCrypto.X509.DPAPI.v2");
+    private static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("ModuloCrypto.X509.DPAPI.v1");
     private static X509Certificate2? _currentCert;
 
-    private static string CertPath => Path.Combine(AppContext.BaseDirectory, $"node_identity_{NodeRuntimeState.CurrentNodeId}.pfx");
-    private static string KeyPath => Path.Combine(AppContext.BaseDirectory, $"node_identity_{NodeRuntimeState.CurrentNodeId}.key");
+    private static string CertPath => Path.Combine(AppContext.BaseDirectory, "node_identity_v1.pfx");
+    private static string KeyPath => Path.Combine(AppContext.BaseDirectory, "node_identity_v1.key");
 
     public static X509Certificate2 CurrentCertificate => _currentCert ?? Initialize();
 
     public static string Subject => CurrentCertificate.Subject;
     public static string Thumbprint => GetThumbprintSha256Hex();
 
-    public static string ExpectedSubjectDistinguishedName =>
-        $"CN={NodeRuntimeState.CurrentNodeId}, OU=Equipo {NodeRuntimeState.TeamNumber:D2}, O=Centro de Ciberseguridad, C=MX";
-
     public static X509Certificate2 Initialize(bool forceRegenerate = false)
     {
         string expectedCn = $"CN={NodeRuntimeState.CurrentNodeId}";
-        const string expectedOrg = "O=Centro de Ciberseguridad";
 
         byte[] secretBytes = GetOrCreateDpapiProtectedSecretBytes(forceRegenerate);
         string secretPass = Convert.ToBase64String(secretBytes);
@@ -52,7 +42,6 @@ public static class NodeCertificateService
                         X509KeyStorageFlags.Exportable);
 
                     if (loaded.Subject.Contains(expectedCn, StringComparison.OrdinalIgnoreCase) &&
-                        loaded.Subject.Contains(expectedOrg, StringComparison.OrdinalIgnoreCase) &&
                         loaded.NotAfter.ToUniversalTime() > DateTime.UtcNow)
                     {
                         _currentCert = loaded;
@@ -70,7 +59,7 @@ public static class NodeCertificateService
             }
 
             using var rsa = RSA.Create(2048);
-            var subjectDn = new X500DistinguishedName(ExpectedSubjectDistinguishedName);
+            var subjectDn = new X500DistinguishedName($"CN={NodeRuntimeState.CurrentNodeId}, OU=RedTor8Nodos, O=ModuloCrypto, C=MX");
             var req = new CertificateRequest(
                 subjectDn,
                 rsa,
@@ -82,19 +71,9 @@ public static class NodeCertificateService
                 X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
             req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
 
-            DateTimeOffset notBefore = DateTimeOffset.UtcNow;
-            DateTimeOffset notAfter = notBefore.AddDays(365); // Vigencia exacta de 365 días
+            using var created = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddYears(3));
 
-            // Serial aleatorio de 16 bytes (128 bits >= 64 bits), positivo (bit más significativo en 0)
-            byte[] serialNumber = RandomNumberGenerator.GetBytes(16);
-            serialNumber[0] &= 0x7F;
-            if (serialNumber[0] == 0) serialNumber[0] = 0x01;
-
-            var sigGenerator = X509SignatureGenerator.CreateForRSA(rsa, RSASignaturePadding.Pkcs1);
-            using var pubCert = req.Create(subjectDn, sigGenerator, notBefore, notAfter, serialNumber);
-            using var createdWithKey = pubCert.CopyWithPrivateKey(rsa);
-
-            byte[] pfxBytes = createdWithKey.Export(X509ContentType.Pfx, secretPass);
+            byte[] pfxBytes = created.Export(X509ContentType.Pfx, secretPass);
             try
             {
                 File.WriteAllBytes(CertPath, pfxBytes);
@@ -142,37 +121,29 @@ public static class NodeCertificateService
         return CurrentCertificate.ExportCertificatePem();
     }
 
-    /// <summary>
-    /// Huella digital SHA-256 del DER en HEX MAYÚSCULAS de 64 caracteres (^[0-9A-F]{64}$).
-    /// </summary>
     public static string GetThumbprintSha256Hex()
     {
         return Convert.ToHexString(CurrentCertificate.GetCertHash(HashAlgorithmName.SHA256)).ToUpperInvariant();
     }
 
-    public static string GetThumbprintSha256Hex(X509Certificate2 cert)
+    public static string SignPayload(byte[] payload)
     {
-        return Convert.ToHexString(cert.GetCertHash(HashAlgorithmName.SHA256)).ToUpperInvariant();
+        using RSA? rsa = CurrentCertificate.GetRSAPrivateKey();
+        if (rsa == null) return string.Empty;
+
+        byte[] signature = rsa.SignData(payload, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        return Convert.ToBase64String(signature);
     }
 
-    /// <summary>
-    /// Firma exclusivamente con RSA-PSS-SHA256 (MGF1-SHA256, sal 32 bytes).
-    /// </summary>
     public static string SignDataPss(byte[] data)
     {
         using RSA? rsa = CurrentCertificate.GetRSAPrivateKey();
-        if (rsa == null)
-            throw new InvalidOperationException("El certificado X.509 del nodo no contiene clave privada RSA.");
+        if (rsa == null) return string.Empty;
 
         byte[] signature = rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
         return Convert.ToBase64String(signature);
     }
 
-    public static string SignPayload(byte[] payload) => SignDataPss(payload);
-
-    /// <summary>
-    /// Verifica firma exclusivamente con RSA-PSS-SHA256 contra certificado PEM o DER Base64.
-    /// </summary>
     public static bool VerifyWithPem(byte[] data, string signatureBase64, string certPemOrBase64)
     {
         if (data == null || string.IsNullOrWhiteSpace(signatureBase64) || string.IsNullOrWhiteSpace(certPemOrBase64))
@@ -183,72 +154,17 @@ public static class NodeCertificateService
             byte[] sigBytes = Convert.FromBase64String(signatureBase64.Trim());
             using X509Certificate2 cert = LoadCertificateFromPemOrBase64(certPemOrBase64);
             using RSA? rsa = cert.GetRSAPublicKey();
-            if (rsa == null || rsa.KeySize < 2048)
-                return false;
+            if (rsa == null) return false;
 
-            return rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
+            if (rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pss))
+                return true;
+
+            return rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         }
         catch
         {
             return false;
         }
-    }
-
-    public static bool ValidateCertificateMetadata(
-        X509Certificate2 cert,
-        string expectedNodeId,
-        string expectedThumbprintHex,
-        out string errorDetail)
-    {
-        errorDetail = string.Empty;
-
-        if (!NodeRuntimeState.IsValidNodeId(expectedNodeId))
-        {
-            errorDetail = $"NodeId '{expectedNodeId}' no cumple formato ^EQ[0-9]{{2}}$.";
-            return false;
-        }
-
-        DateTime nowUtc = DateTime.UtcNow;
-        if (nowUtc < cert.NotBefore.ToUniversalTime().AddMinutes(-5) ||
-            nowUtc > cert.NotAfter.ToUniversalTime().AddMinutes(5))
-        {
-            errorDetail = "El certificado X.509 está fuera de su periodo de vigencia.";
-            return false;
-        }
-
-        using RSA? rsa = cert.GetRSAPublicKey();
-        if (rsa == null || rsa.KeySize < 2048)
-        {
-            errorDetail = "El certificado X.509 debe poseer llave pública RSA >= 2048 bits.";
-            return false;
-        }
-
-        string cnPattern = $@"\bCN\s*=\s*{Regex.Escape(expectedNodeId)}\b";
-        if (!Regex.IsMatch(cert.Subject, cnPattern, RegexOptions.IgnoreCase))
-        {
-            errorDetail = $"El CN del certificado ('{cert.Subject}') no coincide con '{expectedNodeId}'.";
-            return false;
-        }
-
-        string actualThumbprint = GetThumbprintSha256Hex(cert);
-        if (!string.IsNullOrWhiteSpace(expectedThumbprintHex) &&
-            !FixedTimeEqualsHex(actualThumbprint, expectedThumbprintHex))
-        {
-            errorDetail = "La huella SHA-256 del certificado no coincide con la declarada.";
-            return false;
-        }
-
-        return true;
-    }
-
-    public static bool FixedTimeEqualsHex(string hexA, string hexB)
-    {
-        if (string.IsNullOrWhiteSpace(hexA) || string.IsNullOrWhiteSpace(hexB))
-            return false;
-
-        byte[] a = Encoding.ASCII.GetBytes(hexA.Trim().ToUpperInvariant());
-        byte[] b = Encoding.ASCII.GetBytes(hexB.Trim().ToUpperInvariant());
-        return CryptographicOperations.FixedTimeEquals(a, b);
     }
 
     public static X509Certificate2 LoadCertificateFromPemOrBase64(string certPemOrBase64)

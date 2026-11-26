@@ -7,16 +7,16 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 
-namespace ModuloCrypto.Network;
+namespace ModuloCrypto.Network.V2;
 
 /// <summary>
-/// Servicio de autodescubrimiento UDP en el puerto 5099 conforme al Estándar v2.0 (Punto 2):
-/// - Emite CC-BEACON al iniciar y cada 30 segundos hacia 255.255.255.255:5099 y broadcast de subred.
-/// - Emite CC-BEACON final con status="offline" al cerrar.
-/// - Ignora anuncios propios o que no sean type="CC-BEACON" y protocolVersion="2.0".
-/// - Marca nodos como offline tras 90 segundos sin beacon ni respuesta HTTP.
+/// Servicio de autodescubrimiento UDP en el puerto 5099 conforme al Estándar v2.0 (Sección 5.2):
+/// - Emite CC-BEACON JSON UTF-8 (<= 1024 B) cada 30 s hacia 255.255.255.255:5099 y broadcast real de la interfaz activa
+/// - Emite beacon "status": "offline" al cerrar
+/// - Escucha en UDP 5099 con ReuseAddress = true
+/// - Marca offline tras 90 s sin beacon ni respuesta a /api/status.
 /// </summary>
-public sealed class UdpDiscoveryService : IAsyncDisposable
+public sealed class V2UdpDiscoveryService : IAsyncDisposable
 {
     private const int BeaconIntervalMs = 30_000;
     private const int OfflineThresholdSeconds = 90;
@@ -43,7 +43,7 @@ public sealed class UdpDiscoveryService : IAsyncDisposable
         }
         catch
         {
-            // Si otro proceso local ya ocupó 5099 sin permitir reuso, continuamos con emisión y escaneo HTTP
+            // Si otro proceso ocupa 5099 sin permitir reuso, continuamos con emisión y escaneo HTTP
         }
 
         _loopTask = Task.Run(() => BeaconAndHealthLoopAsync(_cts.Token));
@@ -64,7 +64,7 @@ public sealed class UdpDiscoveryService : IAsyncDisposable
                 HttpsPort = NodeRuntimeState.HttpsPort,
                 Status = status,
                 Algorithms = NodeRuntimeState.OwnedAlgorithms.ToList(),
-                CertificateThumbprintSha256 = NodeCertificateService.GetThumbprintSha256Hex(),
+                CertificateThumbprintSha256 = V2CertificateService.GetThumbprintSha256Hex(),
                 TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
             };
 
@@ -144,7 +144,6 @@ public sealed class UdpDiscoveryService : IAsyncDisposable
         if (!NodeRuntimeState.IsValidNodeId(beacon.NodeId))
             return false;
 
-        // Ignorar anuncios propios
         if (string.Equals(beacon.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase) &&
             beacon.HttpPort == NodeRuntimeState.ApiPort)
         {
@@ -195,16 +194,14 @@ public sealed class UdpDiscoveryService : IAsyncDisposable
             return true;
         }
 
-        // Verificar huella TOFU contra PinnedThumbprintSha256
         string incomingThumb = (beacon.CertificateThumbprintSha256 ?? "").Trim().ToUpperInvariant();
-        NodeNetworkClient.ApplyTofuThumbprintCheck(peer, incomingThumb);
+        V2NetworkClient.ApplyTofuThumbprintCheck(peer, incomingThumb);
 
-        // Si aún no tenemos su PEM o está online, consultar /api/certificate en segundo plano
         if (!peer.HasThumbprintMismatch && string.IsNullOrWhiteSpace(peer.CertificatePem))
         {
             _ = Task.Run(async () =>
             {
-                await NodeNetworkClient.FetchAndValidatePeerCertificateAsync(peer);
+                await V2NetworkClient.FetchAndValidatePeerCertificateAsync(peer);
                 AppDbContext.UpsertTrustedPeer(peer);
                 NodeRuntimeState.NotifyPeerChanged(peer);
             });
@@ -228,7 +225,7 @@ public sealed class UdpDiscoveryService : IAsyncDisposable
 
             if ((now - peer.LastSeenUtc).TotalSeconds > OfflineThresholdSeconds)
             {
-                var (online, _, _) = await NodeNetworkClient.PingNodeAsync(peer, customTimeoutMs: 500);
+                var (online, _, _) = await V2NetworkClient.PingNodeAsync(peer, customTimeoutMs: 500);
                 if (!online)
                 {
                     peer.Status = "offline";
