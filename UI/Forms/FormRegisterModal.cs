@@ -53,7 +53,7 @@ public sealed class FormRegisterModal : Form
 
         var lblSub = new Label
         {
-            Text = "Identidad criptográfica en NODO-01 (SQLite Local)",
+            Text = $"Identidad criptográfica en {NodeRuntimeState.CurrentNodeId} (PBKDF2-SHA256 SQLite)",
             Font = new Font("Segoe UI", 9.5f),
             ForeColor = HologramTheme.HologramViolet,
             Location = new Point(32, 60),
@@ -174,8 +174,8 @@ public sealed class FormRegisterModal : Form
             _txtFullName.Text,
             _txtUsername.Text,
             _txtPassword.Text,
-            "NODO-01",
-            "Operador Tor");
+            NodeRuntimeState.CurrentNodeId,
+            $"Operador {NodeRuntimeState.CurrentNodeId}");
 
         if (!success || user == null)
         {

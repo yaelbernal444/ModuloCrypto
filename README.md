@@ -1,93 +1,62 @@
-# ModuloCrypto — Nodo Criptográfico Distribuido (.NET 10)
+# ModuloCrypto — Nodo Criptográfico Distribuido (Estándar v2.0 • EQ01)
 
-**ModuloCrypto** es un nodo de escritorio y servidor API REST embebido diseñado en **C# (.NET 10)** para operar como **`NODO-01`** dentro de una **red distribuida de 8 nodos** con enrutamiento tipo Tor e intercambio bidireccional de paquetes `.zip` firmados con certificados **X.509** (compatible tanto con nodos `ModuloCrypto` como con `CentroCiberseguridad.Web`).
-
----
-
-## Arquitectura del Proyecto
-
-El proyecto utiliza `<Project Sdk="Microsoft.NET.Sdk.Web">` con `<UseWindowsForms>true</UseWindowsForms>` para unificar:
-- **Interfaz de Escritorio Holográfica (WinForms + GDI+ 60 FPS)** en pantalla completa (`Maximized`) con estética *Dark Violet Glassmorphism*.
-- **Servidor ASP.NET Core Minimal API Embebido** escuchando en `http://0.0.0.0:5000` (o puerto configurable con `--port <puerto>`).
-- **Persistencia Local en SQLite (`ModuloCrypto.db`)** mediante Entity Framework Core (`EnsureCreated()`) con contraseñas protegidas mediante **PBKDF2-SHA256 + Salt aleatorio**.
-
-```text
-ModuloCrypto/
-├── ModuloCrypto.sln
-├── ModuloCrypto.csproj
-├── Program.cs
-├── Core/
-│   ├── Contracts/PacketManifest.cs     # Contrato JSON híbrido de manifest.json y respuestas REST
-│   ├── Data/AppDbContext.cs            # EF Core + SQLite (Usuarios, RegistrosCifrados, SolicitudesEntrantes)
-│   ├── Models/                         # Entidades SQLite y modelo PeerNode (8 nodos)
-│   └── Services/                       # AuthService (PBKDF2-SHA256) y NodeRuntimeState
-├── Security/
-│   ├── ICryptoStrategy.cs              # Patrón Strategy para algoritmos criptográficos
-│   ├── CryptoCatalog.cs                # Registro exclusivo de los 21 códigos oficiales
-│   └── Strategies/                     # Implementaciones de los 21 algoritmos estándar
-├── Network/
-│   ├── ApiHostService.cs               # Minimal API dual embebida (/api/health, /api/status, /api/packets/receive, /api/requests/receive)
-│   ├── NodeCertificateService.cs       # Certificado X.509 RSA-2048 protegido con Windows DPAPI
-│   ├── PacketZipService.cs             # Empaquetado/lectura .zip híbrido (manifest.json, datos.enc, payload.bin, certificado.pem, root_cert.cer)
-│   └── NodeNetworkClient.cs            # Cliente HTTP dual y escáner de subred LAN y puertos localhost
-└── UI/
-    ├── Theme/HologramTheme.cs          # Paleta oficial (#0B0914, #151226, #6C5CE7, #00D2FF, #A29BFE)
-    ├── Controls/                       # GlassPanel, NeonButton, SidebarNavButton, StatusPill, HologramLockControl
-    └── Forms/                          # FormLogin, FormRegisterModal, FormDashboard y vistas integradas
-```
+**ModuloCrypto** es el nodo del **Equipo 1 (`EQ01`)** desarrollado en **C# (.NET 10)** conforme al **Estándar de Comunicación entre Nodos del Centro de Ciberseguridad v2.0**, integrando interfaz de escritorio holográfica (WinForms + GDI+ 60 FPS), servidor ASP.NET Core Minimal API embebido en `http://0.0.0.0:5001` y autodescubrimiento UDP en el puerto `5099`.
 
 ---
 
-## Catálogo Oficial de los 21 Algoritmos (`Security/CryptoCatalog.cs`)
+## Características del Estándar v2.0 Implementadas
 
-| # | Código Oficial | Nombre / Descripción |
-|---|---|---|
-| 1 | `AESGCM` | AES-256-GCM |
-| 2 | `DES` | DES 56-bit |
-| 3 | `TRIPLEDES` | Triple DES / 3DES |
-| 4 | `CHACHA20` | ChaCha20-Poly1305 |
-| 5 | `RSA` | RSA-OAEP / RSA-PSS |
-| 6 | `ECC` | ECDH / ECDSA |
-| 7 | `DIFFIEHELLMAN` | Diffie-Hellman |
-| 8 | `CAESAR` | Cifrado César |
-| 9 | `VIGENERE` | Cifrado Vigenère |
-| 10 | `XORASM` | XOR en Registro |
-| 11 | `LSBSTEGO` | Esteganografía LSB en PNG/BMP |
-| 12 | `EUCLIDESAFFINE` | Euclides Extendido / Afín |
-| 13 | `MILLERRABIN` | Miller-Rabin Modular |
-| 14 | `FISHERYATES` | Permutación Fisher-Yates |
-| 15 | `HASHSHA` | SHA-256 / SHA-512 |
-| 16 | `HMACSHA256` | HMAC-SHA256 |
-| 17 | `DIGITALSIG` | Firma Digital RSA-PSS |
-| 18 | `QUANTUMPQC` | Simulación QKD BB84 / LWE |
-| 19 | `DFTSPECTRAL` | Transformada Discreta de Fourier |
-| 20 | `LAGRANGESHAMIR` | Umbral Shamir GF(256) |
-| 21 | `LORENZSZ40` | Cifrado Lorenz SZ40/42 |
+1. **Identidad `EQ01` y Certificado X.509 v2.0 (`Network/NodeCertificateService.cs`):**
+   - `TeamNumber = 1`, `NodeId = "EQ01"`, puerto HTTP predeterminado **`5001`** (`5000 + TeamNumber`). Soporta `--team <1-99>` y `--port <puerto>` por CLI.
+   - Certificado X.509 RSA-2048 autofirmado con sujeto `CN=EQ01, OU=Equipo 01, O=Centro de Ciberseguridad, C=MX`, vigencia exacta de **365 días**, número de serie aleatorio de 128 bits, huella SHA-256 en **64 HEX MAYÚSCULAS** y firma exclusiva con **RSA-PSS-SHA256** (MGF1-SHA256, sal 32 bytes).
+   - Llave privada local resguardada mediante **Windows DPAPI (`CurrentUser`)** y limpieza de memoria con `CryptographicOperations.ZeroMemory`.
 
----
+2. **Autodescubrimiento UDP `5099`, Escaneo HTTP `5001–5020` y TOFU (`Network/UdpDiscoveryService.cs`, `Network/NodeNetworkClient.cs`):**
+   - Emisión y escucha de anuncios `CC-BEACON` (≤ 1024 bytes) en **UDP `5099`** al iniciar, cada **30 segundos**, y beacon `"status": "offline"` al cerrar. Timeout de inactividad de **90 segundos**.
+   - Escaneo HTTP de respaldo en la subred `/24` sobre puertos **`5001–5020`** (`GET /api/status`, timeout 500 ms, máximo 64 conexiones en paralelo, cooldown automático de 5 minutos).
+   - Directorio persistente en SQLite (`TrustedPeers`) con política **TOFU (Trust On First Use)**: confirmación explícita de huella SHA-256 en UI y bloqueo inmediato (`403 E-CERT-UNTRUSTED`) si un nodo fijado cambia su certificado sin reconfirmación.
 
-## Endpoints REST de la API Embebida (`:5000`)
+3. **Estructura Estricta `.ZIP` v2.0 y Anti-ZIP-Bomb (`Network/PacketZipService.cs`):**
+   - Exactamente **3 archivos planos en raíz**:
+     - `package`: `datos.enc`, `certificado.pem`, `manifest.json` (`<NODEID>_<ALGORITMO>_<YYYYMMDD_HHMMSS>_<SHA8_MAYUS>.zip`).
+     - `result`: `resultado.enc`, `certificado.pem`, `manifest.json` (`RES_<NODEID>_<ALGORITMO>_<YYYYMMDD_HHMMSS>_<SHA8_MAYUS>.zip`).
+   - Rechazo estricto de subcarpetas, rutas relativas, archivos extra (`400 E-ZIP-STRUCTURE`), exceso de 50 MB comprimidos (`413 E-SIZE`), > 200 MB descomprimidos o razón > 100:1 (`400 E-ZIP-BOMB`).
+   - Soporte `multipart` (`part-01.bin`..`part-64.bin`) y reenvío con `RepackageForForwarding` (Sección 9.6).
 
-- `GET /api/health` y `GET /api/status` — Estado del nodo (`NODO-01`), protocolo y huella SHA-256 del certificado X.509.
-- `GET /api/algorithms` — Catálogo JSON de los 21 algoritmos oficiales.
-- `POST /api/packets/receive` y `POST /api/requests/receive` — Recepción dual de paquetes `.zip`, validación de `manifest.json` y firma X.509 (`RSA-PSS-SHA256` / `PKCS#1`), y registro en `SolicitudesEntrantes`.
-- `GET /api/crypto/decrypt/{packetId}` — Entrega de llave para peticiones de descifrado remoto.
+4. **Manifiesto v2.0, Firma Canónica de 11 Campos y Anti-Replay (`Core/Contracts/PacketManifest.cs`, `Network/ApiHostService.cs`):**
+   - Hash canónico `publicParametersSha256` ordenando llaves con `StringComparer.Ordinal` (`llave=valor` unidos con `\n`, hex minúsculas).
+   - Firma RSA-PSS-SHA256 sobre la cadena única de 11 campos:
+     `version|packetType|packetId|sourceNode|producerNode|algorithmCode|operation|timestampUtc|encryptedSha256|publicParametersSha256|certificateThumbprintSha256`
+   - Protección Anti-Replay persistente en SQLite (`SeenPackets`, `409 E-REPLAY`).
+
+5. **21 Algoritmos Oficiales en Local + Dueño Oficial de `AESGCM` (#1) y `DES` (#2):**
+   - Los 21 algoritmos de `Security/CryptoCatalog.cs` operan al 100% en modo local en el Dashboard, mientras `EQ01` anuncia la propiedad oficial de `AESGCM` y `DES` en la red v2.0.
 
 ---
 
-## Ejecución Rápida y Seguridad
+## Endpoints REST v2.0 (`:5001`)
 
-Requisitos: **Windows 10/11** y **.NET 10 SDK**.
+- `GET /api/status` — Estado v2.0 del nodo (`EQ01`), algoritmos propios y huella SHA-256 del certificado.
+- `GET /api/certificate` — Certificado público X.509 en formato PEM y metadatos de vigencia.
+- `GET /api/algorithms` — Catálogo de los 21 algoritmos oficiales y su nodo dueño (`EQ01`–`EQ08`).
+- `POST /api/requests/receive` — Recepción y validación estricta de paquetes `.zip` (`packetType = "package"`).
+- `POST /api/results/receive` — Recepción y validación estricta de paquetes de resultado (`packetType = "result"`).
+
+---
+
+## Ejecución
 
 ```bash
 dotnet build ModuloCrypto.sln
 dotnet run --project ModuloCrypto.csproj
 ```
 
-Para ejecutar en un puerto alternativo (ej. pruebas locales multi-nodo):
+Para pruebas multi-instancia en la misma máquina (ej. simular `EQ02` en `:5002`):
 ```bash
-dotnet run --project ModuloCrypto.csproj -- --port 5002
+dotnet run --project ModuloCrypto.csproj -- --team 2 --port 5002
 ```
 
-**Primer Inicio (Sin Credenciales Precargadas):**
-Por seguridad del repositorio público, la base de datos `ModuloCrypto.db` inicia sin usuarios ni contraseñas preconfiguradas. Al abrir la aplicación por primera vez, haz clic en **`Registrar Nuevo Integrante`** para crear tu cuenta de operador con tu **Nombre Completo**, **Usuario** y **Contraseña** (almacenada con **PBKDF2-SHA256** y salt aleatorio).
+Para ejecutar la suite de autopruebas del estándar v2.0:
+```bash
+dotnet bin/Debug/net10.0-windows/ModuloCrypto.dll --selftest
+```

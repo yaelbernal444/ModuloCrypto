@@ -21,11 +21,11 @@ public class Usuario
 
     [Required]
     [MaxLength(32)]
-    public string NodoAsignado { get; set; } = "NODO-01";
+    public string NodoAsignado { get; set; } = "EQ01";
 
     [Required]
     [MaxLength(32)]
-    public string Rol { get; set; } = "Operador Tor";
+    public string Rol { get; set; } = "Operador EQ01";
 
     public DateTime FechaRegistro { get; set; } = DateTime.Now;
 

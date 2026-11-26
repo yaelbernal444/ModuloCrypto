@@ -1,14 +1,18 @@
 using ModuloCrypto.Core.Contracts;
+using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
 namespace ModuloCrypto.Network;
 
+/// <summary>
+/// Cliente HTTP v2.0 para comunicación entre nodos (EQ01–EQ08), escaneo de subred /24 en puertos 5001–5020
+/// (timeout 500 ms, máx. 64 conexiones paralelas, cooldown automático de 5 minutos) y validación TOFU.
+/// </summary>
 public static class NodeNetworkClient
 {
     private static readonly HttpClient Http = new()
@@ -21,67 +25,49 @@ public static class NodeNetworkClient
         PropertyNameCaseInsensitive = true
     };
 
-    public static async Task<(bool Online, string Latency, NodeHealthResponse? Info)> PingNodeAsync(
+    private static DateTime _lastAutoSubnetScanUtc = DateTime.MinValue;
+    public static readonly TimeSpan AutoScanCooldown = TimeSpan.FromMinutes(5);
+
+    public static async Task<(bool Online, string Latency, PeerStatusResponse? Info)> PingNodeAsync(
         PeerNode node,
         int? customTimeoutMs = null)
     {
         var sw = Stopwatch.StartNew();
-
-        // 1. Intentar GET /api/health (ModuloCrypto)
         try
         {
-            using var cts = customTimeoutMs.HasValue
-                ? new CancellationTokenSource(customTimeoutMs.Value)
-                : new CancellationTokenSource(TimeSpan.FromSeconds(4));
-
-            var resp = await Http.GetAsync($"{node.BaseUrl}/api/health", cts.Token);
-            if (resp.IsSuccessStatusCode)
-            {
-                sw.Stop();
-                string body = await resp.Content.ReadAsStringAsync(cts.Token);
-                var info = JsonSerializer.Deserialize<NodeHealthResponse>(body, JsonOpts);
-                if (info != null && !string.IsNullOrWhiteSpace(info.NodeId))
-                {
-                    node.ProtocolType = "ModuloCrypto";
-                    return (true, $"{sw.ElapsedMilliseconds} ms", info);
-                }
-            }
-        }
-        catch
-        {
-            // Continuar al fallback /api/status
-        }
-
-        // 2. Fallback automático: GET /api/status (CentroCiberseguridad.Web)
-        try
-        {
-            using var cts2 = customTimeoutMs.HasValue
-                ? new CancellationTokenSource(customTimeoutMs.Value)
-                : new CancellationTokenSource(TimeSpan.FromSeconds(4));
-
-            var resp = await Http.GetAsync($"{node.BaseUrl}/api/status", cts2.Token);
+            using var cts = new CancellationTokenSource(customTimeoutMs ?? 1500);
+            var resp = await Http.GetAsync($"{node.BaseUrl}/api/status", cts.Token);
             sw.Stop();
+
             if (!resp.IsSuccessStatusCode)
                 return (false, "HTTP " + (int)resp.StatusCode, null);
 
-            string body = await resp.Content.ReadAsStringAsync(cts2.Token);
+            string body = await resp.Content.ReadAsStringAsync(cts.Token);
             var status = JsonSerializer.Deserialize<PeerStatusResponse>(body, JsonOpts);
-            if (status != null)
+            if (status == null || !string.Equals(status.ProtocolVersion, "2.0", StringComparison.Ordinal))
+                return (false, "Protocolo != 2.0", null);
+
+            node.ProtocolType = "v2.0";
+            node.LastSeenUtc = DateTime.UtcNow;
+            node.LastLatency = $"{sw.ElapsedMilliseconds} ms";
+
+            if (NodeRuntimeState.IsValidNodeId(status.NodeId))
+                node.NodeId = status.NodeId.ToUpperInvariant();
+            if (status.TeamNumber > 0)
+                node.TeamNumber = status.TeamNumber;
+            if (status.Algorithms is { Count: > 0 })
             {
-                node.ProtocolType = "CentroCiberseguridad";
-                var mapped = new NodeHealthResponse
-                {
-                    Status = status.Status,
-                    NodeId = string.IsNullOrWhiteSpace(status.NodeId) ? node.NodeId : status.NodeId,
-                    Port = node.Port,
-                    X509Thumbprint = status.CertificateThumbprint ?? string.Empty,
-                    SupportedAlgorithms = 21,
-                    TimestampUtc = DateTime.UtcNow
-                };
-                return (true, $"{sw.ElapsedMilliseconds} ms", mapped);
+                node.AlgorithmsJson = JsonSerializer.Serialize(status.Algorithms);
+                node.RoleLabel = $"Equipo {node.TeamNumber:D2} ({string.Join(", ", status.Algorithms)})";
             }
 
-            return (false, "Respuesta inválida", null);
+            ApplyTofuThumbprintCheck(node, status.CertificateThumbprintSha256);
+
+            if (!node.HasThumbprintMismatch)
+                await FetchAndValidatePeerCertificateAsync(node, customTimeoutMs ?? 1500);
+
+            AppDbContext.UpsertTrustedPeer(node);
+            return (true, node.LastLatency, status);
         }
         catch
         {
@@ -90,84 +76,141 @@ public static class NodeNetworkClient
         }
     }
 
-    public static async Task<(bool Success, string Message)> SendZipPacketAsync(string targetBaseUrl, string zipPath)
+    public static void ApplyTofuThumbprintCheck(PeerNode peer, string? advertisedThumbprint)
     {
-        var tempPeer = new PeerNode
+        string cleanThumb = (advertisedThumbprint ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(cleanThumb)) return;
+
+        peer.CertThumbprint = cleanThumb;
+
+        // Si el nodo ya tenía una huella fijada (IsConfirmed) y la huella nueva es diferente -> BLOQUEAR INMEDIATAMENTE
+        if (peer.IsConfirmed &&
+            !string.IsNullOrWhiteSpace(peer.PinnedThumbprintSha256) &&
+            !NodeCertificateService.FixedTimeEqualsHex(peer.PinnedThumbprintSha256, cleanThumb))
         {
-            NodeId = "NODO-DEST",
-            ProtocolType = "Auto"
-        };
-        if (Uri.TryCreate(targetBaseUrl, UriKind.Absolute, out var uri))
-        {
-            tempPeer.IpAddress = uri.Host;
-            tempPeer.Port = uri.Port > 0 ? uri.Port : 5000;
+            peer.HasThumbprintMismatch = true;
+            peer.Status = "blocked";
         }
-        return await SendZipPacketAsync(tempPeer, zipPath, Guid.NewGuid().ToString());
+        else
+        {
+            peer.HasThumbprintMismatch = false;
+            peer.Status = "online";
+        }
+    }
+
+    public static async Task<bool> FetchAndValidatePeerCertificateAsync(PeerNode peer, int timeoutMs = 1500)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(timeoutMs);
+            var resp = await Http.GetAsync($"{peer.BaseUrl}/api/certificate", cts.Token);
+            if (!resp.IsSuccessStatusCode) return false;
+
+            string body = await resp.Content.ReadAsStringAsync(cts.Token);
+            string pem;
+            if (body.TrimStart().StartsWith("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
+            {
+                pem = body.Trim();
+            }
+            else
+            {
+                var dto = JsonSerializer.Deserialize<PeerCertificateResponse>(body, JsonOpts);
+                pem = dto?.CertificatePem ?? string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(pem)) return false;
+
+            using var cert = NodeCertificateService.LoadCertificateFromPemOrBase64(pem);
+            if (!NodeCertificateService.ValidateCertificateMetadata(cert, peer.NodeId, peer.CertThumbprint, out _))
+            {
+                peer.HasThumbprintMismatch = true;
+                peer.Status = "blocked";
+                return false;
+            }
+
+            string actualThumb = NodeCertificateService.GetThumbprintSha256Hex(cert);
+            peer.CertificatePem = pem;
+            ApplyTofuThumbprintCheck(peer, actualThumb);
+            return !peer.HasThumbprintMismatch;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Fija (TOFU) o re-confirma explícitamente la huella X.509 de un nodo en SQLite.
+    /// </summary>
+    public static void ConfirmPeerTofu(PeerNode peer)
+    {
+        if (string.IsNullOrWhiteSpace(peer.CertThumbprint)) return;
+        peer.PinnedThumbprintSha256 = peer.CertThumbprint.ToUpperInvariant();
+        peer.IsConfirmed = true;
+        peer.HasThumbprintMismatch = false;
+        peer.Status = "online";
+        AppDbContext.UpsertTrustedPeer(peer);
+        NodeRuntimeState.NotifyPeerChanged(peer);
     }
 
     public static async Task<(bool Success, string Message)> SendZipPacketAsync(
         PeerNode targetPeer,
         string zipPath,
-        string packetId)
+        string packetId,
+        string packetType = "package")
     {
-        byte[] fileBytes = await File.ReadAllBytesAsync(zipPath);
-        string fileName = Path.GetFileName(zipPath);
-
-        bool preferCentro = string.Equals(targetPeer.ProtocolType, "CentroCiberseguridad", StringComparison.OrdinalIgnoreCase);
-
-        var endpointsToTry = preferCentro
-            ? new[]
-            {
-                (Path: "/api/requests/receive", Field: "package", Proto: "CentroCiberseguridad"),
-                (Path: "/api/packets/receive",  Field: "file",    Proto: "ModuloCrypto")
-            }
-            : new[]
-            {
-                (Path: "/api/packets/receive",  Field: "file",    Proto: "ModuloCrypto"),
-                (Path: "/api/requests/receive", Field: "package", Proto: "CentroCiberseguridad")
-            };
-
-        string lastError = string.Empty;
-
-        foreach (var ep in endpointsToTry)
+        if (targetPeer.HasThumbprintMismatch || string.Equals(targetPeer.Status, "blocked", StringComparison.OrdinalIgnoreCase))
         {
-            string url = targetPeer.BaseUrl.TrimEnd('/') + ep.Path;
-            try
-            {
-                using var form = new MultipartFormDataContent();
-                var content = new ByteArrayContent(fileBytes);
-                content.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
-                form.Add(content, ep.Field, fileName);
-
-                using var req = new HttpRequestMessage(HttpMethod.Post, url)
-                {
-                    Content = form
-                };
-                req.Headers.TryAddWithoutValidation("X-Source-Node", NodeRuntimeState.CurrentNodeId);
-                req.Headers.TryAddWithoutValidation("X-Packet-Id", packetId);
-
-                var resp = await Http.SendAsync(req);
-                string body = await resp.Content.ReadAsStringAsync();
-
-                if (resp.IsSuccessStatusCode)
-                {
-                    targetPeer.ProtocolType = ep.Proto;
-                    targetPeer.IsOnline = true;
-                    return (true, $"Paquete enviado correctamente a {url} ({ep.Proto}).\nRespuesta HTTP {(int)resp.StatusCode}: {body}");
-                }
-
-                lastError = $"HTTP {(int)resp.StatusCode} en {url}: {body}";
-            }
-            catch (Exception ex)
-            {
-                lastError = $"Error hacia {url}: {ex.Message}";
-            }
+            return (false, $"BLOQUEO TOFU (E-CERT-UNTRUSTED): El nodo {targetPeer.NodeId} presentó un cambio de huella X.509. Debes reconfirmar su huella en 'Red de Nodos (IP)' antes de enviar paquetes.");
         }
 
-        return (false, $"No se pudo entregar el paquete a {targetPeer.BaseUrl}.\nDetalle: {lastError}");
+        byte[] fileBytes = await File.ReadAllBytesAsync(zipPath);
+        if (fileBytes.Length > PacketZipService.MaxCompressedZipBytes)
+        {
+            return (false, "E-SIZE: El paquete .zip supera el límite máximo de 50 MB.");
+        }
+
+        string fileName = Path.GetFileName(zipPath);
+        string endpointPath = string.Equals(packetType, "result", StringComparison.OrdinalIgnoreCase)
+            ? "/api/results/receive"
+            : "/api/requests/receive";
+
+        string url = targetPeer.BaseUrl.TrimEnd('/') + endpointPath;
+
+        try
+        {
+            using var form = new MultipartFormDataContent();
+            var content = new ByteArrayContent(fileBytes);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+            form.Add(content, "package", fileName);
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = form
+            };
+            req.Headers.TryAddWithoutValidation("X-Source-Node", NodeRuntimeState.CurrentNodeId);
+            req.Headers.TryAddWithoutValidation("X-Packet-Id", packetId);
+            req.Headers.TryAddWithoutValidation("X-Protocol-Version", "2.0");
+
+            var resp = await Http.SendAsync(req);
+            string body = await resp.Content.ReadAsStringAsync();
+
+            if (resp.IsSuccessStatusCode)
+            {
+                targetPeer.Status = "online";
+                targetPeer.LastSeenUtc = DateTime.UtcNow;
+                return (true, $"Paquete v2.0 entregado a {url}.\nHTTP {(int)resp.StatusCode}: {body}");
+            }
+
+            return (false, $"Rechazado por {targetPeer.NodeId} (HTTP {(int)resp.StatusCode}):\n{body}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Error de conexión hacia {url}: {ex.Message}");
+        }
     }
 
-    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5000, int endPort = 5008)
+    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5001, int endPort = 5020)
     {
         var found = new ConcurrentBag<PeerNode>();
         var ports = Enumerable.Range(startPort, Math.Max(1, endPort - startPort + 1));
@@ -176,26 +219,17 @@ public static class NodeNetworkClient
         {
             var probe = new PeerNode
             {
-                NodeId = $"LOCAL-{port}",
+                NodeId = $"EQ{(port - 5000):D2}",
+                TeamNumber = Math.Clamp(port - 5000, 1, 99),
                 IpAddress = "127.0.0.1",
                 Port = port,
-                ProtocolType = "Auto"
+                Source = "scan",
+                ProtocolType = "v2.0"
             };
 
-            var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 800);
+            var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 500);
             if (online)
             {
-                probe.IsOnline = true;
-                probe.LastLatency = latency;
-                if (info != null)
-                {
-                    if (!string.IsNullOrWhiteSpace(info.NodeId))
-                        probe.NodeId = info.NodeId.Trim().ToUpperInvariant();
-                    if (!string.IsNullOrWhiteSpace(info.X509Thumbprint))
-                        probe.CertThumbprint = info.X509Thumbprint.Length > 16
-                            ? info.X509Thumbprint[..16] + "..."
-                            : info.X509Thumbprint;
-                }
                 found.Add(probe);
             }
         });
@@ -203,77 +237,67 @@ public static class NodeNetworkClient
         return found.OrderBy(p => p.Port).ToList();
     }
 
-    public static async Task<List<PeerNode>> ScanLanSubnetAsync(string localIp, int port = 5000)
+    /// <summary>
+    /// Escaneo HTTP de respaldo en subred /24 sobre puertos 5001–5020 (timeout 500 ms, máx. 64 conexiones paralelas,
+    /// cooldown de 5 minutos para ejecuciones automáticas).
+    /// </summary>
+    public static async Task<(List<PeerNode> Found, bool SkippedByCooldown)> ScanLanSubnetAsync(
+        string localIp,
+        int startPort = 5001,
+        int endPort = 5020,
+        bool isAutomaticTrigger = false)
     {
-        var found = new ConcurrentBag<PeerNode>();
-        string prefix = "192.168.1.";
+        if (isAutomaticTrigger && (DateTime.UtcNow - _lastAutoSubnetScanUtc) < AutoScanCooldown)
+        {
+            return (new List<PeerNode>(), true);
+        }
 
+        _lastAutoSubnetScanUtc = DateTime.UtcNow;
+        var found = new ConcurrentBag<PeerNode>();
+
+        string prefix = "192.168.1.";
         var parts = (localIp ?? "").Split('.');
         if (parts.Length == 4 && parts[0] != "127")
             prefix = $"{parts[0]}.{parts[1]}.{parts[2]}.";
 
-        using var sem = new SemaphoreSlim(32);
-        var tasks = new List<Task>(254);
-
+        // En escaneo manual de red LAN priorizamos el rango oficial de equipos (5001..5008 o startPort..endPort) con 64 conexiones en paralelo y 500ms timeout
+        var targets = new List<(string Ip, int Port)>();
         for (int host = 1; host <= 254; host++)
         {
             string ip = $"{prefix}{host}";
-            tasks.Add(Task.Run(async () =>
-            {
-                await sem.WaitAsync();
-                try
-                {
-                    var probe = new PeerNode
-                    {
-                        NodeId = $"LAN-{host}",
-                        IpAddress = ip,
-                        Port = port,
-                        ProtocolType = "Auto"
-                    };
-
-                    var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 700);
-                    if (online)
-                    {
-                        probe.IsOnline = true;
-                        probe.LastLatency = latency;
-                        if (info != null)
-                        {
-                            if (!string.IsNullOrWhiteSpace(info.NodeId))
-                                probe.NodeId = info.NodeId.Trim().ToUpperInvariant();
-                            if (!string.IsNullOrWhiteSpace(info.X509Thumbprint))
-                                probe.CertThumbprint = info.X509Thumbprint.Length > 16
-                                    ? info.X509Thumbprint[..16] + "..."
-                                    : info.X509Thumbprint;
-                        }
-                        found.Add(probe);
-                    }
-                }
-                finally
-                {
-                    sem.Release();
-                }
-            }));
+            for (int port = startPort; port <= endPort; port++)
+                targets.Add((ip, port));
         }
+
+        using var sem = new SemaphoreSlim(64);
+        var tasks = targets.Select(async target =>
+        {
+            await sem.WaitAsync();
+            try
+            {
+                var probe = new PeerNode
+                {
+                    NodeId = $"EQ{Math.Clamp(target.Port - 5000, 1, 99):D2}",
+                    TeamNumber = Math.Clamp(target.Port - 5000, 1, 99),
+                    IpAddress = target.Ip,
+                    Port = target.Port,
+                    Source = "scan",
+                    ProtocolType = "v2.0"
+                };
+
+                var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 500);
+                if (online)
+                {
+                    found.Add(probe);
+                }
+            }
+            finally
+            {
+                sem.Release();
+            }
+        });
 
         await Task.WhenAll(tasks);
-        return found.OrderBy(p => p.IpAddress).ToList();
-    }
-
-    public static async Task<RemoteDecryptResponse> RequestRemoteKeyAsync(string remoteDecryptUrl)
-    {
-        try
-        {
-            var resp = await Http.GetAsync(remoteDecryptUrl);
-            string body = await resp.Content.ReadAsStringAsync();
-            var parsed = JsonSerializer.Deserialize<RemoteDecryptResponse>(body, JsonOpts);
-            if (parsed != null)
-                return parsed;
-
-            return new RemoteDecryptResponse { Success = false, Message = $"Respuesta inválida: {body}" };
-        }
-        catch (Exception ex)
-        {
-            return new RemoteDecryptResponse { Success = false, Message = $"Error al contactar nodo remoto: {ex.Message}" };
-        }
+        return (found.OrderBy(p => p.IpAddress).ThenBy(p => p.Port).ToList(), false);
     }
 }

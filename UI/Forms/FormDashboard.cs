@@ -1,3 +1,4 @@
+using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
@@ -53,45 +54,44 @@ public partial class FormDashboard : Form
     private NeonButton _btnModeText = null!;
     private NeonButton _btnModeHex = null!;
     private NeonButton _btnModeImg = null!;
+    private NeonButton _btnOpenFile = null!;
     private CheckBox _chkAutoDownloadBinary = null!;
     private string _viewerMode = "TEXT";
 
-    // Metadata (Tor Traceability)
+    // Metadata (v2.0 Traceability)
     private TextBox _txtMetaPacketId = null!;
     private TextBox _txtMetaRootNode = null!;
     private Label _lblMetaSignatureBadge = null!;
     private TextBox _txtMetaHops = null!;
-    private TextBox _txtMetaRemoteLink = null!;
+    private TextBox _txtMetaKeyRef = null!;
     private TextBox _txtMetaPublicJson = null!;
     private ComboBox _cmbTargetPeer = null!;
 
     // Current working payload state
-    private byte[] _currentBytes = Encoding.UTF8.GetBytes("Mensaje confidencial ModuloCrypto — Red Tor Bidireccional de 8 Nodos (NODO-01).");
+    private byte[] _currentBytes = Encoding.UTF8.GetBytes("Mensaje confidencial ModuloCrypto — Estándar de Comunicación v2.0 (EQ01).");
     private string _currentFileName = "mensaje_seguro.txt";
     private string _currentExtension = ".txt";
     private RegistroCifrado? _activeRecord;
     private bool _isShowingEncrypted;
+    private bool _isFromNetworkUntrusted;
     private string? _lastSavedDecryptedPath;
     private string? _binarySummaryReport;
 
-    // Contexto para ciclo bidireccional (Nodo Intermedio / Relay conservando rootOrigin)
-    private string? _relayRootOrigin;
-    private string? _relayRootSignatureBase64;
-    private string? _relayRootCertBase64;
-    private string? _relayOriginalHashHex;
+    // Contexto para reenvío / salto intermedio v2.0 (ProducerNode original)
+    private string? _relayProducerNode;
+    private string? _relaySourceZipPath;
     private List<string>? _relayHopHistory;
 
     public FormDashboard(Usuario currentUser)
     {
         _currentUser = currentUser;
-        _currentUser.NodoAsignado = "NODO-01";
-        NodeRuntimeState.CurrentNodeId = "NODO-01";
+        _currentUser.NodoAsignado = NodeRuntimeState.CurrentNodeId;
 
         _userFullName = string.IsNullOrWhiteSpace(currentUser.NombreCompleto)
             ? currentUser.NombreUsuario
             : currentUser.NombreCompleto;
 
-        Text = $"ModuloCrypto — NODO-01 (:{NodeRuntimeState.ApiPort})";
+        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} (Estándar v2.0 • HTTP :{NodeRuntimeState.ApiPort} • UDP :{NodeRuntimeState.UdpDiscoveryPort})";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1220, 740);
@@ -112,12 +112,16 @@ public partial class FormDashboard : Form
         RenderCurrentBytesInViewer();
 
         NodeRuntimeState.OnPacketReceived += HandleIncomingPacketEvent;
-        FormClosed += (_, _) => NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
+        NodeRuntimeState.OnPeerDiscoveredOrChanged += HandlePeerChangedEvent;
+        FormClosed += (_, _) =>
+        {
+            NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
+            NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
+        };
     }
 
     private void BuildShellLayout()
     {
-        // 1. Left Sidebar (260px exactos, fondo uniforme #151226 sin zonas blancas, borde derecho #2E284D)
         var sidebar = new Panel
         {
             Dock = DockStyle.Left,
@@ -131,7 +135,6 @@ public partial class FormDashboard : Form
             e.Graphics.DrawLine(pen, sidebar.Width - 1, 0, sidebar.Width - 1, sidebar.Height);
         };
 
-        // Top Logo Area
         var logoPanel = new Panel
         {
             Dock = DockStyle.Top,
@@ -155,7 +158,7 @@ public partial class FormDashboard : Form
                 new Rectangle(62, 18, 190, 26), HologramTheme.TextPrimary,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            TextRenderer.DrawText(g, "RED TOR 8 NODOS • NODO-01", new Font("Cascadia Mono", 7.8f, FontStyle.Bold),
+            TextRenderer.DrawText(g, $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}", new Font("Cascadia Mono", 7.8f, FontStyle.Bold),
                 new Rectangle(62, 45, 190, 18), HologramTheme.HologramCyan,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
@@ -163,7 +166,6 @@ public partial class FormDashboard : Form
             g.DrawLine(sepPen, 16, logoPanel.Height - 1, logoPanel.Width - 16, logoPanel.Height - 1);
         };
 
-        // Bottom-Left Logged-in Profile Card (Anclada con Dock = Bottom, muestra NombreCompleto y NODO-01)
         var profileWrap = new Panel
         {
             Dock = DockStyle.Bottom,
@@ -213,7 +215,7 @@ public partial class FormDashboard : Form
         };
         var lblProfStatus = new Label
         {
-            Text = "● Online • NODO-01",
+            Text = $"● Online • {NodeRuntimeState.CurrentNodeId}",
             Font = new Font("Cascadia Mono", 8.2f, FontStyle.Bold),
             ForeColor = HologramTheme.Success,
             Location = new Point(62, 38),
@@ -238,7 +240,6 @@ public partial class FormDashboard : Form
         profileCard.Controls.AddRange(new Control[] { lblProfName, lblProfStatus, btnLogout });
         profileWrap.Controls.Add(profileCard);
 
-        // Navigation Menu Stack (Fondo uniforme #151226, espaciado vertical uniforme de 12px entre botones)
         var navContainer = new Panel
         {
             Dock = DockStyle.Fill,
@@ -269,7 +270,6 @@ public partial class FormDashboard : Form
         sidebar.Controls.Add(profileWrap);
         sidebar.Controls.Add(logoPanel);
 
-        // 2. Right Main Container (Topbar + ViewHost)
         var mainRight = new Panel
         {
             Dock = DockStyle.Fill,
@@ -292,7 +292,7 @@ public partial class FormDashboard : Form
         var greetingPanel = new Panel
         {
             Dock = DockStyle.Left,
-            Width = 340,
+            Width = 355,
             BackColor = HologramTheme.PanelGlass
         };
         var lblWelcome = new Label
@@ -301,17 +301,17 @@ public partial class FormDashboard : Form
             Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Location = new Point(0, 4),
-            Size = new Size(336, 30),
+            Size = new Size(350, 30),
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = false
         };
         var lblSubWelcome = new Label
         {
-            Text = "Nodo activo: NODO-01 • Estado: Operativo",
+            Text = $"Nodo: {NodeRuntimeState.CurrentNodeId} • Dueño: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}",
             Font = new Font("Segoe UI Semibold", 9.2f),
             ForeColor = HologramTheme.HologramCyan,
             Location = new Point(0, 36),
-            Size = new Size(336, 22),
+            Size = new Size(350, 22),
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = false
         };
@@ -358,7 +358,7 @@ public partial class FormDashboard : Form
         };
         _pillApi = new StatusPill
         {
-            Text = NodeRuntimeState.ApiOnline ? $"API: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
+            Text = NodeRuntimeState.ApiOnline ? $"API v2.0: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
             IsActive = NodeRuntimeState.ApiOnline,
             Margin = new Padding(4, 0, 8, 0)
         };
@@ -370,7 +370,7 @@ public partial class FormDashboard : Form
         };
         _pillCert = new StatusPill
         {
-            Text = NodeRuntimeState.CertificateActive ? "Certificado X.509: Activo" : "X.509: Inactivo",
+            Text = NodeRuntimeState.CertificateActive ? "X.509 RSA-PSS: Activo" : "X.509: Inactivo",
             IsActive = NodeRuntimeState.CertificateActive,
             Margin = new Padding(0, 0, 4, 0)
         };
@@ -396,7 +396,7 @@ public partial class FormDashboard : Form
 
     private static string BuildInitials(string fullName)
     {
-        if (string.IsNullOrWhiteSpace(fullName)) return "MC";
+        if (string.IsNullOrWhiteSpace(fullName)) return "EQ";
         var parts = fullName.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length >= 2)
             return $"{char.ToUpperInvariant(parts[0][0])}{char.ToUpperInvariant(parts[1][0])}";
@@ -447,7 +447,6 @@ public partial class FormDashboard : Form
         split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49f));
         split.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-        // === COLUMNA IZQUIERDA / CENTRO: HOLOGRAMA 3D BINARIO + CONTROLES PRINCIPALES ===
         var leftCol = new Panel
         {
             Dock = DockStyle.Fill,
@@ -468,7 +467,7 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Fill,
             ActiveAlgorithmLabel = "AESGCM",
-            StatusSubtitle = "NODO-01 • Cubo Binario 3D en Reposo"
+            StatusSubtitle = $"{NodeRuntimeState.CurrentNodeId} • Cubo Binario 3D en Reposo"
         };
 
         _lblAlgDesc = new Label
@@ -535,7 +534,7 @@ public partial class FormDashboard : Form
 
         var btnEncrypt = new NeonButton
         {
-            Text = "🔒 Cifrar (Nodo Raíz)",
+            Text = "🔒 Cifrar (Productor)",
             Variant = NeonButtonVariant.Primary,
             Dock = DockStyle.Fill,
             Margin = new Padding(3),
@@ -545,7 +544,7 @@ public partial class FormDashboard : Form
 
         var btnRelayEncrypt = new NeonButton
         {
-            Text = "🔁 Re-Cifrar Salto Tor",
+            Text = "🔁 Re-Cifrar Salto",
             Variant = NeonButtonVariant.Cyan,
             Dock = DockStyle.Fill,
             Margin = new Padding(3),
@@ -567,19 +566,19 @@ public partial class FormDashboard : Form
         };
         btnDecryptLocal.Click += (_, _) => HandleDecryptLocalAction();
 
-        var btnDecryptRemote = new NeonButton
+        var btnExportZip = new NeonButton
         {
-            Text = "🌐 Descifrar Remoto",
+            Text = "📦 Exportar .ZIP v2.0",
             Variant = NeonButtonVariant.Secondary,
             Dock = DockStyle.Fill,
             Margin = new Padding(3),
             Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
         };
-        btnDecryptRemote.Click += async (_, _) => await HandleDecryptRemoteActionAsync();
+        btnExportZip.Click += (_, _) => HandleExportV2ZipLocally();
 
         var btnSendZip = new NeonButton
         {
-            Text = "🚀 Enviar .ZIP a IP",
+            Text = "🚀 Enviar .ZIP v2.0",
             Variant = NeonButtonVariant.Primary,
             Dock = DockStyle.Fill,
             Margin = new Padding(3),
@@ -588,7 +587,7 @@ public partial class FormDashboard : Form
         btnSendZip.Click += async (_, _) => await HandleSendZipToPeerAsync();
 
         actionGrid.Controls.Add(btnDecryptLocal, 0, 2);
-        actionGrid.Controls.Add(btnDecryptRemote, 1, 2);
+        actionGrid.Controls.Add(btnExportZip, 1, 2);
         actionGrid.Controls.Add(btnSendZip, 2, 2);
 
         actionCard.Controls.Add(actionGrid);
@@ -598,7 +597,6 @@ public partial class FormDashboard : Form
         leftCol.Controls.Add(spacer);
         leftCol.Controls.Add(actionCard);
 
-        // === COLUMNA DERECHA: VISOR (TEXTO/HEX/IMAGEN + DESCARGA/APERTURA) + TRAZABILIDAD TOR ===
         var rightCol = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -610,7 +608,6 @@ public partial class FormDashboard : Form
         rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 55f));
         rightCol.RowStyles.Add(new RowStyle(SizeType.Percent, 45f));
 
-        // Top Right Card: Visor Texto / Hex / Imagen + Barra Multimedia/Binarios
         var viewerCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -644,14 +641,13 @@ public partial class FormDashboard : Form
         _btnModeImg = new NeonButton { Text = "Imagen", Size = new Size(74, 28), CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Font = new Font("Segoe UI Semibold", 8.3f) };
 
         _btnModeText.Click += (_, _) => { _binarySummaryReport = null; SetViewerMode("TEXT"); };
-        _btnModeHex.Click += (_, _) => { SetViewerMode("HEX"); };
-        _btnModeImg.Click += (_, _) => { SetViewerMode("IMG"); };
+        _btnModeHex.Click += (_, _) => SetViewerMode("HEX");
+        _btnModeImg.Click += (_, _) => SetViewerMode("IMG");
         modeButtons.Controls.AddRange(new Control[] { _btnModeText, _btnModeHex, _btnModeImg });
 
         viewerHeader.Controls.Add(_lblFileBadge);
         viewerHeader.Controls.Add(modeButtons);
 
-        // Segunda barra del Visor: Botones Descargar Archivo, Abrir Archivo y CheckBox Auto-descarga
         var fileActionsBar = new Panel
         {
             Dock = DockStyle.Top,
@@ -671,29 +667,29 @@ public partial class FormDashboard : Form
         };
         btnDownloadFile.Click += (_, _) => HandleDownloadCurrentFile();
 
-        var btnOpenFile = new NeonButton
+        _btnOpenFile = new NeonButton
         {
-            Text = "▶ Abrir Archivo",
+            Text = "▶ Abrir Archivo Local",
             Variant = NeonButtonVariant.Success,
             Location = new Point(164, 4),
-            Size = new Size(134, 30),
+            Size = new Size(146, 30),
             CornerRadius = 8,
             Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
         };
-        btnOpenFile.Click += (_, _) => HandleOpenCurrentFileInWindows();
+        _btnOpenFile.Click += (_, _) => HandleOpenCurrentFileInWindows();
 
         _chkAutoDownloadBinary = new CheckBox
         {
-            Text = "Auto-descargar multimedia/binarios al descifrar",
+            Text = "Auto-guardar binarios locales al descifrar",
             Checked = true,
             AutoSize = true,
-            Location = new Point(308, 9),
-            Font = new Font("Segoe UI", 8.5f),
+            Location = new Point(318, 9),
+            Font = new Font("Segoe UI", 8.4f),
             ForeColor = HologramTheme.HologramViolet,
             BackColor = HologramTheme.PanelGlass
         };
 
-        fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, btnOpenFile, _chkAutoDownloadBinary });
+        fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, _btnOpenFile, _chkAutoDownloadBinary });
 
         var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 6, 0, 0), BackColor = HologramTheme.PanelGlass };
         _txtDataViewer = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: false, mono: true);
@@ -705,6 +701,7 @@ public partial class FormDashboard : Form
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
                 _currentFileName = "mensaje_manual.txt";
                 _currentExtension = ".txt";
+                _isFromNetworkUntrusted = false;
                 _lastSavedDecryptedPath = null;
                 _lblFileBadge.Text = $"VISOR DE CARGA • {_currentFileName} ({_currentBytes.Length} B)";
             }
@@ -725,7 +722,6 @@ public partial class FormDashboard : Form
         viewerCard.Controls.Add(fileActionsBar);
         viewerCard.Controls.Add(viewerHeader);
 
-        // Bottom Right Card: TRAZABILIDAD TOR • METADATOS
         var metaCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -736,8 +732,8 @@ public partial class FormDashboard : Form
         var metaHeader = new Panel { Dock = DockStyle.Top, Height = 30, BackColor = HologramTheme.PanelGlass };
         var lblMetaTitle = new Label
         {
-            Text = "TRAZABILIDAD TOR • METADATOS",
-            Font = new Font("Segoe UI Semibold", 9.8f, FontStyle.Bold),
+            Text = "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA 11 CAMPOS",
+            Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -746,7 +742,7 @@ public partial class FormDashboard : Form
         };
         _lblMetaSignatureBadge = new Label
         {
-            Text = "● X.509 Listo (NODO-01)",
+            Text = $"● RSA-PSS Listo ({NodeRuntimeState.CurrentNodeId})",
             Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Right,
@@ -765,7 +761,7 @@ public partial class FormDashboard : Form
             Padding = new Padding(0, 6, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
-        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 152));
+        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 156));
         metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
@@ -773,14 +769,14 @@ public partial class FormDashboard : Form
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "Packet ID (UUID):", "---");
-        _txtMetaRootNode = AddMetaRow(metaGrid, 1, "Nodo Raíz (Origen):", "NODO-01");
-        _txtMetaHops = AddMetaRow(metaGrid, 2, "Ruta Saltos Tor:", "NODO-01");
-        _txtMetaRemoteLink = AddMetaRow(metaGrid, 3, "Link Remoto:", "http://...");
+        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "packetId (UUID v4):", "---");
+        _txtMetaRootNode = AddMetaRow(metaGrid, 1, "producerNode / source:", NodeRuntimeState.CurrentNodeId);
+        _txtMetaHops = AddMetaRow(metaGrid, 2, "Ruta / Trazabilidad:", NodeRuntimeState.CurrentNodeId);
+        _txtMetaKeyRef = AddMetaRow(metaGrid, 3, "keyRef (Custodia):", $"ownerNode={NodeRuntimeState.CurrentNodeId}");
 
         var lblPub = new Label
         {
-            Text = "Parámetros JSON:",
+            Text = "publicParameters:",
             Font = new Font("Segoe UI Semibold", 8.6f),
             ForeColor = HologramTheme.TextSecondary,
             Dock = DockStyle.Fill,
@@ -831,8 +827,9 @@ public partial class FormDashboard : Form
     {
         if (_cmbAlgorithm.SelectedItem is CryptoAlgorithmInfo info)
         {
+            string owner = CryptoCatalog.GetOwnerNode(info.Code);
             _hologram.ActiveAlgorithmLabel = info.Code;
-            _lblAlgDesc.Text = $"[{info.Category}]  {info.Description}";
+            _lblAlgDesc.Text = $"[#{CryptoCatalog.GetAlgorithmId(info.Code)} • Dueño: {owner} • {info.Category}]  {info.Description}";
         }
     }
 
@@ -852,6 +849,9 @@ public partial class FormDashboard : Form
     {
         _lblFileBadge.Text = $"VISOR • {_currentFileName} ({FormatFileSize(_currentBytes.Length)})" +
                              (_isShowingEncrypted ? " [CIFRADO]" : " [PLANO]");
+
+        if (_btnOpenFile != null)
+            _btnOpenFile.Enabled = !_isFromNetworkUntrusted;
 
         if (_viewerMode == "IMG")
         {
@@ -940,12 +940,13 @@ public partial class FormDashboard : Form
         _currentExtension = Path.GetExtension(ofd.FileName);
         if (string.IsNullOrWhiteSpace(_currentExtension)) _currentExtension = ".bin";
         _isShowingEncrypted = false;
+        _isFromNetworkUntrusted = false;
         _lastSavedDecryptedPath = ofd.FileName;
         _binarySummaryReport = null;
 
         ClearRelayContext();
 
-        _hologram.SetIdle($"Archivo cargado en NODO-01: {_currentFileName} ({FormatFileSize(_currentBytes.Length)})");
+        _hologram.SetIdle($"Archivo cargado en {NodeRuntimeState.CurrentNodeId}: {_currentFileName} ({FormatFileSize(_currentBytes.Length)})");
 
         if (ImageViewerExtensions.Contains(_currentExtension))
         {
@@ -978,7 +979,7 @@ public partial class FormDashboard : Form
             return;
         }
 
-        string suggestedName = string.IsNullOrWhiteSpace(_currentFileName) ? $"archivo{_currentExtension}" : _currentFileName;
+        string suggestedName = Path.GetFileName(string.IsNullOrWhiteSpace(_currentFileName) ? $"archivo{_currentExtension}" : _currentFileName);
         string ext = string.IsNullOrWhiteSpace(_currentExtension) ? Path.GetExtension(suggestedName) : _currentExtension;
         if (string.IsNullOrWhiteSpace(ext)) ext = ".bin";
 
@@ -1000,9 +1001,19 @@ public partial class FormDashboard : Form
 
     private void HandleOpenCurrentFileInWindows()
     {
+        // Regla Inmutable #4: Prohibido abrir o ejecutar automáticamente archivos recibidos de la red
+        if (_isFromNetworkUntrusted)
+        {
+            MessageBox.Show(this,
+                "Por política de seguridad del Estándar v2.0, está prohibido abrir o ejecutar directamente archivos recibidos desde la red.\n\n" +
+                "Puedes guardar los bytes de forma segura usando [💾 Descargar Archivo] o inspeccionarlos en [Hex].",
+                "Política de Seguridad v2.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         if (_currentBytes == null || _currentBytes.Length == 0)
         {
-            MessageBox.Show(this, "No hay ningún archivo cargado o descifrado para abrir.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "No hay ningún archivo local cargado o descifrado para abrir.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -1032,10 +1043,8 @@ public partial class FormDashboard : Form
 
     private void ClearRelayContext()
     {
-        _relayRootOrigin = null;
-        _relayRootSignatureBase64 = null;
-        _relayRootCertBase64 = null;
-        _relayOriginalHashHex = null;
+        _relayProducerNode = null;
+        _relaySourceZipPath = null;
         _relayHopHistory = null;
     }
 
@@ -1054,36 +1063,29 @@ public partial class FormDashboard : Form
             var strategy = CryptoCatalog.GetStrategy(algInfo.Code);
             var result = strategy.Encrypt(_currentBytes, _txtPassphrase.Text);
 
-            // Conservar nombre y extensión original en ParametrosPublicosJson (vital para LSBSTEGO y archivos multimedia/binarios)
             string enrichedPubJson = EnrichPublicParametersWithOriginalFileMeta(
                 result.PublicParametersJson,
                 origFileNameBeforeEncrypt,
                 origExtensionBeforeEncrypt);
 
-            string packetId = Guid.NewGuid().ToString();
-            string remoteLink = NodeRuntimeState.BuildRemoteDecryptUrl(packetId);
+            string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+            string keyId = $"key-{packetId}";
 
-            string rootOrigin;
-            string rootSignature;
+            string producerNode;
             List<string> hops;
 
-            if (asIntermediateHop && !string.IsNullOrWhiteSpace(_relayRootOrigin))
+            if (asIntermediateHop && !string.IsNullOrWhiteSpace(_relayProducerNode))
             {
-                rootOrigin = _relayRootOrigin!;
-                rootSignature = _relayRootSignatureBase64 ?? NodeCertificateService.SignPayload(result.OutputBytes);
-                hops = _relayHopHistory != null ? new List<string>(_relayHopHistory) : new List<string> { rootOrigin };
-                if (hops.Count == 0 || hops[^1] != "NODO-01")
-                    hops.Add("NODO-01");
+                producerNode = _relayProducerNode!;
+                hops = _relayHopHistory != null ? new List<string>(_relayHopHistory) : new List<string> { producerNode };
+                if (hops.Count == 0 || hops[^1] != NodeRuntimeState.CurrentNodeId)
+                    hops.Add(NodeRuntimeState.CurrentNodeId);
             }
             else
             {
                 ClearRelayContext();
-                rootOrigin = "NODO-01";
-                string payloadHashHex = Convert.ToHexString(SHA256.HashData(result.OutputBytes));
-                _relayOriginalHashHex = payloadHashHex;
-                _relayRootCertBase64 = NodeCertificateService.ExportPublicCertBase64();
-                rootSignature = NodeCertificateService.SignPayload(Encoding.ASCII.GetBytes(payloadHashHex));
-                hops = new List<string> { "NODO-01" };
+                producerNode = NodeRuntimeState.CurrentNodeId;
+                hops = new List<string> { NodeRuntimeState.CurrentNodeId };
             }
 
             string outExt = string.IsNullOrEmpty(result.OutputExtensionOverride) ? _currentExtension : result.OutputExtensionOverride;
@@ -1101,11 +1103,11 @@ public partial class FormDashboard : Form
                 AlgoritmoCodigo = algInfo.Code,
                 ParametrosPublicosJson = enrichedPubJson,
                 LlaveSecretaBase64 = result.SecretKeyBase64,
-                LinkDescifradoRemoto = remoteLink,
-                NodoRaiz = rootOrigin,
-                FirmaRaizBase64 = rootSignature,
+                LinkDescifradoRemoto = keyId,
+                NodoRaiz = producerNode,
+                FirmaRaizBase64 = NodeCertificateService.SignDataPss(result.OutputBytes),
                 RutaSaltosJson = JsonSerializer.Serialize(hops),
-                Origen = asIntermediateHop && rootOrigin != "NODO-01" ? "Relay" : "Local",
+                Origen = asIntermediateHop && producerNode != NodeRuntimeState.CurrentNodeId ? "Relay" : "Local",
                 FechaOperacion = DateTime.Now
             };
 
@@ -1146,7 +1148,7 @@ public partial class FormDashboard : Form
         {
             var node = JsonNode.Parse(string.IsNullOrWhiteSpace(pubJson) ? "{}" : pubJson) as JsonObject ?? new JsonObject();
             if (!string.IsNullOrWhiteSpace(origFileName))
-                node["originalFileName"] = origFileName;
+                node["originalFileName"] = Path.GetFileName(origFileName);
             if (!string.IsNullOrWhiteSpace(origExt))
                 node["originalExtension"] = origExt;
             return node.ToJsonString();
@@ -1184,7 +1186,7 @@ public partial class FormDashboard : Form
         if (_activeRecord == null)
         {
             MessageBox.Show(this, "Primero cifra un paquete o carga un registro desde Consultas / Solicitudes.",
-                "ModuloCrypto — NODO-01", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -1193,28 +1195,6 @@ public partial class FormDashboard : Form
             : _activeRecord.LlaveSecretaBase64;
 
         ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, keyToUse, _activeRecord.ParametrosPublicosJson);
-    }
-
-    private async Task HandleDecryptRemoteActionAsync()
-    {
-        string url = _txtMetaRemoteLink.Text.Trim();
-        if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-        {
-            MessageBox.Show(this, "No hay un Link de Descifrado Remoto válido en los metadatos activos.",
-                "ModuloCrypto — NODO-01", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        _hologram.StatusSubtitle = $"Consultando llave remota en {url}...";
-        var resp = await NodeNetworkClient.RequestRemoteKeyAsync(url);
-        if (!resp.Success)
-        {
-            MessageBox.Show(this, $"Descifrado remoto fallido:\n{resp.Message}",
-                "ModuloCrypto — Descifrado Remoto", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-
-        ExecuteDecryption(resp.AlgoritmoCodigo, _currentBytes, resp.LlaveSecretaBase64, resp.ParametrosPublicosJson);
     }
 
     private void ExecuteDecryption(string algCode, byte[] cipherBytes, string secretKeyBase64, string pubJson)
@@ -1229,12 +1209,11 @@ public partial class FormDashboard : Form
             _binarySummaryReport = null;
             _lastSavedDecryptedPath = null;
 
-            // Restaurar nombre y extensión original (especialmente útil tras LSBSTEGO o paquetes recibidos)
             var (origName, origExt) = ExtractOriginalFileMetaFromJson(pubJson);
             if (!string.IsNullOrWhiteSpace(origExt))
                 _currentExtension = origExt;
             if (!string.IsNullOrWhiteSpace(origName))
-                _currentFileName = origName;
+                _currentFileName = Path.GetFileName(origName);
             else if (algCode.Equals("LSBSTEGO", StringComparison.OrdinalIgnoreCase) &&
                      _currentExtension.Equals(".png", StringComparison.OrdinalIgnoreCase))
             {
@@ -1252,7 +1231,7 @@ public partial class FormDashboard : Form
             if (_activeRecord != null)
             {
                 string hopsStr = string.Join(" → ", PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson));
-                _hologram.StatusSubtitle = $"DESCIFRADO EN NODO-01 • Origen Raíz: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
+                _hologram.StatusSubtitle = $"DESCIFRADO EN {NodeRuntimeState.CurrentNodeId} • Producer: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
             }
 
             bool isPlainText = PlainTextExtensions.Contains(_currentExtension);
@@ -1260,10 +1239,12 @@ public partial class FormDashboard : Form
 
             if (!isPlainText && !isViewerImage)
             {
-                // Archivo multimedia o binario (.mp4, .pdf, .docx, .xlsx, .mp3, .zip, etc.)
-                string autoSavedInfo = "Auto-descarga desactivada (usa [💾 Descargar Archivo] o [▶ Abrir Archivo]).";
+                string autoSavedInfo = _isFromNetworkUntrusted
+                    ? "Deshabilitada por seguridad para paquetes de red (usa [💾 Descargar Archivo] manualmente)."
+                    : "Auto-guardado desactivado (usa [💾 Descargar Archivo]).";
 
-                if (_chkAutoDownloadBinary != null && _chkAutoDownloadBinary.Checked)
+                // Solo auto-guardar cuando el paquete es de origen local (nunca auto-ejecutar paquetes de red)
+                if (!_isFromNetworkUntrusted && _chkAutoDownloadBinary != null && _chkAutoDownloadBinary.Checked)
                 {
                     string savedPath = SaveDecryptedBinaryAutomatically(_currentBytes, _currentFileName, _currentExtension);
                     _lastSavedDecryptedPath = savedPath;
@@ -1278,11 +1259,10 @@ public partial class FormDashboard : Form
                     $"• Extensión          : {_currentExtension}\r\n" +
                     $"• Tamaño Exacto      : {FormatFileSize(_currentBytes.Length)} ({_currentBytes.Length:N0} bytes)\r\n" +
                     $"• Algoritmo Aplicado : {algCode}\r\n" +
-                    $"• Descarga Automática: {autoSavedInfo}\r\n\r\n" +
+                    $"• Guardado Local     : {autoSavedInfo}\r\n\r\n" +
                     $"ACCIONES DISPONIBLES:\r\n" +
-                    $"  1. Haz clic en [▶ Abrir Archivo] para reproducirlo o visualizarlo con Windows.\r\n" +
-                    $"  2. Haz clic en [💾 Descargar Archivo] para guardarlo en otra carpeta.\r\n" +
-                    $"  3. Cambia a la pestaña [Hex] si deseas inspeccionar los bytes crudos.";
+                    $"  1. Haz clic en [💾 Descargar Archivo] para guardarlo en la carpeta que elijas.\r\n" +
+                    $"  2. Cambia a la pestaña [Hex] si deseas inspeccionar los bytes crudos.";
 
                 SetViewerMode("TEXT");
             }
@@ -1368,16 +1348,42 @@ public partial class FormDashboard : Form
         return $"{bytes / (1024.0 * 1024.0):F2} MB";
     }
 
+    private void HandleExportV2ZipLocally()
+    {
+        if (_activeRecord == null)
+        {
+            MessageBox.Show(this, "Primero cifra un paquete para exportarlo en formato .zip v2.0 (3 archivos en raíz).",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        byte[] cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
+        string sha8 = Convert.ToHexString(SHA256.HashData(cipherBytes))[..8].ToUpperInvariant();
+        string defaultName = $"{NodeRuntimeState.CurrentNodeId}_{_activeRecord.AlgoritmoCodigo}_{DateTime.UtcNow:yyyyMMdd_HHmmss}_{sha8}.zip";
+
+        using var sfd = new SaveFileDialog
+        {
+            Filter = "Paquete Estándar v2.0 (*.zip)|*.zip",
+            FileName = defaultName
+        };
+        if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+        PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, destinationPath: sfd.FileName);
+        MessageBox.Show(this,
+            $"Paquete .zip v2.0 exportado con 3 archivos planos (datos.enc, certificado.pem, manifest.json):\n{sfd.FileName}",
+            "Exportación v2.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private async Task HandleSendZipToPeerAsync()
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Primero cifra un mensaje o archivo para generar un paquete .zip.",
-                "ModuloCrypto — NODO-01", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "Primero cifra un mensaje o archivo para generar un paquete .zip v2.0.",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        string targetPeerId = _cmbTargetPeer.SelectedItem?.ToString()?.Split(' ')[0] ?? "NODO-02";
+        string targetPeerId = _cmbTargetPeer.SelectedItem?.ToString()?.Split(' ')[0] ?? "EQ02";
         var peer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p => p.NodeId == targetPeerId)
                    ?? NodeRuntimeState.NetworkPeers.First();
 
@@ -1388,29 +1394,31 @@ public partial class FormDashboard : Form
             if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
             if (hops[^1] != peer.NodeId) hops.Add(peer.NodeId);
 
-            string zipPath = PacketZipService.CreatePacketZip(
-                _activeRecord,
-                cipherBytes,
-                hops,
-                preservedRootCertBase64: _relayRootCertBase64,
-                preservedOriginalHashHex: _relayOriginalHashHex);
+            string zipPath = !string.IsNullOrWhiteSpace(_relaySourceZipPath) &&
+                             File.Exists(_relaySourceZipPath) &&
+                             string.Equals(_activeRecord.Origen, "Recibido", StringComparison.OrdinalIgnoreCase)
+                ? PacketZipService.RepackageForForwarding(_relaySourceZipPath)
+                : PacketZipService.CreatePacketZip(
+                    _activeRecord,
+                    cipherBytes,
+                    producerNode: _activeRecord.NodoRaiz);
 
             var sendResult = await NodeNetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
             RefreshNetworkGrid();
 
             MessageBox.Show(this,
                 $"{sendResult.Message}\n\n" +
-                $"• Nodo Raíz (rootOrigin): {_activeRecord.NodoRaiz}\n" +
-                $"• Protocolo Destino: {peer.ProtocolType}\n" +
-                $"• Ruta de Saltos (hopHistory): {string.Join(" → ", hops)}",
-                sendResult.Success ? "Envío Tor .ZIP Exitoso" : "Error de Envío .ZIP",
+                $"• Emisor (sourceNode): {NodeRuntimeState.CurrentNodeId}\n" +
+                $"• Productor (producerNode): {_activeRecord.NodoRaiz}\n" +
+                $"• Ruta: {string.Join(" → ", hops)}",
+                sendResult.Success ? "Envío v2.0 .ZIP Exitoso" : "Error de Envío .ZIP",
                 MessageBoxButtons.OK,
                 sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"No se pudo empaquetar/enviar el .ZIP:\n{ex.Message}",
-                "ModuloCrypto — NODO-01", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, $"No se pudo empaquetar/enviar el .ZIP v2.0:\n{ex.Message}",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -1420,11 +1428,9 @@ public partial class FormDashboard : Form
         if (hops.Count == 0) hops.Add(r.NodoRaiz);
 
         _txtMetaPacketId.Text = r.PacketId;
-        _txtMetaRootNode.Text = $"{r.NodoRaiz}  (Originador del Circuito)";
+        _txtMetaRootNode.Text = $"producer={r.NodoRaiz} | source={NodeRuntimeState.CurrentNodeId}";
         _txtMetaHops.Text = string.Join("  →  ", hops);
-        _txtMetaRemoteLink.Text = string.IsNullOrWhiteSpace(r.LinkDescifradoRemoto)
-            ? "(Paquete externo — Clave local)"
-            : r.LinkDescifradoRemoto;
+        _txtMetaKeyRef.Text = $"keyId={r.LinkDescifradoRemoto} | ownerNode={r.NodoRaiz}";
 
         try
         {
@@ -1438,14 +1444,14 @@ public partial class FormDashboard : Form
 
         if (!hasSignature)
         {
-            _lblMetaSignatureBadge.Text = "⚠ Sin firma X.509 (Modo Tolerante)";
+            _lblMetaSignatureBadge.Text = "⚠ Sin firma X.509";
             _lblMetaSignatureBadge.ForeColor = HologramTheme.Warning;
         }
         else
         {
             _lblMetaSignatureBadge.Text = signatureValid
-                ? $"● Firma Raíz ({r.NodoRaiz}) VÁLIDA"
-                : $"● Firma Raíz ({r.NodoRaiz}) INVÁLIDA";
+                ? $"● RSA-PSS ({r.NodoRaiz}) VÁLIDA"
+                : $"● RSA-PSS ({r.NodoRaiz}) INVÁLIDA";
             _lblMetaSignatureBadge.ForeColor = signatureValid ? HologramTheme.Success : HologramTheme.Danger;
         }
     }
@@ -1457,7 +1463,21 @@ public partial class FormDashboard : Form
         {
             RefreshPendingSolicitudesBadge();
             RefreshSolicitudesGrid();
-            _hologram.StatusSubtitle = $"Paquete .ZIP recibido en NODO-01 desde {solicitud.NodoOrigen} ({solicitud.AlgoritmoCodigo})";
+            _hologram.StatusSubtitle = $"Paquete v2.0 recibido en {NodeRuntimeState.CurrentNodeId} desde {solicitud.NodoOrigen} ({solicitud.AlgoritmoCodigo})";
+        });
+    }
+
+    private void HandlePeerChangedEvent(PeerNode peer)
+    {
+        if (IsDisposed) return;
+        BeginInvoke(() =>
+        {
+            RefreshNetworkGrid();
+            RefreshTargetPeerCombo();
+            if (peer.HasThumbprintMismatch)
+            {
+                _hologram.StatusSubtitle = $"🚨 ALERTA TOFU: Cambio de huella detectado en {peer.NodeId} ({peer.IpAddress}:{peer.Port})";
+            }
         });
     }
 

@@ -16,12 +16,21 @@ internal static class SymmetricKeyHelper
                 byte[] decoded = Convert.FromBase64String(secretKeyBase64OrPassphrase.Trim());
                 if (decoded.Length == requiredBytes)
                     return decoded;
+                CryptographicOperations.ZeroMemory(decoded);
             }
             catch
             {
-                // No es Base64 exacto: derivar mediante SHA-256 desde passphrase
+                // Derivar mediante SHA-256 desde passphrase
             }
-            return SHA256.HashData(Encoding.UTF8.GetBytes(secretKeyBase64OrPassphrase))[..requiredBytes];
+            byte[] pwdBytes = Encoding.UTF8.GetBytes(secretKeyBase64OrPassphrase);
+            try
+            {
+                return SHA256.HashData(pwdBytes)[..requiredBytes];
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pwdBytes);
+            }
         }
 
         return new byte[requiredBytes];
@@ -76,7 +85,7 @@ internal static class SymmetricKeyHelper
     }
 }
 
-/// <summary>1. AESGCM — AES-256-GCM</summary>
+/// <summary>1. AESGCM — AES-256-GCM (Equipo Dueño Oficial: EQ01)</summary>
 public sealed class AesGcmStrategy : ICryptoStrategy
 {
     public CryptoAlgorithmInfo Info { get; } = new()
@@ -92,98 +101,107 @@ public sealed class AesGcmStrategy : ICryptoStrategy
         byte[] key = string.IsNullOrWhiteSpace(optionalPassphrase)
             ? RandomNumberGenerator.GetBytes(32)
             : SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase));
-        byte[] nonce = RandomNumberGenerator.GetBytes(12);
-        byte[] cipher = new byte[plainBytes.Length];
-        byte[] tag = new byte[16];
-
-        using var aes = new AesGcm(key, 16);
-        aes.Encrypt(nonce, plainBytes, cipher, tag);
-
-        string pubJson = JsonSerializer.Serialize(new
+        try
         {
-            mode = "AES-256-GCM",
-            nonce = Convert.ToBase64String(nonce),
-            tag = Convert.ToBase64String(tag)
-        });
+            byte[] nonce = RandomNumberGenerator.GetBytes(12);
+            byte[] cipher = new byte[plainBytes.Length];
+            byte[] tag = new byte[16];
 
-        return new CryptoOperationResult
+            using var aes = new AesGcm(key, 16);
+            aes.Encrypt(nonce, plainBytes, cipher, tag);
+
+            string pubJson = JsonSerializer.Serialize(new
+            {
+                mode = "AES-256-GCM",
+                nonce = Convert.ToBase64String(nonce),
+                tag = Convert.ToBase64String(tag)
+            });
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = cipher,
+                SecretKeyBase64 = Convert.ToBase64String(key),
+                PublicParametersJson = pubJson,
+                Summary = $"AES-256-GCM cifrado ({cipher.Length} bytes, Tag AEAD 128-bit)."
+            };
+        }
+        finally
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = cipher,
-            SecretKeyBase64 = Convert.ToBase64String(key),
-            PublicParametersJson = pubJson,
-            Summary = $"AES-256-GCM cifrado ({cipher.Length} bytes, Tag AEAD 128-bit)."
-        };
+            CryptographicOperations.ZeroMemory(key);
+        }
     }
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 32);
-
-        // Prioridad 1: Formato nativo ModuloCrypto (nonce y tag en JSON)
-        if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) &&
-            SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag))
-        {
-            byte[] plain = new byte[cipherBytes.Length];
-            using var aes = new AesGcm(key, 16);
-            aes.Decrypt(nonce, cipherBytes, tag, plain);
-
-            return new CryptoOperationResult
-            {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plain,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"AES-256-GCM autenticado y descifrado ({plain.Length} bytes)."
-            };
-        }
-
-        // Fallback: Formato empaquetado externo CentroCiberseguridad.Web en datos.enc
-        if (cipherBytes.Length < 28)
-            throw new CryptographicException("Datos cifrados AES-GCM insuficientes para extraer Nonce y Tag.");
-
-        using var aesFallback = new AesGcm(key, 16);
-
-        // Layout A: [12B nonce][16B tag][ciphertext]
         try
         {
-            byte[] nA = cipherBytes[..12];
-            byte[] tA = cipherBytes[12..28];
-            byte[] cA = cipherBytes[28..];
-            byte[] plainA = new byte[cA.Length];
-            aesFallback.Decrypt(nA, cA, tA, plainA);
-
-            return new CryptoOperationResult
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) &&
+                SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag))
             {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plainA,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"AES-256-GCM (formato externo nonce+tag+cipher) descifrado ({plainA.Length} bytes)."
-            };
+                byte[] plain = new byte[cipherBytes.Length];
+                using var aes = new AesGcm(key, 16);
+                aes.Decrypt(nonce, cipherBytes, tag, plain);
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plain,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"AES-256-GCM autenticado y descifrado ({plain.Length} bytes)."
+                };
+            }
+
+            if (cipherBytes.Length < 28)
+                throw new CryptographicException("Datos cifrados AES-GCM insuficientes para extraer Nonce y Tag.");
+
+            using var aesFallback = new AesGcm(key, 16);
+
+            try
+            {
+                byte[] nA = cipherBytes[..12];
+                byte[] tA = cipherBytes[12..28];
+                byte[] cA = cipherBytes[28..];
+                byte[] plainA = new byte[cA.Length];
+                aesFallback.Decrypt(nA, cA, tA, plainA);
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plainA,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"AES-256-GCM (formato empaquetado nonce+tag+cipher) descifrado ({plainA.Length} bytes)."
+                };
+            }
+            catch
+            {
+                byte[] nB = cipherBytes[..12];
+                byte[] cB = cipherBytes[12..^16];
+                byte[] tB = cipherBytes[^16..];
+                byte[] plainB = new byte[cB.Length];
+                aesFallback.Decrypt(nB, cB, tB, plainB);
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plainB,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"AES-256-GCM (formato empaquetado nonce+cipher+tag) descifrado ({plainB.Length} bytes)."
+                };
+            }
         }
-        catch
+        finally
         {
-            // Layout B: [12B nonce][ciphertext][16B tag]
-            byte[] nB = cipherBytes[..12];
-            byte[] cB = cipherBytes[12..^16];
-            byte[] tB = cipherBytes[^16..];
-            byte[] plainB = new byte[cB.Length];
-            aesFallback.Decrypt(nB, cB, tB, plainB);
-
-            return new CryptoOperationResult
-            {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plainB,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"AES-256-GCM (formato externo nonce+cipher+tag) descifrado ({plainB.Length} bytes)."
-            };
+            CryptographicOperations.ZeroMemory(key);
         }
     }
 }
 
-/// <summary>2. DES — DES 56-bit</summary>
+/// <summary>2. DES — DES 56-bit (Equipo Dueño Oficial: EQ01)</summary>
 public sealed class DesStrategy : ICryptoStrategy
 {
     public CryptoAlgorithmInfo Info { get; } = new()
@@ -199,60 +217,82 @@ public sealed class DesStrategy : ICryptoStrategy
         using var des = DES.Create();
         des.Mode = CipherMode.CBC;
         des.Padding = PaddingMode.PKCS7;
-        if (!string.IsNullOrWhiteSpace(optionalPassphrase))
-            des.Key = SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase))[..8];
-        else
-            des.GenerateKey();
-        des.GenerateIV();
-
-        byte[] cipher = des.EncryptCbc(plainBytes, des.IV, PaddingMode.PKCS7);
-        string pubJson = JsonSerializer.Serialize(new
+        byte[]? rawKey = null;
+        try
         {
-            mode = "DES-CBC-PKCS7",
-            iv = Convert.ToBase64String(des.IV)
-        });
+            if (!string.IsNullOrWhiteSpace(optionalPassphrase))
+            {
+                rawKey = SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase))[..8];
+                des.Key = rawKey;
+            }
+            else
+            {
+                des.GenerateKey();
+                rawKey = des.Key;
+            }
+            des.GenerateIV();
 
-        return new CryptoOperationResult
+            byte[] cipher = des.EncryptCbc(plainBytes, des.IV, PaddingMode.PKCS7);
+            string pubJson = JsonSerializer.Serialize(new
+            {
+                mode = "DES-CBC-PKCS7",
+                iv = Convert.ToBase64String(des.IV)
+            });
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = cipher,
+                SecretKeyBase64 = Convert.ToBase64String(rawKey),
+                PublicParametersJson = pubJson,
+                Summary = $"DES 56-bit cifrado ({cipher.Length} bytes)."
+            };
+        }
+        finally
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = cipher,
-            SecretKeyBase64 = Convert.ToBase64String(des.Key),
-            PublicParametersJson = pubJson,
-            Summary = $"DES 56-bit cifrado ({cipher.Length} bytes)."
-        };
+            if (rawKey != null) CryptographicOperations.ZeroMemory(rawKey);
+        }
     }
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        using var des = DES.Create();
-        des.Key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 8);
-
-        byte[] iv;
-        byte[] actualCipher;
-
-        if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+        byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 8);
+        try
         {
-            iv = jsonIv;
-            actualCipher = cipherBytes;
+            using var des = DES.Create();
+            des.Key = key;
+
+            byte[] iv;
+            byte[] actualCipher;
+
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+            {
+                iv = jsonIv;
+                actualCipher = cipherBytes;
+            }
+            else
+            {
+                if (cipherBytes.Length <= 8)
+                    throw new CryptographicException("Payload DES empaquetado demasiado corto para extraer IV.");
+                iv = cipherBytes[..8];
+                actualCipher = cipherBytes[8..];
+            }
+
+            byte[] plain = des.DecryptCbc(actualCipher, iv, PaddingMode.PKCS7);
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = plain,
+                SecretKeyBase64 = secretKeyBase64,
+                PublicParametersJson = publicParametersJson,
+                Summary = $"DES 56-bit descifrado ({plain.Length} bytes)."
+            };
         }
-        else
+        finally
         {
-            if (cipherBytes.Length <= 8)
-                throw new CryptographicException("Payload DES empaquetado demasiado corto para extraer IV.");
-            iv = cipherBytes[..8];
-            actualCipher = cipherBytes[8..];
+            CryptographicOperations.ZeroMemory(key);
         }
-
-        byte[] plain = des.DecryptCbc(actualCipher, iv, PaddingMode.PKCS7);
-
-        return new CryptoOperationResult
-        {
-            AlgorithmCode = Info.Code,
-            OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
-            PublicParametersJson = publicParametersJson,
-            Summary = $"DES 56-bit descifrado ({plain.Length} bytes)."
-        };
     }
 }
 
@@ -272,60 +312,82 @@ public sealed class TripleDesStrategy : ICryptoStrategy
         using var tdes = TripleDES.Create();
         tdes.Mode = CipherMode.CBC;
         tdes.Padding = PaddingMode.PKCS7;
-        if (!string.IsNullOrWhiteSpace(optionalPassphrase))
-            tdes.Key = SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase))[..24];
-        else
-            tdes.GenerateKey();
-        tdes.GenerateIV();
-
-        byte[] cipher = tdes.EncryptCbc(plainBytes, tdes.IV, PaddingMode.PKCS7);
-        string pubJson = JsonSerializer.Serialize(new
+        byte[]? rawKey = null;
+        try
         {
-            mode = "3DES-EDE-CBC",
-            iv = Convert.ToBase64String(tdes.IV)
-        });
+            if (!string.IsNullOrWhiteSpace(optionalPassphrase))
+            {
+                rawKey = SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase))[..24];
+                tdes.Key = rawKey;
+            }
+            else
+            {
+                tdes.GenerateKey();
+                rawKey = tdes.Key;
+            }
+            tdes.GenerateIV();
 
-        return new CryptoOperationResult
+            byte[] cipher = tdes.EncryptCbc(plainBytes, tdes.IV, PaddingMode.PKCS7);
+            string pubJson = JsonSerializer.Serialize(new
+            {
+                mode = "3DES-EDE-CBC",
+                iv = Convert.ToBase64String(tdes.IV)
+            });
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = cipher,
+                SecretKeyBase64 = Convert.ToBase64String(rawKey),
+                PublicParametersJson = pubJson,
+                Summary = $"Triple DES cifrado ({cipher.Length} bytes)."
+            };
+        }
+        finally
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = cipher,
-            SecretKeyBase64 = Convert.ToBase64String(tdes.Key),
-            PublicParametersJson = pubJson,
-            Summary = $"Triple DES cifrado ({cipher.Length} bytes)."
-        };
+            if (rawKey != null) CryptographicOperations.ZeroMemory(rawKey);
+        }
     }
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        using var tdes = TripleDES.Create();
-        tdes.Key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 24);
-
-        byte[] iv;
-        byte[] actualCipher;
-
-        if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+        byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 24);
+        try
         {
-            iv = jsonIv;
-            actualCipher = cipherBytes;
+            using var tdes = TripleDES.Create();
+            tdes.Key = key;
+
+            byte[] iv;
+            byte[] actualCipher;
+
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "iv", out byte[] jsonIv))
+            {
+                iv = jsonIv;
+                actualCipher = cipherBytes;
+            }
+            else
+            {
+                if (cipherBytes.Length <= 8)
+                    throw new CryptographicException("Payload 3DES empaquetado demasiado corto para extraer IV.");
+                iv = cipherBytes[..8];
+                actualCipher = cipherBytes[8..];
+            }
+
+            byte[] plain = tdes.DecryptCbc(actualCipher, iv, PaddingMode.PKCS7);
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = plain,
+                SecretKeyBase64 = secretKeyBase64,
+                PublicParametersJson = publicParametersJson,
+                Summary = $"Triple DES descifrado ({plain.Length} bytes)."
+            };
         }
-        else
+        finally
         {
-            if (cipherBytes.Length <= 8)
-                throw new CryptographicException("Payload 3DES empaquetado demasiado corto para extraer IV.");
-            iv = cipherBytes[..8];
-            actualCipher = cipherBytes[8..];
+            CryptographicOperations.ZeroMemory(key);
         }
-
-        byte[] plain = tdes.DecryptCbc(actualCipher, iv, PaddingMode.PKCS7);
-
-        return new CryptoOperationResult
-        {
-            AlgorithmCode = Info.Code,
-            OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
-            PublicParametersJson = publicParametersJson,
-            Summary = $"Triple DES descifrado ({plain.Length} bytes)."
-        };
     }
 }
 
@@ -345,97 +407,106 @@ public sealed class ChaCha20Strategy : ICryptoStrategy
         byte[] key = string.IsNullOrWhiteSpace(optionalPassphrase)
             ? RandomNumberGenerator.GetBytes(32)
             : SHA256.HashData(Encoding.UTF8.GetBytes(optionalPassphrase));
-        byte[] nonce = RandomNumberGenerator.GetBytes(12);
-
-        byte[] cipher = new byte[plainBytes.Length];
-        byte[] tag = new byte[16];
-        string engine;
-
-        if (ChaCha20Poly1305.IsSupported)
+        try
         {
-            using var cc = new ChaCha20Poly1305(key);
-            cc.Encrypt(nonce, plainBytes, cipher, tag);
-            engine = "Native-ChaCha20Poly1305";
+            byte[] nonce = RandomNumberGenerator.GetBytes(12);
+            byte[] cipher = new byte[plainBytes.Length];
+            byte[] tag = new byte[16];
+            string engine;
+
+            if (ChaCha20Poly1305.IsSupported)
+            {
+                using var cc = new ChaCha20Poly1305(key);
+                cc.Encrypt(nonce, plainBytes, cipher, tag);
+                engine = "Native-ChaCha20Poly1305";
+            }
+            else
+            {
+                cipher = ChaCha20Transform(key, nonce, 1, plainBytes);
+                tag = ComputeAuthTag(key, nonce, cipher);
+                engine = "RFC8439-ChaCha20-Managed";
+            }
+
+            string pubJson = JsonSerializer.Serialize(new
+            {
+                mode = engine,
+                nonce = Convert.ToBase64String(nonce),
+                tag = Convert.ToBase64String(tag)
+            });
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = cipher,
+                SecretKeyBase64 = Convert.ToBase64String(key),
+                PublicParametersJson = pubJson,
+                Summary = $"ChaCha20-Poly1305 ({engine}) cifrado ({cipher.Length} bytes)."
+            };
         }
-        else
+        finally
         {
-            cipher = ChaCha20Transform(key, nonce, 1, plainBytes);
-            tag = ComputeAuthTag(key, nonce, cipher);
-            engine = "RFC8439-ChaCha20-Managed";
+            CryptographicOperations.ZeroMemory(key);
         }
-
-        string pubJson = JsonSerializer.Serialize(new
-        {
-            mode = engine,
-            nonce = Convert.ToBase64String(nonce),
-            tag = Convert.ToBase64String(tag)
-        });
-
-        return new CryptoOperationResult
-        {
-            AlgorithmCode = Info.Code,
-            OutputBytes = cipher,
-            SecretKeyBase64 = Convert.ToBase64String(key),
-            PublicParametersJson = pubJson,
-            Summary = $"ChaCha20-Poly1305 ({engine}) cifrado ({cipher.Length} bytes)."
-        };
     }
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         byte[] key = SymmetricKeyHelper.ResolveKey(secretKeyBase64, 32);
-
-        if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) &&
-            SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag))
-        {
-            string mode = SymmetricKeyHelper.TryGetJsonString(publicParametersJson, "mode");
-            byte[] plain = DecryptWithNonceAndTag(key, nonce, tag, cipherBytes, mode);
-
-            return new CryptoOperationResult
-            {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plain,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"ChaCha20-Poly1305 autenticado y descifrado ({plain.Length} bytes)."
-            };
-        }
-
-        // Fallback formato empaquetado externo en datos.enc
-        if (cipherBytes.Length < 28)
-            throw new CryptographicException("Datos cifrados ChaCha20 insuficientes para extraer Nonce y Tag.");
-
         try
         {
-            // Layout A: [12B nonce][16B tag][ciphertext]
-            byte[] nA = cipherBytes[..12];
-            byte[] tA = cipherBytes[12..28];
-            byte[] cA = cipherBytes[28..];
-            byte[] plainA = DecryptWithNonceAndTag(key, nA, tA, cA, "Native-ChaCha20Poly1305");
-            return new CryptoOperationResult
+            if (SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "nonce", out byte[] nonce) &&
+                SymmetricKeyHelper.TryGetJsonBase64(publicParametersJson, "tag", out byte[] tag))
             {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plainA,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"ChaCha20-Poly1305 (formato externo nonce+tag+cipher) descifrado ({plainA.Length} bytes)."
-            };
+                string mode = SymmetricKeyHelper.TryGetJsonString(publicParametersJson, "mode");
+                byte[] plain = DecryptWithNonceAndTag(key, nonce, tag, cipherBytes, mode);
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plain,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"ChaCha20-Poly1305 autenticado y descifrado ({plain.Length} bytes)."
+                };
+            }
+
+            if (cipherBytes.Length < 28)
+                throw new CryptographicException("Datos cifrados ChaCha20 insuficientes para extraer Nonce y Tag.");
+
+            try
+            {
+                byte[] nA = cipherBytes[..12];
+                byte[] tA = cipherBytes[12..28];
+                byte[] cA = cipherBytes[28..];
+                byte[] plainA = DecryptWithNonceAndTag(key, nA, tA, cA, "Native-ChaCha20Poly1305");
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plainA,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"ChaCha20-Poly1305 (formato empaquetado nonce+tag+cipher) descifrado ({plainA.Length} bytes)."
+                };
+            }
+            catch
+            {
+                byte[] nB = cipherBytes[..12];
+                byte[] cB = cipherBytes[12..^16];
+                byte[] tB = cipherBytes[^16..];
+                byte[] plainB = DecryptWithNonceAndTag(key, nB, tB, cB, "Native-ChaCha20Poly1305");
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    OutputBytes = plainB,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"ChaCha20-Poly1305 (formato empaquetado nonce+cipher+tag) descifrado ({plainB.Length} bytes)."
+                };
+            }
         }
-        catch
+        finally
         {
-            // Layout B: [12B nonce][ciphertext][16B tag]
-            byte[] nB = cipherBytes[..12];
-            byte[] cB = cipherBytes[12..^16];
-            byte[] tB = cipherBytes[^16..];
-            byte[] plainB = DecryptWithNonceAndTag(key, nB, tB, cB, "Native-ChaCha20Poly1305");
-            return new CryptoOperationResult
-            {
-                AlgorithmCode = Info.Code,
-                OutputBytes = plainB,
-                SecretKeyBase64 = secretKeyBase64,
-                PublicParametersJson = publicParametersJson,
-                Summary = $"ChaCha20-Poly1305 (formato externo nonce+cipher+tag) descifrado ({plainB.Length} bytes)."
-            };
+            CryptographicOperations.ZeroMemory(key);
         }
     }
 
@@ -450,10 +521,7 @@ public sealed class ChaCha20Strategy : ICryptoStrategy
                 cc.Decrypt(nonce, cipherBytes, tag, plain);
                 return plain;
             }
-            catch when (string.IsNullOrEmpty(mode))
-            {
-                // Si no especificó modo, probar también el motor gestionado
-            }
+            catch when (string.IsNullOrEmpty(mode)) { }
         }
 
         byte[] expected = ComputeAuthTag(key, nonce, cipherBytes);
@@ -465,11 +533,18 @@ public sealed class ChaCha20Strategy : ICryptoStrategy
     private static byte[] ComputeAuthTag(byte[] key, byte[] nonce, byte[] cipher)
     {
         byte[] polyKey = ChaCha20Block(key, 0, nonce)[..32];
-        using var hmac = new HMACSHA256(polyKey);
-        byte[] input = new byte[nonce.Length + cipher.Length];
-        Buffer.BlockCopy(nonce, 0, input, 0, nonce.Length);
-        Buffer.BlockCopy(cipher, 0, input, nonce.Length, cipher.Length);
-        return hmac.ComputeHash(input)[..16];
+        try
+        {
+            using var hmac = new HMACSHA256(polyKey);
+            byte[] input = new byte[nonce.Length + cipher.Length];
+            Buffer.BlockCopy(nonce, 0, input, 0, nonce.Length);
+            Buffer.BlockCopy(cipher, 0, input, nonce.Length, cipher.Length);
+            return hmac.ComputeHash(input)[..16];
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(polyKey);
+        }
     }
 
     private static byte[] ChaCha20Transform(byte[] key, byte[] nonce, uint counter, byte[] data)
@@ -482,6 +557,7 @@ public sealed class ChaCha20Strategy : ICryptoStrategy
             int take = Math.Min(64, data.Length - offset);
             for (int i = 0; i < take; i++)
                 output[offset + i] = (byte)(data[offset + i] ^ block[i]);
+            CryptographicOperations.ZeroMemory(block);
             offset += take;
         }
         return output;

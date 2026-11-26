@@ -39,7 +39,7 @@ public sealed class FormLogin : Form
 
     public FormLogin()
     {
-        Text = "ModuloCrypto — NODO-01";
+        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} (Estándar v2.0)";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1024, 680);
@@ -96,8 +96,8 @@ public sealed class FormLogin : Form
         _previewHologram = new HologramLockControl
         {
             Dock = DockStyle.Fill,
-            ActiveAlgorithmLabel = "NODO-01",
-            StatusSubtitle = "Núcleo Criptográfico Holográfico • Listo"
+            ActiveAlgorithmLabel = NodeRuntimeState.CurrentNodeId,
+            StatusSubtitle = "Núcleo Criptográfico Holográfico v2.0 • Listo"
         };
 
         leftPanel.Controls.Add(_previewHologram);
@@ -309,7 +309,6 @@ public sealed class FormLogin : Form
         }
 
         AuthenticatedUser = auth;
-        NodeRuntimeState.CurrentNodeId = "NODO-01";
         DialogResult = DialogResult.OK;
         Close();
     }
@@ -320,7 +319,6 @@ public sealed class FormLogin : Form
         if (modal.ShowDialog(this) == DialogResult.OK && modal.RegisteredUser != null)
         {
             AuthenticatedUser = modal.RegisteredUser;
-            NodeRuntimeState.CurrentNodeId = "NODO-01";
             DialogResult = DialogResult.OK;
             Close();
         }

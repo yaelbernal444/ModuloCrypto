@@ -1,3 +1,4 @@
+using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
@@ -8,6 +9,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace ModuloCrypto;
@@ -17,17 +19,15 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        var (teamNumber, explicitPort) = ParseCliArgs(args);
+        NodeRuntimeState.ConfigureTeamAndPort(teamNumber, explicitPort);
+
         if (args.Contains("--selftest", StringComparer.OrdinalIgnoreCase))
             return RunSelfTest();
 
-        int apiPort = ParsePortArg(args, defaultPort: 5000);
-        NodeRuntimeState.ApiPort = apiPort;
-        var localPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p => p.NodeId == "NODO-01");
-        if (localPeer != null) localPeer.Port = apiPort;
-
         ApplicationConfiguration.Initialize();
 
-        // 1. Inicializar SQLite (ModuloCrypto.db) con EnsureCreated() (sin usuarios precreados)
+        // 1. Inicializar SQLite (ModuloCrypto.db) con EnsureCreated() (Usuarios, RegistrosCifrados, SolicitudesEntrantes, TrustedPeers, SeenPackets)
         try
         {
             AppDbContext.InitializeDatabase();
@@ -38,12 +38,12 @@ internal static class Program
             NodeRuntimeState.SqliteConnected = false;
             MessageBox.Show(
                 $"Error al inicializar la base de datos SQLite:\n{ex.Message}",
-                "ModuloCrypto — SQLite",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
 
-        // 2. Inicializar Certificado X.509 del Nodo (protegido con Windows DPAPI)
+        // 2. Inicializar Certificado X.509 RSA-2048 v2.0 (Vigencia 365 días, RSA-PSS-SHA256, protegido con DPAPI)
         try
         {
             NodeCertificateService.Initialize();
@@ -53,9 +53,13 @@ internal static class Program
             NodeRuntimeState.CertificateActive = false;
         }
 
-        // 3. Arrancar servidor ASP.NET Core Minimal API embebido en http://0.0.0.0:<apiPort>
+        // 3. Arrancar servidor ASP.NET Core Minimal API embebido en http://0.0.0.0:<ApiPort>
         var apiHost = new ApiHostService();
-        apiHost.StartAsync(apiPort).GetAwaiter().GetResult();
+        apiHost.StartAsync(NodeRuntimeState.ApiPort).GetAwaiter().GetResult();
+
+        // 4. Arrancar servicio de autodescubrimiento UDP en puerto 5099 (CC-BEACON cada 30s + beacon offline al cerrar)
+        var udpDiscovery = new UdpDiscoveryService();
+        udpDiscovery.Start();
 
         try
         {
@@ -73,208 +77,222 @@ internal static class Program
         }
         finally
         {
+            udpDiscovery.DisposeAsync().AsTask().GetAwaiter().GetResult();
             apiHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
         return 0;
     }
 
-    private static int ParsePortArg(string[] args, int defaultPort)
+    private static (int TeamNumber, int? ExplicitPort) ParseCliArgs(string[] args)
     {
+        int team = 1;
+        int? port = null;
+
         for (int i = 0; i < args.Length - 1; i++)
         {
-            if (args[i].Equals("--port", StringComparison.OrdinalIgnoreCase) &&
-                int.TryParse(args[i + 1], out int p) && p > 0 && p < 65536)
+            if (args[i].Equals("--team", StringComparison.OrdinalIgnoreCase) &&
+                int.TryParse(args[i + 1], out int t) && t is >= 1 and <= 99)
             {
-                return p;
+                team = t;
+            }
+            else if (args[i].Equals("--port", StringComparison.OrdinalIgnoreCase) &&
+                     int.TryParse(args[i + 1], out int p) && p is > 0 and < 65536)
+            {
+                port = p;
             }
         }
-        return defaultPort;
+
+        return (team, port);
     }
 
     private static int RunSelfTest()
     {
-        string tempDbPath = Path.Combine(Path.GetTempPath(), $"ModuloCrypto_SelfTest_{Guid.NewGuid():N}.db");
-        string? hybridZipPath = null;
-        string? centroZipPath = null;
-        string? unsignedZipPath = null;
-        string? autoDownloadedBinaryPath = null;
+        string tempDbPath = Path.Combine(Path.GetTempPath(), $"ModuloCrypto_SelfTest_v2_{Guid.NewGuid():N}.db");
+        string? packageZipPath = null;
+        string? resultZipPath = null;
+        string? forwardedZipPath = null;
+        string? multipartZipPath = null;
+        string? invalidZipPath = null;
 
         try
         {
-            // 1. Test de Seguridad (Bloque A): BD nueva vacía (Count == 0) + PBKDF2-SHA256
+            // 1. Verificar Punto 1: Identidad EQ01, puerto 5001 y Certificado X.509 v2.0
+            if (NodeRuntimeState.TeamNumber != 1 || NodeRuntimeState.CurrentNodeId != "EQ01" || NodeRuntimeState.ApiPort != 5001)
+                throw new Exception($"Identidad esperada EQ01:5001, actual {NodeRuntimeState.CurrentNodeId}:{NodeRuntimeState.ApiPort}");
+
+            var cert = NodeCertificateService.Initialize(forceRegenerate: true);
+            if (!cert.Subject.Contains("CN=EQ01", StringComparison.OrdinalIgnoreCase) ||
+                !cert.Subject.Contains("OU=Equipo 01", StringComparison.OrdinalIgnoreCase) ||
+                !cert.Subject.Contains("O=Centro de Ciberseguridad", StringComparison.OrdinalIgnoreCase) ||
+                !cert.Subject.Contains("C=MX", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception($"El Subject X.509 no cumple el formato v2.0: {cert.Subject}");
+            }
+
+            double validityDays = (cert.NotAfter.ToUniversalTime() - cert.NotBefore.ToUniversalTime()).TotalDays;
+            if (Math.Abs(validityDays - 365.0) > 0.05)
+                throw new Exception($"Vigencia X.509 esperada 365 días, actual: {validityDays:F2}");
+
+            if (cert.GetSerialNumber().Length < 8)
+                throw new Exception("El número de serie X.509 tiene menos de 64 bits (8 bytes).");
+
+            string thumb = NodeCertificateService.GetThumbprintSha256Hex();
+            if (!Regex.IsMatch(thumb, "^[0-9A-F]{64}$"))
+                throw new Exception($"Huella SHA-256 inválida (se esperan 64 HEX MAYÚSCULAS): {thumb}");
+
+            // 2. Verificar BD SQLite vacía sin usuarios precreados + PBKDF2-SHA256 + tablas TrustedPeers y SeenPackets
             AppDbContext.InitializeDatabase(tempDbPath);
             using (var checkDb = new AppDbContext(tempDbPath))
             {
-                int initialUsers = checkDb.Usuarios.Count();
-                if (initialUsers != 0)
-                    throw new Exception($"La BD nueva no inició vacía: contenía {initialUsers} usuario(s).");
+                if (checkDb.Usuarios.Count() != 0)
+                    throw new Exception("La BD SQLite nueva no inició vacía.");
             }
 
-            var reg = AuthService.Register(
-                "Operador Autoprueba",
-                "op_selftest",
-                "ClaveSegura!2026",
-                "NODO-01",
-                "Operador Tor",
-                tempDbPath);
+            var reg = AuthService.Register("Operador EQ01", "eq01_op", "ClaveSegura!2026", "EQ01", "Operador EQ01", tempDbPath);
+            if (!reg.Success || reg.User == null || !reg.User.PasswordHash.StartsWith("PBKDF2$", StringComparison.Ordinal))
+                throw new Exception("Fallo en registro PBKDF2-SHA256.");
 
-            if (!reg.Success || reg.User == null)
-                throw new Exception($"Fallo registro PBKDF2: {reg.Message}");
+            var authOk = AuthService.Authenticate("eq01_op", "ClaveSegura!2026", tempDbPath)
+                ?? throw new Exception("Fallo en autenticación PBKDF2-SHA256.");
 
-            if (!reg.User.PasswordHash.StartsWith("PBKDF2$", StringComparison.Ordinal))
-                throw new Exception("El hash de contraseña no utiliza el formato PBKDF2$<salt>$<hash>.");
+            // 3. Verificar Punto 2: CC-BEACON UDP 5099 <= 1024 bytes
+            var beacon = new CcBeaconMessage
+            {
+                Type = "CC-BEACON",
+                ProtocolVersion = "2.0",
+                NodeId = NodeRuntimeState.CurrentNodeId,
+                TeamNumber = NodeRuntimeState.TeamNumber,
+                Ip = NodeRuntimeState.LocalIpAddress,
+                HttpPort = NodeRuntimeState.ApiPort,
+                Status = "online",
+                Algorithms = NodeRuntimeState.OwnedAlgorithms.ToList(),
+                CertificateThumbprintSha256 = thumb
+            };
+            byte[] beaconBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(beacon));
+            if (beaconBytes.Length > 1024)
+                throw new Exception($"CC-BEACON supera los 1024 bytes ({beaconBytes.Length}).");
 
-            var authOk = AuthService.Authenticate("op_selftest", "ClaveSegura!2026", tempDbPath)
-                ?? throw new Exception("Fallo autenticación con credenciales PBKDF2 válidas.");
-
-            var authBad = AuthService.Authenticate("op_selftest", "ClaveIncorrecta", tempDbPath);
-            if (authBad != null)
-                throw new Exception("La autenticación aceptó una contraseña incorrecta.");
-
-            // 2. Identidad NODO-01 y Certificado X.509 con DPAPI
-            if (NodeRuntimeState.CurrentNodeId != "NODO-01")
-                throw new Exception($"CurrentNodeId esperado NODO-01, actual: {NodeRuntimeState.CurrentNodeId}");
-
-            NodeCertificateService.Initialize();
-            string pem = NodeCertificateService.ExportPublicCertPem();
-            if (!pem.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
-                throw new Exception("ExportPublicCertPem no generó formato PEM válido.");
-
-            // 3. Los 21 Algoritmos Oficiales
-            byte[] sample = Encoding.UTF8.GetBytes("ModuloCrypto-SelfTest-Payload-2026-TorMesh-DualProtocol!");
+            // 4. Verificar los 21 Algoritmos Oficiales en Local
+            byte[] sample = Encoding.UTF8.GetBytes("ModuloCrypto-Estándar-v2.0-EQ01-Payload-2026!");
             int passed = 0;
-
             foreach (var alg in CryptoCatalog.OfficialAlgorithms)
             {
                 var strat = CryptoCatalog.GetStrategy(alg.Code);
                 var enc = strat.Encrypt(sample, "clave-prueba");
                 var dec = strat.Decrypt(enc.OutputBytes, enc.SecretKeyBase64, enc.PublicParametersJson);
                 if (alg.IsReversible && !sample.SequenceEqual(dec.OutputBytes))
-                    throw new Exception($"Round-trip falló para {alg.Code}");
+                    throw new Exception($"Round-trip local falló para {alg.Code}");
                 passed++;
             }
 
-            // 4. Empaquetado .ZIP Híbrido Universal (5 archivos internos)
+            // 5. Verificar Punto 4: Hash canónico de publicParameters vacío y ordenado con StringComparer.Ordinal
+            string emptyParamsHash = PacketManifest.ComputePublicParametersSha256(new Dictionary<string, string>());
+            if (emptyParamsHash != PacketManifest.EmptySha256Lower)
+                throw new Exception($"Hash canónico vacío incorrecto: {emptyParamsHash}");
+
+            var sampleParams = new Dictionary<string, string>
+            {
+                ["zKey"] = "valorZ",
+                ["aKey"] = "valorA"
+            };
+            string expectedOrderedSha = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("aKey=valorA\nzKey=valorZ"))).ToLowerInvariant();
+            if (PacketManifest.ComputePublicParametersSha256(sampleParams) != expectedOrderedSha)
+                throw new Exception("Canonicalización StringComparer.Ordinal de publicParameters falló.");
+
+            // 6. Verificar Punto 3 y 4: Estructura estricta .ZIP v2.0 (3 archivos planos: datos.enc, certificado.pem, manifest.json)
             var aesRes = CryptoCatalog.GetStrategy("AESGCM").Encrypt(sample);
             var rec = new RegistroCifrado
             {
                 UsuarioId = authOk.Id,
-                PacketId = Guid.NewGuid().ToString(),
-                NombreArchivo = "test_hibrido.txt",
+                PacketId = Guid.NewGuid().ToString("D").ToLowerInvariant(),
+                NombreArchivo = "mensaje_v2.txt",
                 Extension = ".txt",
                 BytesCifrados = Convert.ToBase64String(aesRes.OutputBytes),
                 AlgoritmoCodigo = "AESGCM",
                 ParametrosPublicosJson = aesRes.PublicParametersJson,
                 LlaveSecretaBase64 = aesRes.SecretKeyBase64,
-                LinkDescifradoRemoto = NodeRuntimeState.BuildRemoteDecryptUrl("test"),
-                NodoRaiz = "NODO-01",
-                FirmaRaizBase64 = NodeCertificateService.SignDataPss(aesRes.OutputBytes),
-                RutaSaltosJson = "[\"NODO-01\"]",
+                NodoRaiz = "EQ01",
+                RutaSaltosJson = "[\"EQ01\"]",
                 Origen = "Local"
             };
 
-            hybridZipPath = PacketZipService.CreatePacketZip(rec, aesRes.OutputBytes);
-            using (var zipCheck = ZipFile.OpenRead(hybridZipPath))
+            packageZipPath = PacketZipService.CreatePacketZip(rec, aesRes.OutputBytes, packetType: "package");
+            using (var zPkg = ZipFile.OpenRead(packageZipPath))
             {
-                string[] requiredEntries = { "manifest.json", "datos.enc", "payload.bin", "certificado.pem", "root_cert.cer" };
-                foreach (string reqEntry in requiredEntries)
+                if (zPkg.Entries.Count != 3 ||
+                    zPkg.GetEntry("datos.enc") == null ||
+                    zPkg.GetEntry("certificado.pem") == null ||
+                    zPkg.GetEntry("manifest.json") == null)
                 {
-                    if (zipCheck.GetEntry(reqEntry) == null)
-                        throw new Exception($"El .zip híbrido no contiene la entrada requerida '{reqEntry}'.");
+                    throw new Exception("El paquete package v2.0 no contiene exactamente los 3 archivos planos requeridos.");
                 }
             }
 
-            var parsedHybrid = PacketZipService.ReadPacketZip(hybridZipPath);
-            if (!parsedHybrid.SignatureValid || !parsedHybrid.IntegrityValid || parsedHybrid.Manifest.NodoRaiz != "NODO-01")
-                throw new Exception("Verificación X.509 / SHA-256 del paquete .zip híbrido falló.");
+            var parsedPkg = PacketZipService.ReadPacketZip(packageZipPath, enforceStrictSignature: true);
+            if (!parsedPkg.SignatureValid || !parsedPkg.IntegrityValid || parsedPkg.Manifest.Version != "2.0")
+                throw new Exception("Falló la validación RSA-PSS-SHA256 de 11 campos en package v2.0.");
 
-            // 5. Simulación de paquete estricto de CentroCiberseguridad.Web (solo datos.enc, certificado.pem, manifest.json con RSA-PSS)
-            // y payload AES-GCM empaquetado [12B nonce][16B tag][ciphertext]
-            string extPass = "clave-aes-256-segura";
-            byte[] extKey = SHA256.HashData(Encoding.UTF8.GetBytes(extPass));
-            byte[] extNonce = RandomNumberGenerator.GetBytes(12);
-            byte[] extCipher = new byte[sample.Length];
-            byte[] extTag = new byte[16];
-            using (var aesExt = new AesGcm(extKey, 16))
-                aesExt.Encrypt(extNonce, sample, extCipher, extTag);
+            // 7. Verificar paquete result (RES_<NODEID>_... con resultado.enc, certificado.pem, manifest.json)
+            resultZipPath = PacketZipService.CreatePacketZip(rec, aesRes.OutputBytes, packetType: "result", operation: "inverse", requestId: rec.PacketId);
+            if (!Path.GetFileName(resultZipPath).StartsWith("RES_EQ01_AESGCM_", StringComparison.Ordinal))
+                throw new Exception($"Nomenclatura de result .zip inválida: {Path.GetFileName(resultZipPath)}");
 
-            byte[] packedDatosEnc = new byte[12 + 16 + extCipher.Length];
-            Buffer.BlockCopy(extNonce, 0, packedDatosEnc, 0, 12);
-            Buffer.BlockCopy(extTag, 0, packedDatosEnc, 12, 16);
-            Buffer.BlockCopy(extCipher, 0, packedDatosEnc, 28, extCipher.Length);
-
-            string extPacketId = Guid.NewGuid().ToString();
-            string extSha = Convert.ToHexString(SHA256.HashData(packedDatosEnc));
-            string extCanonical = $"{extPacketId}|AESGCM|{extSha}";
-            string extSigPss = NodeCertificateService.SignDataPss(Encoding.UTF8.GetBytes(extCanonical));
-
-            centroZipPath = Path.Combine(Path.GetTempPath(), $"CentroSim_{Guid.NewGuid():N}.zip");
-            using (var zc = ZipFile.Open(centroZipPath, ZipArchiveMode.Create))
+            using (var zRes = ZipFile.OpenRead(resultZipPath))
             {
-                var mEntry = zc.CreateEntry("manifest.json");
-                using (var sw = new StreamWriter(mEntry.Open(), new UTF8Encoding(false)))
-                {
-                    sw.Write(JsonSerializer.Serialize(new
-                    {
-                        version = "1.0",
-                        packetId = extPacketId,
-                        sourceNode = "NODO-02",
-                        algorithmCode = "AESGCM",
-                        originalFileName = "externo.txt",
-                        originalExtension = ".txt",
-                        encryptedSha256 = extSha,
-                        signatureAlgorithm = "RSA-PSS-SHA256",
-                        manifestSignatureBase64 = extSigPss
-                    }));
-                }
+                if (zRes.Entries.Count != 3 || zRes.GetEntry("resultado.enc") == null)
+                    throw new Exception("El paquete result v2.0 no contiene exactamente resultado.enc, certificado.pem y manifest.json.");
+            }
+            var parsedRes = PacketZipService.ReadPacketZip(resultZipPath, enforceStrictSignature: true);
+            if (!parsedRes.SignatureValid || parsedRes.Manifest.PacketType != "result")
+                throw new Exception("Falló la lectura del paquete result v2.0.");
 
-                var dEntry = zc.CreateEntry("datos.enc");
-                using (var ds = dEntry.Open())
-                    ds.Write(packedDatosEnc, 0, packedDatosEnc.Length);
-
-                var pEntry = zc.CreateEntry("certificado.pem");
-                using (var swP = new StreamWriter(pEntry.Open(), new UTF8Encoding(false)))
-                    swP.Write(pem);
+            // 8. Verificar Sección 9.6: RepackageForForwarding
+            forwardedZipPath = PacketZipService.RepackageForForwarding(packageZipPath);
+            var parsedFwd = PacketZipService.ReadPacketZip(forwardedZipPath, enforceStrictSignature: true);
+            if (!parsedFwd.SignatureValid ||
+                parsedFwd.Manifest.PacketId == parsedPkg.Manifest.PacketId ||
+                parsedFwd.Manifest.ProducerNode != parsedPkg.Manifest.ProducerNode ||
+                parsedFwd.Manifest.SourceNode != "EQ01" ||
+                parsedFwd.Manifest.EncryptedSha256 != parsedPkg.Manifest.EncryptedSha256)
+            {
+                throw new Exception("RepackageForForwarding (Sección 9.6) no conservó los campos del productor o no generó nuevo packetId.");
             }
 
-            var parsedCentro = PacketZipService.ReadPacketZip(centroZipPath);
-            if (!parsedCentro.SignatureValid || !parsedCentro.IntegrityValid || parsedCentro.Manifest.NodoRaiz != "NODO-02")
-                throw new Exception("Falló la lectura o verificación RSA-PSS del paquete simulado CentroCiberseguridad.Web.");
-
-            var decCentro = CryptoCatalog.GetStrategy("AESGCM").Decrypt(parsedCentro.PayloadBytes, extPass, "{}");
-            if (!sample.SequenceEqual(decCentro.OutputBytes))
-                throw new Exception("Falló el descifrado fallback de datos.enc empaquetado de CentroCiberseguridad.Web.");
-
-            // 6. Modo Tolerante sin Firma X.509
-            unsignedZipPath = Path.Combine(Path.GetTempPath(), $"UnsignedSim_{Guid.NewGuid():N}.zip");
-            using (var zu = ZipFile.Open(unsignedZipPath, ZipArchiveMode.Create))
+            // 9. Verificar soporte multipart (part-01.bin, part-02.bin)
+            byte[] multiBytes = PacketZipService.CreateMultipartInnerZip(new[]
             {
-                var mEntry = zu.CreateEntry("manifest.json");
-                using (var sw = new StreamWriter(mEntry.Open(), new UTF8Encoding(false)))
-                {
-                    sw.Write(JsonSerializer.Serialize(new
-                    {
-                        packetId = Guid.NewGuid().ToString(),
-                        algorithmCode = "AESGCM",
-                        originalFileName = "sin_firma.txt"
-                    }));
-                }
-                var dEntry = zu.CreateEntry("datos.enc");
-                using (var ds = dEntry.Open())
-                    ds.Write(packedDatosEnc, 0, packedDatosEnc.Length);
+                Encoding.UTF8.GetBytes("Fragmento-Shamir-01"),
+                Encoding.UTF8.GetBytes("Fragmento-Shamir-02"),
+                Encoding.UTF8.GetBytes("Fragmento-Shamir-03")
+            }, out var multiParts);
+            multipartZipPath = PacketZipService.CreatePacketZip(rec, multiBytes, multipartParts: multiParts);
+            var parsedMulti = PacketZipService.ReadPacketZip(multipartZipPath, enforceStrictSignature: true);
+            if (parsedMulti.Manifest.PayloadMode != "multipart" || parsedMulti.Manifest.Parts?.Count != 3)
+                throw new Exception("Falló validación de paquete multipart v2.0.");
+
+            // 10. Verificar rechazo E-ZIP-STRUCTURE ante .zip con 4 archivos o subcarpeta
+            invalidZipPath = Path.Combine(Path.GetTempPath(), $"InvalidV2_{Guid.NewGuid():N}.zip");
+            File.Copy(packageZipPath, invalidZipPath, true);
+            using (var zInv = ZipFile.Open(invalidZipPath, ZipArchiveMode.Update))
+            {
+                var extra = zInv.CreateEntry("extra.txt");
+                using var sw = new StreamWriter(extra.Open());
+                sw.Write("prohibido");
             }
 
-            var parsedUnsigned = PacketZipService.ReadPacketZip(unsignedZipPath);
-            if (parsedUnsigned.HasSignature || parsedUnsigned.SignatureValid || !parsedUnsigned.IntegrityValid)
-                throw new Exception("El modo tolerante sin firma X.509 no reportó el estado esperado.");
+            bool rejectedStructure = false;
+            try
+            {
+                PacketZipService.ReadPacketZip(invalidZipPath, enforceStrictSignature: true);
+            }
+            catch (PacketValidationException pve) when (pve.ErrorCode == "E-ZIP-STRUCTURE" && pve.HttpStatusCode == 400)
+            {
+                rejectedStructure = true;
+            }
+            if (!rejectedStructure)
+                throw new Exception("El validador no rechazó un .zip con 4 archivos con 400 E-ZIP-STRUCTURE.");
 
-            // 7. Descarga Automática de Archivos Binarios/Multimedia
-            byte[] fakePdf = new byte[] { 0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37, 0x0A };
-            autoDownloadedBinaryPath = FormDashboard.SaveDecryptedBinaryAutomatically(fakePdf, "documento_prueba.pdf", ".pdf");
-            if (!File.Exists(autoDownloadedBinaryPath) || !fakePdf.SequenceEqual(File.ReadAllBytes(autoDownloadedBinaryPath)))
-                throw new Exception("Falló la descarga automática de archivos binarios/multimedia.");
-
-            Console.WriteLine($"SELFTEST_OK: Node={NodeRuntimeState.CurrentNodeId}, EmptyDB=OK, PBKDF2=OK, DPAPI_X509=OK, HybridZIP=OK, CentroCompat=OK, TolerantUnsigned=OK, AutoDownloadBinary=OK, Algorithms={passed}/21");
+            Console.WriteLine($"SELFTEST_OK: Standard=v2.0, Node={NodeRuntimeState.CurrentNodeId}:{NodeRuntimeState.ApiPort}, X509_365d_RSAPSS=OK, UDP5099_Beacon=OK, Strict3FileZIP=OK, Canonical11FieldSig=OK, Forwarding9_6=OK, Multipart=OK, ZipSecurity=OK, Algorithms={passed}/21");
             return 0;
         }
         catch (Exception ex)
@@ -287,10 +305,11 @@ internal static class Program
             TryDeleteFile(tempDbPath);
             TryDeleteFile(tempDbPath + "-shm");
             TryDeleteFile(tempDbPath + "-wal");
-            TryDeleteFile(hybridZipPath);
-            TryDeleteFile(centroZipPath);
-            TryDeleteFile(unsignedZipPath);
-            TryDeleteFile(autoDownloadedBinaryPath);
+            TryDeleteFile(packageZipPath);
+            TryDeleteFile(resultZipPath);
+            TryDeleteFile(forwardedZipPath);
+            TryDeleteFile(multipartZipPath);
+            TryDeleteFile(invalidZipPath);
         }
     }
 

@@ -15,7 +15,7 @@ public class RegistroCifrado
 
     [Required]
     [MaxLength(64)]
-    public string PacketId { get; set; } = Guid.NewGuid().ToString();
+    public string PacketId { get; set; } = Guid.NewGuid().ToString("D").ToLowerInvariant();
 
     [Required]
     [MaxLength(260)]
@@ -25,7 +25,7 @@ public class RegistroCifrado
     public string Extension { get; set; } = ".txt";
 
     /// <summary>
-    /// Base64 de los bytes cifrados o ruta local del archivo cifrado.
+    /// Base64 de los bytes cifrados para operación local.
     /// </summary>
     [Required]
     public string BytesCifrados { get; set; } = string.Empty;
@@ -38,33 +38,33 @@ public class RegistroCifrado
     public string AlgoritmoCodigo { get; set; } = "AESGCM";
 
     /// <summary>
-    /// JSON con parámetros públicos (IV, Nonce, Tag GCM, Salt, parámetros modulares, etc.).
+    /// JSON plano con parámetros públicos (IV, Nonce, Tag GCM, etc.).
     /// </summary>
     public string ParametrosPublicosJson { get; set; } = "{}";
 
     /// <summary>
-    /// Llave secreta en Base64 para responder a peticiones de descifrado remoto.
+    /// Llave secreta en Base64 custodiada localmente en SQLite (nunca se envía en manifest.json; se referencia vía keyRef).
     /// </summary>
     public string LlaveSecretaBase64 { get; set; } = string.Empty;
 
     /// <summary>
-    /// Endpoint HTTP del nodo emisor para solicitar descifrado remoto.
+    /// Identificador de referencia de llave (keyRef.keyId) en el estándar v2.0.
     /// </summary>
-    [MaxLength(512)]
+    [MaxLength(128)]
     public string LinkDescifradoRemoto { get; set; } = string.Empty;
 
     [MaxLength(32)]
-    public string NodoRaiz { get; set; } = "NODO-01";
+    public string NodoRaiz { get; set; } = "EQ01";
 
     public string FirmaRaizBase64 { get; set; } = string.Empty;
 
     /// <summary>
-    /// Arreglo JSON con los nodos recorridos en la ruta tipo Tor (hopHistory).
+    /// Arreglo JSON con los nodos recorridos (trazabilidad).
     /// </summary>
-    public string RutaSaltosJson { get; set; } = "[\"NODO-01\"]";
+    public string RutaSaltosJson { get; set; } = "[\"EQ01\"]";
 
     /// <summary>
-    /// "Local" o "Recibido".
+    /// "Local", "Relay" o "Recibido".
     /// </summary>
     [Required]
     [MaxLength(24)]

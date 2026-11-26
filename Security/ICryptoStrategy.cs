@@ -2,10 +2,12 @@ namespace ModuloCrypto.Security;
 
 public sealed class CryptoAlgorithmInfo
 {
+    public int AlgorithmId { get; set; } = 1;
     public string Code { get; init; } = string.Empty;
     public string DisplayName { get; init; } = string.Empty;
     public string Category { get; init; } = string.Empty;
     public string Description { get; init; } = string.Empty;
+    public string OwnerNode { get; set; } = "EQ01";
     public bool IsReversible { get; init; } = true;
 
     public override string ToString() => $"{Code} — {DisplayName}";
