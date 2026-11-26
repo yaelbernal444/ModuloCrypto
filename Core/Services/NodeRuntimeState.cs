@@ -20,6 +20,7 @@ public static class NodeRuntimeState
     public static int? HttpsPort { get; set; }
     public static bool ApiOnline { get; set; }
     public static bool SqliteConnected { get; set; }
+    public static string SqliteDiagnostic { get; set; } = "Inicializando...";
     public static bool CertificateActive { get; set; }
     public static string LocalIpAddress { get; private set; } = DetectLocalIp();
     public static string SubnetBroadcastAddress { get; private set; } = DetectBroadcastAddress(LocalIpAddress);

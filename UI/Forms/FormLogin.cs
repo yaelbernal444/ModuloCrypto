@@ -85,10 +85,10 @@ public sealed class FormLogin : Form
         var lblTagline = new Label
         {
             Text = "RED DISTRIBUIDA DE 8 NODOS",
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Top,
-            Height = 28,
+            Height = 30,
             AutoEllipsis = false,
             TextAlign = ContentAlignment.MiddleLeft
         };
@@ -117,8 +117,8 @@ public sealed class FormLogin : Form
             Text = "Iniciar Sesión",
             Font = new Font("Segoe UI", 20f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(44, 42),
-            Size = new Size(400, 44),
+            Location = new Point(44, 38),
+            Size = new Size(400, 46),
             AutoEllipsis = false
         };
 
@@ -127,15 +127,15 @@ public sealed class FormLogin : Form
             Text = "Acceso al Nodo Criptográfico",
             Font = new Font("Segoe UI", 10.5f, FontStyle.Regular),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(44, 88),
-            Size = new Size(400, 26),
+            Location = new Point(44, 86),
+            Size = new Size(400, 28),
             AutoEllipsis = false
         };
 
-        var lblUser = CreateFieldLabel("USUARIO", 44, 142);
+        var lblUser = CreateFieldLabel("USUARIO", 44, 138);
         _txtUsername = new TextBox
         {
-            Location = new Point(44, 168),
+            Location = new Point(44, 164),
             Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
@@ -145,10 +145,10 @@ public sealed class FormLogin : Form
             PlaceholderText = "Ingresa tu usuario"
         };
 
-        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 224);
+        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 218);
         _txtPassword = new TextBox
         {
-            Location = new Point(44, 250),
+            Location = new Point(44, 244),
             Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
@@ -164,17 +164,18 @@ public sealed class FormLogin : Form
             Text = "",
             Font = new Font("Segoe UI", 9.2f),
             ForeColor = HologramTheme.Danger,
-            Location = new Point(44, 300),
-            Size = new Size(395, 28)
+            Location = new Point(44, 292),
+            Size = new Size(395, 36)
         };
 
         var btnLogin = new NeonButton
         {
             Text = "Iniciar Sesión",
             Variant = NeonButtonVariant.Primary,
-            Location = new Point(44, 344),
+            AutoFitWidth = false,
+            Location = new Point(44, 340),
             Size = new Size(395, 46),
-            Font = new Font("Segoe UI Semibold", 10.5f, FontStyle.Bold)
+            Font = new Font("Segoe UI", 10.2f, FontStyle.Bold)
         };
         btnLogin.Click += (_, _) => HandleLogin();
 
@@ -182,9 +183,10 @@ public sealed class FormLogin : Form
         {
             Text = "Registrar Nuevo Integrante",
             Variant = NeonButtonVariant.Secondary,
-            Location = new Point(44, 404),
-            Size = new Size(395, 44),
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold)
+            AutoFitWidth = false,
+            Location = new Point(44, 400),
+            Size = new Size(395, 46),
+            Font = new Font("Segoe UI", 9.8f, FontStyle.Bold)
         };
         btnRegister.Click += (_, _) => OpenRegisterModal();
 
@@ -225,10 +227,10 @@ public sealed class FormLogin : Form
     private static Label CreateFieldLabel(string text, int x, int y) => new()
     {
         Text = text,
-        Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold),
+        Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
         ForeColor = HologramTheme.HologramViolet,
         Location = new Point(x, y),
-        Size = new Size(395, 22)
+        Size = new Size(395, 24)
     };
 
     private void CenterCard()

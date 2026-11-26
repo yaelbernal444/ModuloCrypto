@@ -12,6 +12,9 @@ public class StatusPill : Control
     private Color _dotColor = HologramTheme.Success;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public int MinimumWidth { get; set; } = 135;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public bool IsActive
     {
         get => _isActive;
@@ -29,30 +32,40 @@ public class StatusPill : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         Height = 32;
-        Width = 200;
+        Width = 180;
         BackColor = HologramTheme.PanelGlass;
-        Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold);
+        Font = new Font("Segoe UI", 8.8f, FontStyle.Bold);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        AutoAdjustWidth();
     }
 
     protected override void OnTextChanged(EventArgs e)
     {
         base.OnTextChanged(e);
         AutoAdjustWidth();
+        Invalidate();
     }
 
     protected override void OnFontChanged(EventArgs e)
     {
         base.OnFontChanged(e);
         AutoAdjustWidth();
+        Invalidate();
     }
 
-    private void AutoAdjustWidth()
+    public void AutoAdjustWidth()
     {
         if (string.IsNullOrEmpty(Text)) return;
-        Size measured = TextRenderer.MeasureText(Text, Font);
-        int needed = measured.Width + 42;
-        if (Width < needed)
-            Width = needed;
+        Size measured = TextRenderer.MeasureText(
+            Text,
+            Font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        Width = Math.Max(MinimumWidth, measured.Width + 44);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -80,8 +93,13 @@ public class StatusPill : Control
         using (var dot = new SolidBrush(_dotColor))
             g.FillEllipse(dot, 12, cy - 4, 8, 8);
 
-        var textRect = new Rectangle(26, 0, Width - 30, Height);
-        TextRenderer.DrawText(g, Text, Font, textRect, HologramTheme.TextPrimary,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        var textRect = new Rectangle(28, 0, Width - 36, Height);
+        TextRenderer.DrawText(
+            g,
+            Text,
+            Font,
+            textRect,
+            HologramTheme.TextPrimary,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
     }
 }

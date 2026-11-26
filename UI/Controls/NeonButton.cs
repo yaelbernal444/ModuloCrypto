@@ -19,12 +19,20 @@ public class NeonButton : Control
 {
     private bool _hovered;
     private bool _pressed;
+    private bool _isTruncated;
+    private readonly ToolTip _toolTip = new();
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public NeonButtonVariant Variant { get; set; } = NeonButtonVariant.Primary;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int CornerRadius { get; set; } = 10;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool AutoFitWidth { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public int HorizontalTextPadding { get; set; } = 16;
 
     public NeonButton()
     {
@@ -34,8 +42,44 @@ public class NeonButton : Control
         Cursor = Cursors.Hand;
         Size = new Size(160, 40);
         BackColor = HologramTheme.PanelGlass;
-        Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
+        Font = new Font("Segoe UI", 9.2f, FontStyle.Bold);
         ForeColor = HologramTheme.TextPrimary;
+    }
+
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        Size measured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(Text) ? " " : Text,
+            Font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+
+        int prefWidth = measured.Width + (HorizontalTextPadding * 2) + 12;
+        int prefHeight = Math.Max(36, measured.Height + 14);
+        return new Size(prefWidth, prefHeight);
+    }
+
+    public void FitToText(int minWidth = 100, int height = 36)
+    {
+        Size pref = GetPreferredSize(Size.Empty);
+        Width = Math.Max(minWidth, pref.Width);
+        Height = Math.Max(32, height);
+    }
+
+    protected override void OnTextChanged(EventArgs e)
+    {
+        base.OnTextChanged(e);
+        if (AutoFitWidth)
+            FitToText(MinimumSize.Width > 0 ? MinimumSize.Width : 100, Height);
+        Invalidate();
+    }
+
+    protected override void OnFontChanged(EventArgs e)
+    {
+        base.OnFontChanged(e);
+        if (AutoFitWidth)
+            FitToText(MinimumSize.Width > 0 ? MinimumSize.Width : 100, Height);
+        Invalidate();
     }
 
     protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
@@ -111,12 +155,34 @@ public class NeonButton : Control
         using (var pen = new Pen(Enabled ? border : HologramTheme.BorderSubtle, 1.2f))
             g.DrawPath(pen, path);
 
+        var textRect = Rectangle.Inflate(rect, -10, -2);
+        if (textRect.Width > 0 && !string.IsNullOrEmpty(Text))
+        {
+            Size measured = TextRenderer.MeasureText(g, Text, Font, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+            bool nowTruncated = measured.Width > textRect.Width;
+            if (nowTruncated != _isTruncated)
+            {
+                _isTruncated = nowTruncated;
+                _toolTip.SetToolTip(this, nowTruncated ? Text : null);
+            }
+        }
+
         TextRenderer.DrawText(
             g,
             Text,
             Font,
-            rect,
+            textRect,
             Enabled ? ForeColor : HologramTheme.TextSecondary,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _toolTip.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }

@@ -1,6 +1,8 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
+using System.Data;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -8,7 +10,7 @@ namespace ModuloCrypto.Core.Data;
 
 public class AppDbContext : DbContext
 {
-    public static readonly string DatabasePath = Path.Combine(AppContext.BaseDirectory, "ModuloCrypto.db");
+    public static string DatabasePath { get; private set; } = ResolveWritableDatabasePath();
 
     private readonly string _connectionDbPath;
 
@@ -28,11 +30,49 @@ public class AppDbContext : DbContext
     public DbSet<PeerNode> TrustedPeers => Set<PeerNode>();
     public DbSet<SeenPacketEntity> SeenPackets => Set<SeenPacketEntity>();
 
+    public static string BuildSqliteConnectionString(string dbPath)
+    {
+        string fullPath = Path.GetFullPath(dbPath);
+        string? dir = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrWhiteSpace(dir))
+            Directory.CreateDirectory(dir);
+
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = fullPath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Shared,
+            DefaultTimeout = 10
+        };
+        return builder.ToString();
+    }
+
+    private static string ResolveWritableDatabasePath()
+    {
+        string primaryDir = AppContext.BaseDirectory;
+        try
+        {
+            Directory.CreateDirectory(primaryDir);
+            string probeFile = Path.Combine(primaryDir, $".write_probe_{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(probeFile, "ok");
+            File.Delete(probeFile);
+            return Path.Combine(primaryDir, "ModuloCrypto.db");
+        }
+        catch
+        {
+            string fallbackDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ModuloCrypto");
+            Directory.CreateDirectory(fallbackDir);
+            return Path.Combine(fallbackDir, "ModuloCrypto.db");
+        }
+    }
+
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         if (!optionsBuilder.IsConfigured)
         {
-            optionsBuilder.UseSqlite($"Data Source={_connectionDbPath}");
+            optionsBuilder.UseSqlite(BuildSqliteConnectionString(_connectionDbPath));
         }
     }
 
@@ -77,20 +117,89 @@ public class AppDbContext : DbContext
     }
 
     /// <summary>
-    /// Inicializa el esquema SQLite v2.0 (sin sembrar usuarios por defecto) y asegura las tablas TrustedPeers y SeenPackets.
+    /// Inicializa y migra idempotentemente el esquema SQLite (con PRAGMAs WAL, verificación de todas las tablas y columnas
+    /// y recuperación automática con respaldo .bak si la base de datos previa estuviera corrupta).
     /// </summary>
     public static void InitializeDatabase(string? customDatabasePath = null)
     {
-        using var db = new AppDbContext(customDatabasePath ?? DatabasePath);
-        db.Database.EnsureCreated();
+        string targetPath = string.IsNullOrWhiteSpace(customDatabasePath) ? DatabasePath : customDatabasePath;
 
         try
         {
-            db.Database.ExecuteSqlRaw("ALTER TABLE Usuarios ADD COLUMN NombreCompleto TEXT NOT NULL DEFAULT '';");
+            ApplySchemaAndMigrations(targetPath);
         }
-        catch { }
+        catch
+        {
+            // Recuperación segura ante BD corrupta o esquema incompatible: respaldar como .bak.<timestamp> y recrear limpia
+            BackupAndRecreateCorruptDatabase(targetPath);
+            ApplySchemaAndMigrations(targetPath);
+        }
 
-        // Crear tablas nuevas v2.0 si la base de datos ya existía de una versión previa
+        if (customDatabasePath == null)
+        {
+            bool ok = TestConnection(out string diag, targetPath);
+            NodeRuntimeState.SqliteConnected = ok;
+            NodeRuntimeState.SqliteDiagnostic = diag;
+        }
+    }
+
+    private static void ApplySchemaAndMigrations(string targetPath)
+    {
+        using var db = new AppDbContext(targetPath);
+
+        // 1. EnsureCreated inicial
+        db.Database.EnsureCreated();
+
+        // 2. Activar PRAGMAs de estabilidad y concurrencia
+        db.Database.ExecuteSqlRaw("PRAGMA journal_mode = WAL;");
+        db.Database.ExecuteSqlRaw("PRAGMA busy_timeout = 5000;");
+        db.Database.ExecuteSqlRaw("PRAGMA foreign_keys = ON;");
+
+        // 3. CREATE TABLE IF NOT EXISTS para todas las tablas del contexto
+        db.Database.ExecuteSqlRaw(@"
+            CREATE TABLE IF NOT EXISTS Usuarios (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                NombreCompleto TEXT NOT NULL DEFAULT '',
+                NombreUsuario TEXT NOT NULL UNIQUE,
+                PasswordHash TEXT NOT NULL DEFAULT '',
+                NodoAsignado TEXT NOT NULL DEFAULT 'EQ01',
+                Rol TEXT NOT NULL DEFAULT 'Operador EQ01',
+                FechaRegistro TEXT NOT NULL DEFAULT ''
+            );");
+
+        db.Database.ExecuteSqlRaw(@"
+            CREATE TABLE IF NOT EXISTS RegistrosCifrados (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                UsuarioId INTEGER NOT NULL DEFAULT 0,
+                PacketId TEXT NOT NULL DEFAULT '',
+                NombreArchivo TEXT NOT NULL DEFAULT '',
+                Extension TEXT NOT NULL DEFAULT '.txt',
+                BytesCifrados TEXT NOT NULL DEFAULT '',
+                AlgoritmoCodigo TEXT NOT NULL DEFAULT 'AESGCM',
+                ParametrosPublicosJson TEXT NOT NULL DEFAULT '{{}}',
+                LlaveSecretaBase64 TEXT NOT NULL DEFAULT '',
+                LinkDescifradoRemoto TEXT NOT NULL DEFAULT '',
+                NodoRaiz TEXT NOT NULL DEFAULT 'EQ01',
+                FirmaRaizBase64 TEXT NOT NULL DEFAULT '',
+                RutaSaltosJson TEXT NOT NULL DEFAULT '[""EQ01""]',
+                Origen TEXT NOT NULL DEFAULT 'Local',
+                FechaOperacion TEXT NOT NULL DEFAULT ''
+            );");
+
+        db.Database.ExecuteSqlRaw(@"
+            CREATE TABLE IF NOT EXISTS SolicitudesEntrantes (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                PacketId TEXT NOT NULL DEFAULT '',
+                NodoOrigen TEXT NOT NULL DEFAULT '',
+                IpOrigen TEXT NOT NULL DEFAULT '',
+                NombreZip TEXT NOT NULL DEFAULT '',
+                AlgoritmoCodigo TEXT NOT NULL DEFAULT '',
+                FirmaX509Valida INTEGER NOT NULL DEFAULT 0,
+                RutaZipTemporal TEXT NOT NULL DEFAULT '',
+                Estado TEXT NOT NULL DEFAULT 'Pendiente',
+                FechaRecepcion TEXT NOT NULL DEFAULT ''
+            );");
+
         db.Database.ExecuteSqlRaw(@"
             CREATE TABLE IF NOT EXISTS TrustedPeers (
                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +231,69 @@ public class AppDbContext : DbContext
                 ReceivedAtUtc TEXT NOT NULL DEFAULT ''
             );");
 
-        // Migrar nodo asignado de usuarios existentes al formato EQ01
+        // 4. Asegurar todas las columnas de cada tabla consultando PRAGMA table_info
+        EnsureColumnExists(db, "Usuarios", "NombreCompleto", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "Usuarios", "NombreUsuario", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "Usuarios", "PasswordHash", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "Usuarios", "NodoAsignado", "TEXT NOT NULL DEFAULT 'EQ01'");
+        EnsureColumnExists(db, "Usuarios", "Rol", "TEXT NOT NULL DEFAULT 'Operador EQ01'");
+        EnsureColumnExists(db, "Usuarios", "FechaRegistro", "TEXT NOT NULL DEFAULT ''");
+
+        EnsureColumnExists(db, "RegistrosCifrados", "UsuarioId", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumnExists(db, "RegistrosCifrados", "PacketId", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "NombreArchivo", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "Extension", "TEXT NOT NULL DEFAULT '.txt'");
+        EnsureColumnExists(db, "RegistrosCifrados", "BytesCifrados", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "AlgoritmoCodigo", "TEXT NOT NULL DEFAULT 'AESGCM'");
+        EnsureColumnExists(db, "RegistrosCifrados", "ParametrosPublicosJson", "TEXT NOT NULL DEFAULT '{}'");
+        EnsureColumnExists(db, "RegistrosCifrados", "LlaveSecretaBase64", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "LinkDescifradoRemoto", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "NodoRaiz", "TEXT NOT NULL DEFAULT 'EQ01'");
+        EnsureColumnExists(db, "RegistrosCifrados", "FirmaRaizBase64", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "RegistrosCifrados", "RutaSaltosJson", "TEXT NOT NULL DEFAULT '[\"EQ01\"]'");
+        EnsureColumnExists(db, "RegistrosCifrados", "Origen", "TEXT NOT NULL DEFAULT 'Local'");
+        EnsureColumnExists(db, "RegistrosCifrados", "FechaOperacion", "TEXT NOT NULL DEFAULT ''");
+
+        EnsureColumnExists(db, "SolicitudesEntrantes", "PacketId", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "NodoOrigen", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "IpOrigen", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "NombreZip", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "AlgoritmoCodigo", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "FirmaX509Valida", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "RutaZipTemporal", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "Estado", "TEXT NOT NULL DEFAULT 'Pendiente'");
+        EnsureColumnExists(db, "SolicitudesEntrantes", "FechaRecepcion", "TEXT NOT NULL DEFAULT ''");
+
+        EnsureColumnExists(db, "TrustedPeers", "TeamNumber", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumnExists(db, "TrustedPeers", "IpAddress", "TEXT NOT NULL DEFAULT '127.0.0.1'");
+        EnsureColumnExists(db, "TrustedPeers", "Port", "INTEGER NOT NULL DEFAULT 5001");
+        EnsureColumnExists(db, "TrustedPeers", "HttpsPort", "INTEGER NULL");
+        EnsureColumnExists(db, "TrustedPeers", "RoleLabel", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "TrustedPeers", "ProtocolType", "TEXT NOT NULL DEFAULT 'v2.0'");
+        EnsureColumnExists(db, "TrustedPeers", "Source", "TEXT NOT NULL DEFAULT 'manual'");
+        EnsureColumnExists(db, "TrustedPeers", "Status", "TEXT NOT NULL DEFAULT 'offline'");
+        EnsureColumnExists(db, "TrustedPeers", "LastLatency", "TEXT NOT NULL DEFAULT '--'");
+        EnsureColumnExists(db, "TrustedPeers", "CertThumbprint", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "TrustedPeers", "PinnedThumbprintSha256", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "TrustedPeers", "CertificatePem", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "TrustedPeers", "AlgorithmsJson", "TEXT NOT NULL DEFAULT '[]'");
+        EnsureColumnExists(db, "TrustedPeers", "IsConfirmed", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumnExists(db, "TrustedPeers", "HasThumbprintMismatch", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumnExists(db, "TrustedPeers", "LastSeenUtc", "TEXT NOT NULL DEFAULT ''");
+
+        EnsureColumnExists(db, "SeenPackets", "SourceNode", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SeenPackets", "PacketTimestampUtc", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumnExists(db, "SeenPackets", "ReceivedAtUtc", "TEXT NOT NULL DEFAULT ''");
+
+        // 5. Validar conexión y consulta real sobre las entidades
+        if (!db.Database.CanConnect())
+            throw new InvalidOperationException("SQLite CanConnect() devolvió false.");
+
+        _ = db.Usuarios.Count();
+        _ = db.RegistrosCifrados.Count();
+        _ = db.SolicitudesEntrantes.Count();
+
+        // Actualizar usuarios previos al formato EQ01
         if (db.Usuarios.Any())
         {
             bool changed = false;
@@ -142,10 +313,97 @@ public class AppDbContext : DbContext
             if (changed) db.SaveChanges();
         }
 
-        // Cargar nodos persistidos (TOFU) en memoria si estamos en la BD principal
-        if (customDatabasePath == null)
+        if (targetPath == DatabasePath)
         {
             LoadPersistedPeersIntoRuntime(db);
+        }
+    }
+
+    public static void EnsureColumnExists(AppDbContext db, string table, string column, string sqlDefinition)
+    {
+        var conn = db.Database.GetDbConnection();
+        bool wasClosed = conn.State != ConnectionState.Open;
+        if (wasClosed) conn.Open();
+
+        try
+        {
+            bool exists = false;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"PRAGMA table_info(\"{table}\");";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    string colName = reader.GetString(1);
+                    if (string.Equals(colName, column, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!exists)
+            {
+                using var alterCmd = conn.CreateCommand();
+                alterCmd.CommandText = $"ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {sqlDefinition};";
+                alterCmd.ExecuteNonQuery();
+            }
+        }
+        finally
+        {
+            if (wasClosed && conn.State == ConnectionState.Open)
+                conn.Close();
+        }
+    }
+
+    private static void BackupAndRecreateCorruptDatabase(string targetPath)
+    {
+        try
+        {
+            SqliteConnection.ClearAllPools();
+            if (File.Exists(targetPath))
+            {
+                string backupPath = $"{targetPath}.bak.{DateTime.Now:yyyyMMdd_HHmmss}";
+                File.Move(targetPath, backupPath, overwrite: true);
+            }
+            if (File.Exists(targetPath + "-shm")) File.Delete(targetPath + "-shm");
+            if (File.Exists(targetPath + "-wal")) File.Delete(targetPath + "-wal");
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Ejecuta SELECT 1 y verifica el modo WAL sobre SQLite, devolviendo el diagnóstico real.
+    /// </summary>
+    public static bool TestConnection(out string diagnostic, string? customDatabasePath = null)
+    {
+        string targetPath = string.IsNullOrWhiteSpace(customDatabasePath) ? DatabasePath : customDatabasePath;
+        try
+        {
+            using var conn = new SqliteConnection(BuildSqliteConnectionString(targetPath));
+            conn.Open();
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT 1;";
+            object? scalar = cmd.ExecuteScalar();
+            if (Convert.ToInt32(scalar) != 1)
+            {
+                diagnostic = $"Respuesta inesperada de SELECT 1 en {targetPath}";
+                return false;
+            }
+
+            using var walCmd = conn.CreateCommand();
+            walCmd.CommandText = "PRAGMA journal_mode;";
+            string journalMode = (walCmd.ExecuteScalar()?.ToString() ?? "wal").ToUpperInvariant();
+
+            diagnostic = $"Conectado (Modo {journalMode} activo) • {targetPath}";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            diagnostic = $"Error SQLite ({targetPath}): {ex.Message}";
+            return false;
         }
     }
 

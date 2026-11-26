@@ -27,15 +27,17 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
 
-        // 1. Inicializar SQLite (ModuloCrypto.db) con EnsureCreated() (Usuarios, RegistrosCifrados, SolicitudesEntrantes, TrustedPeers, SeenPackets)
+        // 1. Inicializar SQLite (ModuloCrypto.db) con WAL, auto-migración idempotente y verificación real TestConnection
         try
         {
             AppDbContext.InitializeDatabase();
-            NodeRuntimeState.SqliteConnected = true;
+            NodeRuntimeState.SqliteConnected = AppDbContext.TestConnection(out var dbDiag);
+            NodeRuntimeState.SqliteDiagnostic = dbDiag;
         }
         catch (Exception ex)
         {
             NodeRuntimeState.SqliteConnected = false;
+            NodeRuntimeState.SqliteDiagnostic = ex.Message;
             MessageBox.Show(
                 $"Error al inicializar la base de datos SQLite:\n{ex.Message}",
                 $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}",
@@ -140,8 +142,13 @@ internal static class Program
             if (!Regex.IsMatch(thumb, "^[0-9A-F]{64}$"))
                 throw new Exception($"Huella SHA-256 inválida (se esperan 64 HEX MAYÚSCULAS): {thumb}");
 
-            // 2. Verificar BD SQLite vacía sin usuarios precreados + PBKDF2-SHA256 + tablas TrustedPeers y SeenPackets
+            // 2. Verificar BD SQLite vacía sin usuarios precreados + modo WAL + PBKDF2-SHA256 + tablas TrustedPeers y SeenPackets
             AppDbContext.InitializeDatabase(tempDbPath);
+            if (!AppDbContext.TestConnection(out var sqliteDiag, tempDbPath) ||
+                !sqliteDiag.Contains("WAL", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception($"Falló TestConnection SQLite WAL: {sqliteDiag}");
+            }
             using (var checkDb = new AppDbContext(tempDbPath))
             {
                 if (checkDb.Usuarios.Count() != 0)

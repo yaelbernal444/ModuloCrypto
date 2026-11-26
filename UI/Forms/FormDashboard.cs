@@ -33,6 +33,11 @@ public partial class FormDashboard : Form
 
     private readonly Usuario _currentUser;
     private readonly string _userFullName;
+    private readonly ToolTip _dashboardToolTip = new();
+    private readonly Font _logoGlyphFont = new("Segoe UI Symbol", 15f, FontStyle.Bold);
+    private readonly Font _logoTitleFont = new("Segoe UI", 14f, FontStyle.Bold);
+    private readonly Font _logoSubFont = new("Cascadia Mono", 7.8f, FontStyle.Bold);
+    private readonly Font _avatarInitialsFont = new("Segoe UI", 11f, FontStyle.Bold);
 
     // Navigation & Shell
     private readonly Dictionary<string, SidebarNavButton> _navButtons = new();
@@ -99,6 +104,10 @@ public partial class FormDashboard : Form
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
 
+        // Verificar conexión real a SQLite al abrir el Dashboard
+        NodeRuntimeState.SqliteConnected = AppDbContext.TestConnection(out string diag);
+        NodeRuntimeState.SqliteDiagnostic = diag;
+
         BuildShellLayout();
         BuildDashboardCryptoView();
         BuildSolicitudesView();
@@ -106,6 +115,7 @@ public partial class FormDashboard : Form
         BuildNetworkView();
         BuildSettingsView();
 
+        UpdateSqlitePillState();
         SwitchView("dashboard");
         RefreshPendingSolicitudesBadge();
         RefreshAllDataViews();
@@ -117,15 +127,30 @@ public partial class FormDashboard : Form
         {
             NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
             NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
+            _dashboardToolTip.Dispose();
+            _logoGlyphFont.Dispose();
+            _logoTitleFont.Dispose();
+            _logoSubFont.Dispose();
+            _avatarInitialsFont.Dispose();
         };
+    }
+
+    private void UpdateSqlitePillState()
+    {
+        if (_pillSqlite == null) return;
+        _pillSqlite.Text = NodeRuntimeState.SqliteConnected ? "SQLite: Conectado" : "SQLite: Error";
+        _pillSqlite.IsActive = NodeRuntimeState.SqliteConnected;
+        _pillSqlite.AutoAdjustWidth();
+        _dashboardToolTip.SetToolTip(_pillSqlite, $"BD: {AppDbContext.DatabasePath}\nDiagnóstico: {NodeRuntimeState.SqliteDiagnostic}");
     }
 
     private void BuildShellLayout()
     {
+        // 1. Sidebar Izquierdo (274 px de ancho para holgura total en High-DPI)
         var sidebar = new Panel
         {
             Dock = DockStyle.Left,
-            Width = 260,
+            Width = 274,
             BackColor = HologramTheme.PanelGlass,
             Padding = new Padding(0)
         };
@@ -151,25 +176,26 @@ public partial class FormDashboard : Form
             using var path = HologramTheme.CreateRoundedPath(iconRect, 10);
             using var brush = new LinearGradientBrush(iconRect, HologramTheme.AccentStart, HologramTheme.HologramCyan, 135f);
             g.FillPath(brush, path);
-            TextRenderer.DrawText(g, "◈", new Font("Segoe UI Symbol", 15f, FontStyle.Bold), iconRect, Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(g, "◈", _logoGlyphFont, iconRect, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
-            TextRenderer.DrawText(g, "ModuloCrypto", new Font("Segoe UI", 14f, FontStyle.Bold),
-                new Rectangle(62, 18, 190, 26), HologramTheme.TextPrimary,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextRenderer.DrawText(g, "ModuloCrypto", _logoTitleFont,
+                new Rectangle(62, 18, 200, 26), HologramTheme.TextPrimary,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
 
-            TextRenderer.DrawText(g, $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}", new Font("Cascadia Mono", 7.8f, FontStyle.Bold),
-                new Rectangle(62, 45, 190, 18), HologramTheme.HologramCyan,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextRenderer.DrawText(g, $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}", _logoSubFont,
+                new Rectangle(62, 45, 200, 18), HologramTheme.HologramCyan,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
 
             using var sepPen = new Pen(HologramTheme.BorderSubtle, 1f);
             g.DrawLine(sepPen, 16, logoPanel.Height - 1, logoPanel.Width - 16, logoPanel.Height - 1);
         };
 
+        // Tarjeta de Perfil Inferior con TableLayoutPanel interno para cero encimamientos
         var profileWrap = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 152,
+            Height = 160,
             Padding = new Padding(12, 8, 12, 14),
             BackColor = HologramTheme.PanelGlass
         };
@@ -181,55 +207,16 @@ public partial class FormDashboard : Form
             FillColorBottom = HologramTheme.PanelGlass,
             BorderColor = HologramTheme.AccentStart,
             NeonBorderGlow = true,
-            Padding = new Padding(12)
-        };
-        profileCard.Paint += (_, e) =>
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            var avRect = new Rectangle(12, 14, 42, 42);
-            using var avBrush = new LinearGradientBrush(avRect, HologramTheme.AccentStart, HologramTheme.HologramCyan, 135f);
-            g.FillEllipse(avBrush, avRect);
-            using var ringPen = new Pen(HologramTheme.HologramCyan, 1.5f);
-            g.DrawEllipse(ringPen, avRect);
-
-            string initials = BuildInitials(_userFullName);
-            TextRenderer.DrawText(g, initials, new Font("Segoe UI", 11.5f, FontStyle.Bold), avRect, Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-
-            using var dotGlow = new SolidBrush(Color.FromArgb(90, HologramTheme.Success));
-            g.FillEllipse(dotGlow, 42, 44, 14, 14);
-            using var dot = new SolidBrush(HologramTheme.Success);
-            g.FillEllipse(dot, 45, 47, 8, 8);
+            Padding = new Padding(12, 10, 12, 10)
         };
 
-        var lblProfName = new Label
-        {
-            Text = _userFullName,
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
-            ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(62, 14),
-            Size = new Size(164, 22),
-            BackColor = HologramTheme.PanelGlassLight,
-            AutoEllipsis = true
-        };
-        var lblProfStatus = new Label
-        {
-            Text = $"● Online • {NodeRuntimeState.CurrentNodeId}",
-            Font = new Font("Cascadia Mono", 8.2f, FontStyle.Bold),
-            ForeColor = HologramTheme.Success,
-            Location = new Point(62, 38),
-            Size = new Size(164, 20),
-            BackColor = HologramTheme.PanelGlassLight
-        };
         var btnLogout = new NeonButton
         {
             Text = "Cerrar Sesión",
             Variant = NeonButtonVariant.Secondary,
-            Location = new Point(12, 78),
-            Size = new Size(210, 36),
-            CornerRadius = 9,
-            Font = new Font("Segoe UI Semibold", 9.2f, FontStyle.Bold)
+            Dock = DockStyle.Bottom,
+            Height = 34,
+            CornerRadius = 9
         };
         btnLogout.Click += (_, _) =>
         {
@@ -237,7 +224,84 @@ public partial class FormDashboard : Form
             Close();
         };
 
-        profileCard.Controls.AddRange(new Control[] { lblProfName, lblProfStatus, btnLogout });
+        var profileInfoTable = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 3,
+            BackColor = HologramTheme.PanelGlassLight,
+            Padding = new Padding(0, 0, 0, 6)
+        };
+        profileInfoTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 52f));
+        profileInfoTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 22f));
+        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 20f));
+        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+
+        var avatarBox = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = HologramTheme.PanelGlassLight
+        };
+        avatarBox.Paint += (_, e) =>
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var avRect = new Rectangle(2, 4, 42, 42);
+            using var avBrush = new LinearGradientBrush(avRect, HologramTheme.AccentStart, HologramTheme.HologramCyan, 135f);
+            g.FillEllipse(avBrush, avRect);
+            using var ringPen = new Pen(HologramTheme.HologramCyan, 1.5f);
+            g.DrawEllipse(ringPen, avRect);
+
+            string initials = BuildInitials(_userFullName);
+            TextRenderer.DrawText(g, initials, _avatarInitialsFont, avRect, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+
+            using var dotGlow = new SolidBrush(Color.FromArgb(90, HologramTheme.Success));
+            g.FillEllipse(dotGlow, 32, 34, 14, 14);
+            using var dot = new SolidBrush(HologramTheme.Success);
+            g.FillEllipse(dot, 35, 37, 8, 8);
+        };
+        profileInfoTable.Controls.Add(avatarBox, 0, 0);
+        profileInfoTable.SetRowSpan(avatarBox, 3);
+
+        var lblProfName = new Label
+        {
+            Text = _userFullName,
+            Font = new Font("Segoe UI", 9.8f, FontStyle.Bold),
+            ForeColor = HologramTheme.TextPrimary,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            BackColor = HologramTheme.PanelGlassLight,
+            AutoEllipsis = true
+        };
+        var lblProfStatus = new Label
+        {
+            Text = $"● Online • {NodeRuntimeState.CurrentNodeId}",
+            Font = new Font("Cascadia Mono", 8f, FontStyle.Bold),
+            ForeColor = HologramTheme.Success,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            BackColor = HologramTheme.PanelGlassLight,
+            AutoEllipsis = true
+        };
+        var lblProfRole = new Label
+        {
+            Text = _currentUser.Rol,
+            Font = new Font("Segoe UI", 8f),
+            ForeColor = HologramTheme.TextSecondary,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.TopLeft,
+            BackColor = HologramTheme.PanelGlassLight,
+            AutoEllipsis = true
+        };
+
+        profileInfoTable.Controls.Add(lblProfName, 1, 0);
+        profileInfoTable.Controls.Add(lblProfStatus, 1, 1);
+        profileInfoTable.Controls.Add(lblProfRole, 1, 2);
+
+        profileCard.Controls.Add(profileInfoTable);
+        profileCard.Controls.Add(btnLogout);
         profileWrap.Controls.Add(profileCard);
 
         var navContainer = new Panel
@@ -260,7 +324,7 @@ public partial class FormDashboard : Form
         {
             var btn = CreateNavButton(item.key, item.glyph, item.text);
             btn.Location = new Point(12, curY);
-            btn.Size = new Size(236, 46);
+            btn.Size = new Size(250, 46);
             navContainer.Controls.Add(btn);
             curY += 46 + 12;
         }
@@ -270,29 +334,38 @@ public partial class FormDashboard : Form
         sidebar.Controls.Add(profileWrap);
         sidebar.Controls.Add(logoPanel);
 
+        // 2. Contenedor Principal Derecho (Topbar de 2 filas + ViewHost)
         var mainRight = new Panel
         {
             Dock = DockStyle.Fill,
             BackColor = HologramTheme.BackgroundBase
         };
 
-        var topbar = new Panel
+        var topbar = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 80,
+            AutoSize = true,
+            MinimumSize = new Size(0, 96),
+            ColumnCount = 2,
+            RowCount = 2,
             BackColor = HologramTheme.PanelGlass,
-            Padding = new Padding(22, 12, 22, 10)
+            Padding = new Padding(22, 10, 22, 10)
         };
+        topbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        topbar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.Paint += (_, e) =>
         {
             using var pen = new Pen(HologramTheme.BorderSubtle, 1f);
             e.Graphics.DrawLine(pen, 0, topbar.Height - 1, topbar.Width, topbar.Height - 1);
         };
 
-        var greetingPanel = new Panel
+        // Fila 0, Col 0: Saludo y nodo activo
+        var greetingStack = new Panel
         {
-            Dock = DockStyle.Left,
-            Width = 355,
+            Dock = DockStyle.Fill,
+            Height = 52,
             BackColor = HologramTheme.PanelGlass
         };
         var lblWelcome = new Label
@@ -300,28 +373,29 @@ public partial class FormDashboard : Form
             Text = $"Bienvenido, {_userFullName}",
             Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(0, 4),
-            Size = new Size(350, 30),
+            Dock = DockStyle.Top,
+            Height = 28,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = false
+            AutoEllipsis = true
         };
         var lblSubWelcome = new Label
         {
-            Text = $"Nodo: {NodeRuntimeState.CurrentNodeId} • Dueño: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}",
-            Font = new Font("Segoe UI Semibold", 9.2f),
+            Text = $"Nodo activo: {NodeRuntimeState.CurrentNodeId} • Estado: Operativo • Dueño: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}",
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
-            Location = new Point(0, 36),
-            Size = new Size(350, 22),
+            Dock = DockStyle.Top,
+            Height = 22,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = false
+            AutoEllipsis = true
         };
-        greetingPanel.Controls.Add(lblWelcome);
-        greetingPanel.Controls.Add(lblSubWelcome);
+        greetingStack.Controls.Add(lblSubWelcome);
+        greetingStack.Controls.Add(lblWelcome);
 
+        // Fila 0, Col 1: Selector de algoritmo activo (Width = 320)
         var algPanel = new Panel
         {
-            Dock = DockStyle.Right,
-            Width = 320,
+            Size = new Size(320, 52),
+            Margin = new Padding(12, 0, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
         var lblAlgCap = new Label
@@ -329,15 +403,15 @@ public partial class FormDashboard : Form
             Text = "ALGORITMO ACTIVO (21 OFICIALES)",
             Font = new Font("Cascadia Mono", 8.2f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
-            Location = new Point(4, 2),
-            Size = new Size(312, 18),
+            Dock = DockStyle.Top,
+            Height = 18,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = false
+            AutoEllipsis = true
         };
         _cmbAlgorithm = new ComboBox
         {
-            Location = new Point(4, 23),
-            Size = new Size(312, 32),
+            Dock = DockStyle.Top,
+            Height = 30,
             Font = new Font("Cascadia Mono", 9.2f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbAlgorithm, HologramTheme.HologramCyan);
@@ -345,40 +419,43 @@ public partial class FormDashboard : Form
             _cmbAlgorithm.Items.Add(alg);
         _cmbAlgorithm.SelectedIndex = 0;
         _cmbAlgorithm.SelectedIndexChanged += (_, _) => UpdateSelectedAlgorithmHud();
-        algPanel.Controls.Add(lblAlgCap);
         algPanel.Controls.Add(_cmbAlgorithm);
+        algPanel.Controls.Add(lblAlgCap);
 
+        // Fila 1 (Span 2 columnas): FlowLayoutPanel con las 3 píldoras autoajustadas
         var pillsFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Padding = new Padding(10, 14, 10, 0),
+            WrapContents = true,
+            AutoSize = true,
+            Padding = new Padding(0, 6, 0, 2),
             BackColor = HologramTheme.PanelGlass
         };
         _pillApi = new StatusPill
         {
-            Text = NodeRuntimeState.ApiOnline ? $"API v2.0: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
+            Text = NodeRuntimeState.ApiOnline ? $"API: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
             IsActive = NodeRuntimeState.ApiOnline,
-            Margin = new Padding(4, 0, 8, 0)
+            Margin = new Padding(0, 2, 10, 2)
         };
         _pillSqlite = new StatusPill
         {
             Text = NodeRuntimeState.SqliteConnected ? "SQLite: Conectado" : "SQLite: Error",
             IsActive = NodeRuntimeState.SqliteConnected,
-            Margin = new Padding(0, 0, 8, 0)
+            Margin = new Padding(0, 2, 10, 2)
         };
         _pillCert = new StatusPill
         {
-            Text = NodeRuntimeState.CertificateActive ? "X.509 RSA-PSS: Activo" : "X.509: Inactivo",
+            Text = NodeRuntimeState.CertificateActive ? "Certificado X.509: Activo" : "X.509: Inactivo",
             IsActive = NodeRuntimeState.CertificateActive,
-            Margin = new Padding(0, 0, 4, 0)
+            Margin = new Padding(0, 2, 10, 2)
         };
         pillsFlow.Controls.AddRange(new Control[] { _pillApi, _pillSqlite, _pillCert });
 
-        topbar.Controls.Add(pillsFlow);
-        topbar.Controls.Add(algPanel);
-        topbar.Controls.Add(greetingPanel);
+        topbar.Controls.Add(greetingStack, 0, 0);
+        topbar.Controls.Add(algPanel, 1, 0);
+        topbar.Controls.Add(pillsFlow, 0, 1);
+        topbar.SetColumnSpan(pillsFlow, 2);
 
         _viewHost = new Panel
         {
@@ -447,6 +524,7 @@ public partial class FormDashboard : Form
         split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49f));
         split.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
+        // === COLUMNA IZQUIERDA / CENTRO: HOLOGRAMA 3D BINARIO + PANEL DE ACCIONES (182 px) ===
         var leftCol = new Panel
         {
             Dock = DockStyle.Fill,
@@ -477,7 +555,8 @@ public partial class FormDashboard : Form
             Font = new Font("Segoe UI", 8.8f),
             ForeColor = HologramTheme.TextSecondary,
             TextAlign = ContentAlignment.MiddleCenter,
-            BackColor = HologramTheme.PanelGlass
+            BackColor = HologramTheme.PanelGlass,
+            AutoEllipsis = true
         };
 
         holoCard.Controls.Add(_hologram);
@@ -486,9 +565,9 @@ public partial class FormDashboard : Form
         var actionCard = new GlassPanel
         {
             Dock = DockStyle.Bottom,
-            Height = 152,
+            Height = 182,
             CornerRadius = 16,
-            Padding = new Padding(12, 10, 12, 10)
+            Padding = new Padding(14)
         };
 
         var actionGrid = new TableLayoutPanel
@@ -501,14 +580,14 @@ public partial class FormDashboard : Form
         actionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
         actionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
         actionGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34f));
-        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f));
+        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 48f));
+        actionGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 48f));
 
         _txtPassphrase = HologramTheme.CreateDarkTextBox();
         _txtPassphrase.Dock = DockStyle.Fill;
         _txtPassphrase.PlaceholderText = "Clave opcional (o auto-generar llave criptográfica)";
-        _txtPassphrase.Margin = new Padding(3, 4, 6, 4);
+        _txtPassphrase.Margin = new Padding(4, 5, 6, 5);
         actionGrid.Controls.Add(_txtPassphrase, 0, 0);
         actionGrid.SetColumnSpan(_txtPassphrase, 2);
 
@@ -516,7 +595,7 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Fill,
             Font = new Font("Cascadia Mono", 8.5f, FontStyle.Bold),
-            Margin = new Padding(3, 4, 3, 4)
+            Margin = new Padding(4, 5, 4, 5)
         };
         HologramTheme.StyleComboBox(_cmbTargetPeer, HologramTheme.HologramCyan);
         RefreshTargetPeerCombo();
@@ -527,68 +606,62 @@ public partial class FormDashboard : Form
             Text = "📂 Cargar Archivo",
             Variant = NeonButtonVariant.Secondary,
             Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
+            Margin = new Padding(4)
         };
         btnLoadFile.Click += (_, _) => HandleLoadFile();
 
         var btnEncrypt = new NeonButton
         {
-            Text = "🔒 Cifrar (Productor)",
+            Text = "🔒 Cifrar Paquete",
             Variant = NeonButtonVariant.Primary,
             Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
+            Margin = new Padding(4)
         };
         btnEncrypt.Click += (_, _) => HandleEncryptAction(asIntermediateHop: false);
-
-        var btnRelayEncrypt = new NeonButton
-        {
-            Text = "🔁 Re-Cifrar Salto",
-            Variant = NeonButtonVariant.Cyan,
-            Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
-        };
-        btnRelayEncrypt.Click += (_, _) => HandleEncryptAction(asIntermediateHop: true);
-
-        actionGrid.Controls.Add(btnLoadFile, 0, 1);
-        actionGrid.Controls.Add(btnEncrypt, 1, 1);
-        actionGrid.Controls.Add(btnRelayEncrypt, 2, 1);
 
         var btnDecryptLocal = new NeonButton
         {
             Text = "🔓 Descifrar Local",
             Variant = NeonButtonVariant.Success,
             Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
+            Margin = new Padding(4)
         };
         btnDecryptLocal.Click += (_, _) => HandleDecryptLocalAction();
 
-        var btnExportZip = new NeonButton
+        actionGrid.Controls.Add(btnLoadFile, 0, 1);
+        actionGrid.Controls.Add(btnEncrypt, 1, 1);
+        actionGrid.Controls.Add(btnDecryptLocal, 2, 1);
+
+        var btnRelayEncrypt = new NeonButton
         {
-            Text = "📦 Exportar .ZIP v2.0",
-            Variant = NeonButtonVariant.Secondary,
+            Text = "🔁 Re-Cifrar Salto",
+            Variant = NeonButtonVariant.Cyan,
             Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
+            Margin = new Padding(4)
         };
-        btnExportZip.Click += (_, _) => HandleExportV2ZipLocally();
+        btnRelayEncrypt.Click += (_, _) => HandleEncryptAction(asIntermediateHop: true);
 
         var btnSendZip = new NeonButton
         {
-            Text = "🚀 Enviar .ZIP v2.0",
+            Text = "🚀 Enviar .ZIP",
             Variant = NeonButtonVariant.Primary,
             Dock = DockStyle.Fill,
-            Margin = new Padding(3),
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold)
+            Margin = new Padding(4)
         };
         btnSendZip.Click += async (_, _) => await HandleSendZipToPeerAsync();
 
-        actionGrid.Controls.Add(btnDecryptLocal, 0, 2);
-        actionGrid.Controls.Add(btnExportZip, 1, 2);
-        actionGrid.Controls.Add(btnSendZip, 2, 2);
+        var btnExportZip = new NeonButton
+        {
+            Text = "📦 Exportar .ZIP",
+            Variant = NeonButtonVariant.Secondary,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(4)
+        };
+        btnExportZip.Click += (_, _) => HandleExportV2ZipLocally();
+
+        actionGrid.Controls.Add(btnRelayEncrypt, 0, 2);
+        actionGrid.Controls.Add(btnSendZip, 1, 2);
+        actionGrid.Controls.Add(btnExportZip, 2, 2);
 
         actionCard.Controls.Add(actionGrid);
 
@@ -597,6 +670,7 @@ public partial class FormDashboard : Form
         leftCol.Controls.Add(spacer);
         leftCol.Controls.Add(actionCard);
 
+        // === COLUMNA DERECHA: VISOR (CON TABLELAYOUTPANEL HEADER) + METADATOS ===
         var rightCol = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -616,11 +690,21 @@ public partial class FormDashboard : Form
             Margin = new Padding(0, 0, 0, 12)
         };
 
-        var viewerHeader = new Panel { Dock = DockStyle.Top, Height = 34, BackColor = HologramTheme.PanelGlass };
+        var viewerHeader = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = HologramTheme.PanelGlass
+        };
+        viewerHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        viewerHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
         _lblFileBadge = new Label
         {
             Text = "VISOR DE CARGA • mensaje_seguro.txt",
-            Font = new Font("Segoe UI Semibold", 9.4f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -630,29 +714,35 @@ public partial class FormDashboard : Form
 
         var modeButtons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Right,
-            Width = 228,
+            AutoSize = true,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
+            Margin = new Padding(0),
             BackColor = HologramTheme.PanelGlass
         };
-        _btnModeText = new NeonButton { Text = "Texto", Size = new Size(70, 28), CornerRadius = 8, Variant = NeonButtonVariant.Primary, Font = new Font("Segoe UI Semibold", 8.3f) };
-        _btnModeHex = new NeonButton { Text = "Hex", Size = new Size(66, 28), CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Font = new Font("Segoe UI Semibold", 8.3f) };
-        _btnModeImg = new NeonButton { Text = "Imagen", Size = new Size(74, 28), CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Font = new Font("Segoe UI Semibold", 8.3f) };
+        _btnModeText = new NeonButton { Text = "Texto", CornerRadius = 8, Variant = NeonButtonVariant.Primary, Margin = new Padding(2) };
+        _btnModeHex = new NeonButton { Text = "Hex", CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Margin = new Padding(2) };
+        _btnModeImg = new NeonButton { Text = "Imagen", CornerRadius = 8, Variant = NeonButtonVariant.Secondary, Margin = new Padding(2) };
+
+        _btnModeText.FitToText(minWidth: 74, height: 30);
+        _btnModeHex.FitToText(minWidth: 74, height: 30);
+        _btnModeImg.FitToText(minWidth: 78, height: 30);
 
         _btnModeText.Click += (_, _) => { _binarySummaryReport = null; SetViewerMode("TEXT"); };
         _btnModeHex.Click += (_, _) => SetViewerMode("HEX");
         _btnModeImg.Click += (_, _) => SetViewerMode("IMG");
         modeButtons.Controls.AddRange(new Control[] { _btnModeText, _btnModeHex, _btnModeImg });
 
-        viewerHeader.Controls.Add(_lblFileBadge);
-        viewerHeader.Controls.Add(modeButtons);
+        viewerHeader.Controls.Add(_lblFileBadge, 0, 0);
+        viewerHeader.Controls.Add(modeButtons, 1, 0);
 
-        var fileActionsBar = new Panel
+        var fileActionsBar = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 38,
-            Padding = new Padding(0, 4, 0, 2),
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 6, 0, 4),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -660,38 +750,36 @@ public partial class FormDashboard : Form
         {
             Text = "💾 Descargar Archivo",
             Variant = NeonButtonVariant.Cyan,
-            Location = new Point(0, 4),
-            Size = new Size(156, 30),
             CornerRadius = 8,
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnDownloadFile.FitToText(minWidth: 156, height: 32);
         btnDownloadFile.Click += (_, _) => HandleDownloadCurrentFile();
 
         _btnOpenFile = new NeonButton
         {
-            Text = "▶ Abrir Archivo Local",
+            Text = "▶ Abrir Local",
             Variant = NeonButtonVariant.Success,
-            Location = new Point(164, 4),
-            Size = new Size(146, 30),
             CornerRadius = 8,
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 10, 2)
         };
+        _btnOpenFile.FitToText(minWidth: 126, height: 32);
         _btnOpenFile.Click += (_, _) => HandleOpenCurrentFileInWindows();
 
         _chkAutoDownloadBinary = new CheckBox
         {
-            Text = "Auto-guardar binarios locales al descifrar",
+            Text = "Auto-descargar multimedia/binarios al descifrar",
             Checked = true,
             AutoSize = true,
-            Location = new Point(318, 9),
-            Font = new Font("Segoe UI", 8.4f),
+            Margin = new Padding(2, 8, 2, 2),
+            Font = new Font("Segoe UI", 8.5f),
             ForeColor = HologramTheme.HologramViolet,
             BackColor = HologramTheme.PanelGlass
         };
 
         fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, _btnOpenFile, _chkAutoDownloadBinary });
 
-        var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 6, 0, 0), BackColor = HologramTheme.PanelGlass };
+        var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 4, 0, 0), BackColor = HologramTheme.PanelGlass };
         _txtDataViewer = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: false, mono: true);
         _txtDataViewer.Dock = DockStyle.Fill;
         _txtDataViewer.TextChanged += (_, _) =>
@@ -722,6 +810,7 @@ public partial class FormDashboard : Form
         viewerCard.Controls.Add(fileActionsBar);
         viewerCard.Controls.Add(viewerHeader);
 
+        // Card de Metadatos con TableLayoutPanel en el encabezado para evitar encimamientos
         var metaCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
@@ -729,29 +818,39 @@ public partial class FormDashboard : Form
             Padding = new Padding(14)
         };
 
-        var metaHeader = new Panel { Dock = DockStyle.Top, Height = 30, BackColor = HologramTheme.PanelGlass };
+        var metaHeader = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = HologramTheme.PanelGlass
+        };
+        metaHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        metaHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
         var lblMetaTitle = new Label
         {
-            Text = "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA 11 CAMPOS",
-            Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
+            Text = "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA",
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = false
+            AutoEllipsis = true
         };
         _lblMetaSignatureBadge = new Label
         {
             Text = $"● RSA-PSS Listo ({NodeRuntimeState.CurrentNodeId})",
             Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
-            Dock = DockStyle.Right,
-            Width = 235,
+            AutoSize = true,
+            Margin = new Padding(8, 4, 0, 4),
             TextAlign = ContentAlignment.MiddleRight,
             BackColor = HologramTheme.PanelGlass
         };
-        metaHeader.Controls.Add(lblMetaTitle);
-        metaHeader.Controls.Add(_lblMetaSignatureBadge);
+        metaHeader.Controls.Add(lblMetaTitle, 0, 0);
+        metaHeader.Controls.Add(_lblMetaSignatureBadge, 1, 0);
 
         var metaGrid = new TableLayoutPanel
         {
@@ -777,7 +876,7 @@ public partial class FormDashboard : Form
         var lblPub = new Label
         {
             Text = "publicParameters:",
-            Font = new Font("Segoe UI Semibold", 8.6f),
+            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
             ForeColor = HologramTheme.TextSecondary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.TopLeft,
@@ -808,7 +907,7 @@ public partial class FormDashboard : Form
         var lbl = new Label
         {
             Text = label,
-            Font = new Font("Segoe UI Semibold", 8.6f),
+            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
             ForeColor = HologramTheme.TextSecondary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -1001,7 +1100,6 @@ public partial class FormDashboard : Form
 
     private void HandleOpenCurrentFileInWindows()
     {
-        // Regla Inmutable #4: Prohibido abrir o ejecutar automáticamente archivos recibidos de la red
         if (_isFromNetworkUntrusted)
         {
             MessageBox.Show(this,
@@ -1243,7 +1341,6 @@ public partial class FormDashboard : Form
                     ? "Deshabilitada por seguridad para paquetes de red (usa [💾 Descargar Archivo] manualmente)."
                     : "Auto-guardado desactivado (usa [💾 Descargar Archivo]).";
 
-                // Solo auto-guardar cuando el paquete es de origen local (nunca auto-ejecutar paquetes de red)
                 if (!_isFromNetworkUntrusted && _chkAutoDownloadBinary != null && _chkAutoDownloadBinary.Checked)
                 {
                     string savedPath = SaveDecryptedBinaryAutomatically(_currentBytes, _currentFileName, _currentExtension);

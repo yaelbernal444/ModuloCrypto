@@ -53,8 +53,8 @@ public sealed class ApiHostService : IAsyncDisposable
             {
                 options.AddDefaultPolicy(policy =>
                     policy.AllowAnyOrigin()
-                          .AllowAnyMethod()
-                          .AllowAnyHeader());
+                        .AllowAnyMethod()
+                        .AllowAnyHeader());
             });
 
             builder.WebHost.UseUrls($"http://0.0.0.0:{port}");

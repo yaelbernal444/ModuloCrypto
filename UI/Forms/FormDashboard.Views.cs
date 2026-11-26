@@ -39,14 +39,32 @@ public partial class FormDashboard
 
         var card = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(18) };
 
-        var header = new Panel { Dock = DockStyle.Top, Height = 58, BackColor = HologramTheme.PanelGlass };
+        // Encabezado de 2 filas (Fila 0: título + subtítulo; Fila 1: FlowLayoutPanel con botones FitToText)
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = HologramTheme.PanelGlass
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var titleStack = new Panel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            BackColor = HologramTheme.PanelGlass
+        };
         var lblTitle = new Label
         {
             Text = $"Bandeja de Solicitudes Entrantes (.ZIP v2.0) — {NodeRuntimeState.CurrentNodeId}",
             Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(0, 0),
-            Size = new Size(490, 28),
+            Dock = DockStyle.Top,
+            AutoSize = true,
             BackColor = HologramTheme.PanelGlass
         };
         var lblSub = new Label
@@ -54,40 +72,48 @@ public partial class FormDashboard
             Text = "Validación estricta de 3 archivos planos, Anti-ZIP-Bomb, RSA-PSS-SHA256 (11 campos), TOFU y Anti-Replay",
             Font = HologramTheme.FontBody(8.8f),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(0, 30),
-            Size = new Size(560, 20),
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(0, 2, 0, 2),
             BackColor = HologramTheme.PanelGlass
         };
+        titleStack.Controls.Add(lblSub);
+        titleStack.Controls.Add(lblTitle);
 
         var btnFlow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Right,
-            Width = 670,
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
-            Padding = new Padding(0, 8, 0, 0),
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 8, 0, 4),
             BackColor = HologramTheme.PanelGlass
         };
 
-        var btnRefresh = new NeonButton { Text = "↻ Actualizar", Variant = NeonButtonVariant.Secondary, Size = new Size(106, 36) };
-        btnRefresh.Click += (_, _) => { RefreshSolicitudesGrid(); RefreshPendingSolicitudesBadge(); };
-
-        var btnImportZip = new NeonButton { Text = "📥 Importar .ZIP", Variant = NeonButtonVariant.Cyan, Size = new Size(128, 36) };
-        btnImportZip.Click += (_, _) => HandleImportZipToInbox();
-
-        var btnForwardV2 = new NeonButton { Text = "↪ Reenviar v2.0", Variant = NeonButtonVariant.Primary, Size = new Size(134, 36) };
-        btnForwardV2.Click += async (_, _) => await HandleForwardSelectedSolicitudV2Async();
-
-        var btnReject = new NeonButton { Text = "✕ Rechazar", Variant = NeonButtonVariant.Danger, Size = new Size(106, 36) };
-        btnReject.Click += (_, _) => HandleUpdateSolicitudEstado("Rechazada");
-
-        var btnAccept = new NeonButton { Text = "✓ Aceptar y Descifrar", Variant = NeonButtonVariant.Success, Size = new Size(168, 36) };
+        var btnAccept = new NeonButton { Text = "✓ Aceptar y Descifrar", Variant = NeonButtonVariant.Success, Margin = new Padding(0, 2, 8, 2) };
+        btnAccept.FitToText(minWidth: 165, height: 38);
         btnAccept.Click += (_, _) => HandleAcceptAndDecryptSolicitud();
 
-        btnFlow.Controls.AddRange(new Control[] { btnRefresh, btnImportZip, btnForwardV2, btnReject, btnAccept });
-        header.Controls.Add(lblTitle);
-        header.Controls.Add(lblSub);
-        header.Controls.Add(btnFlow);
+        var btnReject = new NeonButton { Text = "✕ Rechazar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
+        btnReject.FitToText(minWidth: 110, height: 38);
+        btnReject.Click += (_, _) => HandleUpdateSolicitudEstado("Rechazada");
+
+        var btnForwardV2 = new NeonButton { Text = "↪ Reenviar v2.0", Variant = NeonButtonVariant.Primary, Margin = new Padding(0, 2, 8, 2) };
+        btnForwardV2.FitToText(minWidth: 135, height: 38);
+        btnForwardV2.Click += async (_, _) => await HandleForwardSelectedSolicitudV2Async();
+
+        var btnImportZip = new NeonButton { Text = "📥 Importar .ZIP", Variant = NeonButtonVariant.Cyan, Margin = new Padding(0, 2, 8, 2) };
+        btnImportZip.FitToText(minWidth: 135, height: 38);
+        btnImportZip.Click += (_, _) => HandleImportZipToInbox();
+
+        var btnRefresh = new NeonButton { Text = "↻ Actualizar", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
+        btnRefresh.FitToText(minWidth: 112, height: 38);
+        btnRefresh.Click += (_, _) => { RefreshSolicitudesGrid(); RefreshPendingSolicitudesBadge(); };
+
+        btnFlow.Controls.AddRange(new Control[] { btnAccept, btnReject, btnForwardV2, btnImportZip, btnRefresh });
+
+        header.Controls.Add(titleStack, 0, 0);
+        header.Controls.Add(btnFlow, 0, 1);
 
         _gridSolicitudes = new DataGridView { Dock = DockStyle.Fill };
         HologramTheme.StyleDataGrid(_gridSolicitudes);
@@ -100,7 +126,7 @@ public partial class FormDashboard
                                          st == "Rechazada" ? HologramTheme.Danger : HologramTheme.Warning;
         };
 
-        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
+        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 0, 0), BackColor = HologramTheme.PanelGlass };
         gridWrap.Controls.Add(_gridSolicitudes);
 
         card.Controls.Add(gridWrap);
@@ -247,7 +273,6 @@ public partial class FormDashboard
             string? secretKey = null;
             string pubJson = JsonSerializer.Serialize(parsed.Manifest.PublicParameters);
 
-            // 1. Buscar llave por keyRef.keyId o PacketId en la base de datos local (cuando EQ01 es el ownerNode)
             string lookupKeyId = parsed.Manifest.KeyRef?.KeyId ?? parsed.Manifest.PacketId;
             var localMatch = db.RegistrosCifrados.FirstOrDefault(r =>
                 r.PacketId == lookupKeyId || r.PacketId == parsed.Manifest.PacketId);
@@ -259,7 +284,6 @@ public partial class FormDashboard
                     pubJson = localMatch.ParametrosPublicosJson;
             }
 
-            // 2. Si la llave no reside en EQ01, solicitar clave/passphrase al operador en modal seguro
             if (string.IsNullOrWhiteSpace(secretKey))
             {
                 string? manualKey = PromptExternalPassphraseModal(
@@ -350,7 +374,7 @@ public partial class FormDashboard
             Text = "Clave de Descifrado de Paquete v2.0",
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.CenterParent,
-            Size = new Size(470, 300),
+            Size = new Size(500, 320),
             BackColor = HologramTheme.BackgroundBase,
             ForeColor = HologramTheme.TextPrimary,
             KeyPreview = true
@@ -362,7 +386,7 @@ public partial class FormDashboard
             CornerRadius = 16,
             NeonBorderGlow = true,
             BorderColor = HologramTheme.AccentStart,
-            Padding = new Padding(24)
+            Padding = new Padding(26)
         };
 
         var lblTitle = new Label
@@ -370,8 +394,8 @@ public partial class FormDashboard
             Text = $"Descifrar Paquete v2.0 ({algCode})",
             Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
-            Location = new Point(24, 20),
-            Size = new Size(420, 28),
+            Location = new Point(26, 20),
+            Size = new Size(448, 30),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -381,14 +405,14 @@ public partial class FormDashboard
             Text = $"Producer: {producerNode} • Source: {sourceNode} • {sigNote}\nIngresa la clave o llave Base64 para descifrar:",
             Font = new Font("Segoe UI", 9.2f),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(24, 54),
-            Size = new Size(420, 42),
+            Location = new Point(26, 54),
+            Size = new Size(448, 46),
             BackColor = HologramTheme.PanelGlass
         };
 
         var txtKey = HologramTheme.CreateDarkTextBox();
-        txtKey.Location = new Point(24, 112);
-        txtKey.Size = new Size(420, 34);
+        txtKey.Location = new Point(26, 114);
+        txtKey.Size = new Size(448, 34);
         txtKey.Font = new Font("Cascadia Mono", 10.5f);
         txtKey.Text = defaultKey;
 
@@ -397,8 +421,8 @@ public partial class FormDashboard
             Text = "Las llaves nunca viajan dentro de manifest.json (Estándar v2.0).",
             Font = new Font("Segoe UI", 8.4f),
             ForeColor = HologramTheme.HologramViolet,
-            Location = new Point(24, 152),
-            Size = new Size(420, 22),
+            Location = new Point(26, 156),
+            Size = new Size(448, 22),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -408,8 +432,8 @@ public partial class FormDashboard
         {
             Text = "🔓 Aceptar y Descifrar",
             Variant = NeonButtonVariant.Success,
-            Location = new Point(24, 204),
-            Size = new Size(204, 42)
+            Location = new Point(26, 218),
+            Size = new Size(218, 44)
         };
         btnOk.Click += (_, _) =>
         {
@@ -422,8 +446,8 @@ public partial class FormDashboard
         {
             Text = "Cancelar",
             Variant = NeonButtonVariant.Secondary,
-            Location = new Point(240, 204),
-            Size = new Size(204, 42)
+            Location = new Point(256, 218),
+            Size = new Size(218, 44)
         };
         btnCancel.Click += (_, _) =>
         {
@@ -461,58 +485,73 @@ public partial class FormDashboard
 
         var card = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(18) };
 
-        var header = new Panel { Dock = DockStyle.Top, Height = 60, BackColor = HologramTheme.PanelGlass };
+        // Encabezado de 2 filas (Fila 0: título; Fila 1: FlowLayoutPanel con búsqueda, filtro y botones FitToText)
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = HologramTheme.PanelGlass
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
         var lblTitle = new Label
         {
             Text = $"Consultas e Historial de Registros Cifrados ({NodeRuntimeState.CurrentNodeId})",
-            Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(0, 0),
-            Size = new Size(490, 28),
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            BackColor = HologramTheme.PanelGlass
+        };
+
+        var controlsFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 8, 0, 4),
             BackColor = HologramTheme.PanelGlass
         };
 
         _txtSearchHistory = HologramTheme.CreateDarkTextBox();
         _txtSearchHistory.PlaceholderText = "Buscar por archivo, algoritmo, ProducerNode o PacketId...";
-        _txtSearchHistory.Location = new Point(0, 30);
-        _txtSearchHistory.Size = new Size(290, 26);
+        _txtSearchHistory.Size = new Size(280, 30);
+        _txtSearchHistory.Margin = new Padding(0, 5, 10, 4);
         _txtSearchHistory.TextChanged += (_, _) => RefreshConsultasGrid();
 
         _cmbFilterOrigin = new ComboBox
         {
-            Location = new Point(300, 30),
-            Size = new Size(140, 26),
-            Font = new Font("Segoe UI Semibold", 9f)
+            Size = new Size(140, 30),
+            Margin = new Padding(0, 5, 14, 4),
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbFilterOrigin);
         _cmbFilterOrigin.Items.AddRange(new object[] { "Todos", "Local", "Relay", "Recibido" });
         _cmbFilterOrigin.SelectedIndex = 0;
         _cmbFilterOrigin.SelectedIndexChanged += (_, _) => RefreshConsultasGrid();
 
-        var btnFlow = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Right,
-            Width = 510,
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
-            Padding = new Padding(0, 10, 0, 0),
-            BackColor = HologramTheme.PanelGlass
-        };
+        var btnLoad = new NeonButton { Text = "⚡ Cargar en Dashboard", Variant = NeonButtonVariant.Primary, Margin = new Padding(0, 2, 8, 2) };
+        btnLoad.FitToText(minWidth: 175, height: 36);
+        btnLoad.Click += (_, _) => LoadSelectedHistoryRecord();
 
-        var btnCopyKeyRef = new NeonButton { Text = "🔑 Copiar keyRef", Variant = NeonButtonVariant.Secondary, Size = new Size(124, 36) };
+        var btnCopyKeyRef = new NeonButton { Text = "🔗 Copiar Link", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
+        btnCopyKeyRef.FitToText(minWidth: 124, height: 36);
         btnCopyKeyRef.Click += (_, _) =>
         {
             var r = GetSelectedRegistro();
             if (r == null) return;
             string kr = string.IsNullOrWhiteSpace(r.LinkDescifradoRemoto) ? $"keyRef://{r.NodoRaiz}/{r.PacketId}" : r.LinkDescifradoRemoto;
             Clipboard.SetText(kr);
-            MessageBox.Show(this, $"Referencia keyRef copiada:\n{kr}", "Portapapeles", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, $"Referencia copiada:\n{kr}", "Portapapeles", MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
 
-        var btnLoad = new NeonButton { Text = "⚡ Cargar en Dashboard", Variant = NeonButtonVariant.Primary, Size = new Size(184, 36) };
-        btnLoad.Click += (_, _) => LoadSelectedHistoryRecord();
-
-        var btnDelete = new NeonButton { Text = "🗑 Eliminar", Variant = NeonButtonVariant.Danger, Size = new Size(110, 36) };
+        var btnDelete = new NeonButton { Text = "🗑 Eliminar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
+        btnDelete.FitToText(minWidth: 110, height: 36);
         btnDelete.Click += (_, _) =>
         {
             var r = GetSelectedRegistro();
@@ -523,17 +562,16 @@ public partial class FormDashboard
             RefreshConsultasGrid();
         };
 
-        btnFlow.Controls.AddRange(new Control[] { btnDelete, btnCopyKeyRef, btnLoad });
-        header.Controls.Add(lblTitle);
-        header.Controls.Add(_txtSearchHistory);
-        header.Controls.Add(_cmbFilterOrigin);
-        header.Controls.Add(btnFlow);
+        controlsFlow.Controls.AddRange(new Control[] { _txtSearchHistory, _cmbFilterOrigin, btnLoad, btnCopyKeyRef, btnDelete });
+
+        header.Controls.Add(lblTitle, 0, 0);
+        header.Controls.Add(controlsFlow, 0, 1);
 
         _gridConsultas = new DataGridView { Dock = DockStyle.Fill };
         HologramTheme.StyleDataGrid(_gridConsultas);
         _gridConsultas.CellDoubleClick += (_, _) => LoadSelectedHistoryRecord();
 
-        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
+        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 0, 0), BackColor = HologramTheme.PanelGlass };
         gridWrap.Controls.Add(_gridConsultas);
 
         card.Controls.Add(gridWrap);
@@ -634,43 +672,64 @@ public partial class FormDashboard
 
         var card = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(18) };
 
-        var header = new Panel { Dock = DockStyle.Top, Height = 64, BackColor = HologramTheme.PanelGlass };
+        // Encabezado de 2 filas (Fila 0: título + subtítulo; Fila 1: FlowLayoutPanel con botones FitToText)
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = HologramTheme.PanelGlass
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var titleStack = new Panel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            BackColor = HologramTheme.PanelGlass
+        };
         var lblTitle = new Label
         {
             Text = "Directorio de Nodos v2.0 (UDP 5099 • Escaneo 5001–5020 • TOFU)",
-            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(0, 0),
-            Size = new Size(440, 28),
+            Dock = DockStyle.Top,
+            AutoSize = true,
             BackColor = HologramTheme.PanelGlass
         };
         var lblSub = new Label
         {
-            Text = $"Beacons CC-BEACON cada 30s (timeout 90s) y fijado de huella SHA-256 TOFU",
-            Font = HologramTheme.FontBody(8.6f),
+            Text = "Beacons CC-BEACON cada 30s (timeout 90s), escaneo HTTP de respaldo y fijado de huella SHA-256 TOFU",
+            Font = HologramTheme.FontBody(8.8f),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(0, 30),
-            Size = new Size(440, 20),
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(0, 2, 0, 2),
             BackColor = HologramTheme.PanelGlass
         };
+        titleStack.Controls.Add(lblSub);
+        titleStack.Controls.Add(lblTitle);
 
         var netBtnFlow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Right,
-            Width = 760,
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
-            Padding = new Padding(0, 10, 0, 0),
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 8, 0, 4),
             BackColor = HologramTheme.PanelGlass
         };
 
         var btnPingAll = new NeonButton
         {
-            Text = "📡 Ping / Verificar TOFU",
+            Text = "📡 Ping 8 Nodos",
             Variant = NeonButtonVariant.Cyan,
-            Size = new Size(176, 38),
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnPingAll.FitToText(minWidth: 145, height: 38);
         btnPingAll.Click += async (_, _) =>
         {
             btnPingAll.Enabled = false;
@@ -680,7 +739,8 @@ public partial class FormDashboard
                 await NodeNetworkClient.PingNodeAsync(peer, customTimeoutMs: 500);
             }
             RefreshNetworkGrid();
-            btnPingAll.Text = "📡 Ping / Verificar TOFU";
+            btnPingAll.Text = "📡 Ping 8 Nodos";
+            btnPingAll.FitToText(minWidth: 145, height: 38);
             btnPingAll.Enabled = true;
         };
 
@@ -688,18 +748,18 @@ public partial class FormDashboard
         {
             Text = "🛡 Confirmar Huella TOFU",
             Variant = NeonButtonVariant.Success,
-            Size = new Size(184, 38),
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnConfirmTofu.FitToText(minWidth: 180, height: 38);
         btnConfirmTofu.Click += (_, _) => HandleConfirmSelectedPeerTofu();
 
         var btnScanLocalhost = new NeonButton
         {
-            Text = "💻 Localhost (5001-5020)",
+            Text = "💻 Escanear Localhost",
             Variant = NeonButtonVariant.Primary,
-            Size = new Size(184, 38),
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnScanLocalhost.FitToText(minWidth: 170, height: 38);
         btnScanLocalhost.Click += async (_, _) =>
         {
             btnScanLocalhost.Enabled = false;
@@ -708,7 +768,8 @@ public partial class FormDashboard
             int integrated = IntegrateDiscoveredPeers(found);
             RefreshNetworkGrid();
             RefreshTargetPeerCombo();
-            btnScanLocalhost.Text = "💻 Localhost (5001-5020)";
+            btnScanLocalhost.Text = "💻 Escanear Localhost";
+            btnScanLocalhost.FitToText(minWidth: 170, height: 38);
             btnScanLocalhost.Enabled = true;
 
             MessageBox.Show(this,
@@ -720,11 +781,11 @@ public partial class FormDashboard
 
         var btnScanLan = new NeonButton
         {
-            Text = "🔍 Subred LAN (5001-5020)",
+            Text = "🔍 Auto-Descubrir LAN",
             Variant = NeonButtonVariant.Secondary,
-            Size = new Size(190, 38),
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnScanLan.FitToText(minWidth: 175, height: 38);
         btnScanLan.Click += async (_, _) =>
         {
             btnScanLan.Enabled = false;
@@ -733,7 +794,8 @@ public partial class FormDashboard
             int integrated = IntegrateDiscoveredPeers(found);
             RefreshNetworkGrid();
             RefreshTargetPeerCombo();
-            btnScanLan.Text = "🔍 Subred LAN (5001-5020)";
+            btnScanLan.Text = "🔍 Auto-Descubrir LAN";
+            btnScanLan.FitToText(minWidth: 175, height: 38);
             btnScanLan.Enabled = true;
 
             MessageBox.Show(this,
@@ -745,45 +807,54 @@ public partial class FormDashboard
 
         netBtnFlow.Controls.AddRange(new Control[] { btnPingAll, btnConfirmTofu, btnScanLocalhost, btnScanLan });
 
-        header.Controls.Add(lblTitle);
-        header.Controls.Add(lblSub);
-        header.Controls.Add(netBtnFlow);
+        header.Controls.Add(titleStack, 0, 0);
+        header.Controls.Add(netBtnFlow, 0, 1);
 
-        var editBar = new Panel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
+        // Barra inferior FlowLayoutPanel autoajustable para edición manual de IP y Puerto
+        var editBar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 10, 0, 4),
+            BackColor = HologramTheme.PanelGlass
+        };
+
         var lblIp = new Label
         {
-            Text = "Alta Manual IP Nodo:",
+            Text = "IP del Nodo Seleccionado:",
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(0, 18),
-            Size = new Size(150, 22),
+            AutoSize = true,
+            Margin = new Padding(0, 9, 8, 4),
             Font = HologramTheme.FontBody(9.2f),
             BackColor = HologramTheme.PanelGlass
         };
         _txtEditPeerIp = HologramTheme.CreateDarkTextBox();
-        _txtEditPeerIp.Location = new Point(155, 15);
         _txtEditPeerIp.Size = new Size(180, 28);
+        _txtEditPeerIp.Margin = new Padding(0, 5, 14, 4);
 
         var lblPort = new Label
         {
             Text = "Puerto:",
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(350, 18),
-            Size = new Size(56, 22),
+            AutoSize = true,
+            Margin = new Padding(0, 9, 8, 4),
             Font = HologramTheme.FontBody(9.2f),
             BackColor = HologramTheme.PanelGlass
         };
         _txtEditPeerPort = HologramTheme.CreateDarkTextBox();
-        _txtEditPeerPort.Location = new Point(408, 15);
         _txtEditPeerPort.Size = new Size(80, 28);
+        _txtEditPeerPort.Margin = new Padding(0, 5, 14, 4);
         _txtEditPeerPort.Text = "5001";
 
         var btnSavePeer = new NeonButton
         {
-            Text = "Guardar y Verificar Nodo",
+            Text = "💾 Guardar IP",
             Variant = NeonButtonVariant.Primary,
-            Location = new Point(502, 12),
-            Size = new Size(195, 34)
+            Margin = new Padding(0, 2, 8, 2)
         };
+        btnSavePeer.FitToText(minWidth: 150, height: 36);
         btnSavePeer.Click += async (_, _) =>
         {
             if (_gridPeers.SelectedRows.Count == 0) return;
@@ -830,7 +901,7 @@ public partial class FormDashboard
             }
         };
 
-        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 12, 0, 0), BackColor = HologramTheme.PanelGlass };
+        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 0, 0), BackColor = HologramTheme.PanelGlass };
         gridWrap.Controls.Add(_gridPeers);
 
         card.Controls.Add(gridWrap);
@@ -849,7 +920,7 @@ public partial class FormDashboard
         if (string.IsNullOrWhiteSpace(peer.CertThumbprint))
         {
             MessageBox.Show(this,
-                $"El nodo {peer.NodeId} aún no ha anunciado un certificado X.509.\nEjecuta primero [📡 Ping / Verificar TOFU] o espera su beacon UDP 5099.",
+                $"El nodo {peer.NodeId} aún no ha anunciado un certificado X.509.\nEjecuta primero [📡 Ping 8 Nodos] o espera su beacon UDP 5099.",
                 "TOFU — Sin Huella", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -956,10 +1027,10 @@ public partial class FormDashboard
 
         var btnRegen = new NeonButton
         {
-            Text = $"🔄 Regenerar Certificado X.509 v2.0 (CN={NodeRuntimeState.CurrentNodeId})",
+            Text = "🔄 Regenerar Certificado X.509",
             Variant = NeonButtonVariant.Primary,
             Dock = DockStyle.Bottom,
-            Height = 42
+            Height = 44
         };
         btnRegen.Click += (_, _) =>
         {
@@ -979,7 +1050,7 @@ public partial class FormDashboard
         var rightCard = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(20), Margin = new Padding(10, 0, 0, 0) };
         var lblDbTitle = new Label
         {
-            Text = "SQLite (TOFU / Anti-Replay) & Diagnóstico Visual",
+            Text = "SQLite (Modo WAL / TOFU / Anti-Replay) & Holograma",
             Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Top,
@@ -990,10 +1061,10 @@ public partial class FormDashboard
         _lblSettingsDbStats = new Label
         {
             Dock = DockStyle.Top,
-            Height = 175,
-            Font = HologramTheme.FontMono(9.2f),
+            Height = 190,
+            Font = HologramTheme.FontMono(9f),
             ForeColor = HologramTheme.TextPrimary,
-            Padding = new Padding(0, 10, 0, 10),
+            Padding = new Padding(0, 8, 0, 8),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -1002,27 +1073,31 @@ public partial class FormDashboard
             Text = "PRUEBA RÁPIDA DE ESTADOS DEL HOLOGRAMA 3D:",
             Dock = DockStyle.Top,
             Height = 30,
-            Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             BackColor = HologramTheme.PanelGlass
         };
 
         var testFlow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Top,
-            Height = 160,
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
+            Padding = new Padding(0, 6, 0, 6),
             BackColor = HologramTheme.PanelGlass
         };
 
-        var btnTestIdle = new NeonButton { Text = "1. Estado Reposo (Cubo Binario 3D)", Variant = NeonButtonVariant.Secondary, Size = new Size(340, 40) };
+        var btnTestIdle = new NeonButton { Text = "1. Estado Reposo (Cubo Binario 3D)", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 0, 0, 8) };
+        btnTestIdle.FitToText(minWidth: 340, height: 40);
         btnTestIdle.Click += (_, _) => { _hologram.SetIdle("Prueba Manual • Cubo Binario 3D"); SwitchView("dashboard"); };
 
-        var btnTestLock = new NeonButton { Text = "2. Estado Cifrar (Candado Cerrado)", Variant = NeonButtonVariant.Primary, Size = new Size(340, 40) };
+        var btnTestLock = new NeonButton { Text = "2. Estado Cifrar (Candado Cerrado)", Variant = NeonButtonVariant.Primary, Margin = new Padding(0, 0, 0, 8) };
+        btnTestLock.FitToText(minWidth: 340, height: 40);
         btnTestLock.Click += (_, _) => { _hologram.TriggerEncryptAnimation("AESGCM"); SwitchView("dashboard"); };
 
-        var btnTestUnlock = new NeonButton { Text = "3. Estado Descifrar (Candado Abierto)", Variant = NeonButtonVariant.Success, Size = new Size(340, 40) };
+        var btnTestUnlock = new NeonButton { Text = "3. Estado Descifrar (Candado Abierto)", Variant = NeonButtonVariant.Success, Margin = new Padding(0, 0, 0, 8) };
+        btnTestUnlock.FitToText(minWidth: 340, height: 40);
         btnTestUnlock.Click += (_, _) => { _hologram.TriggerDecryptAnimation("AESGCM"); SwitchView("dashboard"); };
 
         testFlow.Controls.AddRange(new Control[] { btnTestIdle, btnTestLock, btnTestUnlock });
@@ -1040,6 +1115,10 @@ public partial class FormDashboard
     private void RefreshSettingsStats()
     {
         if (_txtSettingsCertInfo == null || _lblSettingsDbStats == null) return;
+
+        NodeRuntimeState.SqliteConnected = AppDbContext.TestConnection(out string diag);
+        NodeRuntimeState.SqliteDiagnostic = diag;
+        UpdateSqlitePillState();
 
         var cert = NodeCertificateService.CurrentCertificate;
         _txtSettingsCertInfo.Text =
@@ -1064,7 +1143,8 @@ public partial class FormDashboard
         int spCount = db.SeenPackets.Count();
 
         _lblSettingsDbStats.Text =
-            $"Archivo SQLite     : {AppDbContext.DatabasePath}\r\n" +
+            $"Estado SQLite      : {(NodeRuntimeState.SqliteConnected ? "ONLINE (WAL Activo)" : "ERROR")}\r\n" +
+            $"Diagnóstico        : {NodeRuntimeState.SqliteDiagnostic}\r\n" +
             $"Tabla Usuarios     : {uCount} integrante(s) (PBKDF2-SHA256)\r\n" +
             $"Tabla Consultas    : {rCount} registro(s) local(es)\r\n" +
             $"Tabla Solicitudes  : {sCount} total ({sPend} pendiente(s))\r\n" +

@@ -24,7 +24,7 @@ public sealed class FormRegisterModal : Form
         Text = "Registrar Nuevo Integrante — ModuloCrypto";
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterParent;
-        Size = new Size(480, 440);
+        Size = new Size(510, 460);
         BackColor = HologramTheme.BackgroundBase;
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
@@ -46,8 +46,8 @@ public sealed class FormRegisterModal : Form
             Text = "Registrar Nuevo Integrante",
             Font = new Font("Segoe UI", 16f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
-            Location = new Point(32, 26),
-            Size = new Size(416, 34),
+            Location = new Point(32, 24),
+            Size = new Size(446, 36),
             BackColor = Color.Transparent
         };
 
@@ -57,15 +57,15 @@ public sealed class FormRegisterModal : Form
             Font = new Font("Segoe UI", 9.5f),
             ForeColor = HologramTheme.HologramViolet,
             Location = new Point(32, 60),
-            Size = new Size(416, 22),
+            Size = new Size(446, 24),
             BackColor = Color.Transparent
         };
 
-        var lblName = CreateFieldLabel("NOMBRE COMPLETO (EJ. YAEL BERNAL)", 32, 98);
+        var lblName = CreateFieldLabel("NOMBRE COMPLETO (EJ. YAEL BERNAL)", 32, 96);
         _txtFullName = new TextBox
         {
             Location = new Point(32, 122),
-            Size = new Size(416, 32),
+            Size = new Size(446, 32),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -76,8 +76,8 @@ public sealed class FormRegisterModal : Form
         var lblUser = CreateFieldLabel("USUARIO", 32, 168);
         _txtUsername = new TextBox
         {
-            Location = new Point(32, 192),
-            Size = new Size(416, 32),
+            Location = new Point(32, 194),
+            Size = new Size(446, 32),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -85,11 +85,11 @@ public sealed class FormRegisterModal : Form
             PlaceholderText = "yael.bernal"
         };
 
-        var lblPass = CreateFieldLabel("CONTRASEÑA", 32, 238);
+        var lblPass = CreateFieldLabel("CONTRASEÑA", 32, 240);
         _txtPassword = new TextBox
         {
-            Location = new Point(32, 262),
-            Size = new Size(416, 32),
+            Location = new Point(32, 266),
+            Size = new Size(446, 32),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -102,8 +102,8 @@ public sealed class FormRegisterModal : Form
             Text = "",
             Font = new Font("Segoe UI", 9f),
             ForeColor = HologramTheme.Danger,
-            Location = new Point(32, 304),
-            Size = new Size(416, 24),
+            Location = new Point(32, 308),
+            Size = new Size(446, 34),
             BackColor = Color.Transparent
         };
 
@@ -111,9 +111,10 @@ public sealed class FormRegisterModal : Form
         {
             Text = "Guardar y Acceder",
             Variant = NeonButtonVariant.Primary,
-            Location = new Point(32, 336),
-            Size = new Size(202, 44),
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold)
+            AutoFitWidth = false,
+            Location = new Point(32, 354),
+            Size = new Size(216, 46),
+            Font = new Font("Segoe UI", 9.6f, FontStyle.Bold)
         };
         btnCreate.Click += (_, _) => HandleRegister();
 
@@ -121,9 +122,10 @@ public sealed class FormRegisterModal : Form
         {
             Text = "Cancelar",
             Variant = NeonButtonVariant.Secondary,
-            Location = new Point(246, 336),
-            Size = new Size(202, 44),
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold)
+            AutoFitWidth = false,
+            Location = new Point(262, 354),
+            Size = new Size(216, 46),
+            Font = new Font("Segoe UI", 9.6f, FontStyle.Bold)
         };
         btnCancel.Click += (_, _) =>
         {
@@ -161,10 +163,10 @@ public sealed class FormRegisterModal : Form
     private static Label CreateFieldLabel(string text, int x, int y) => new()
     {
         Text = text,
-        Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold),
+        Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
         ForeColor = HologramTheme.HologramViolet,
         Location = new Point(x, y),
-        Size = new Size(416, 20),
+        Size = new Size(446, 22),
         BackColor = Color.Transparent
     };
 

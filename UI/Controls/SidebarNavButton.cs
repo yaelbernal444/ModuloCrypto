@@ -11,6 +11,8 @@ public class SidebarNavButton : Control
     private bool _hovered;
     private bool _active;
     private int _badgeCount;
+    private readonly Font _iconFont = new("Segoe UI Symbol", 11f);
+    private readonly Font _badgeFont = new("Segoe UI", 8f, FontStyle.Bold);
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string IconGlyph { get; set; } = "◆";
@@ -39,9 +41,9 @@ public class SidebarNavButton : Control
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         Cursor = Cursors.Hand;
         Height = 46;
-        Width = 236;
+        Width = 250;
         BackColor = HologramTheme.PanelGlass;
-        Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        Font = new Font("Segoe UI", 9.8f, FontStyle.Bold);
     }
 
     protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
@@ -85,23 +87,34 @@ public class SidebarNavButton : Control
         Color glyphColor = _active ? HologramTheme.HologramCyan : fg;
 
         var iconRect = new Rectangle(rect.X + 10, rect.Y, 24, rect.Height);
-        TextRenderer.DrawText(g, IconGlyph, new Font("Segoe UI Symbol", 11f), iconRect, glyphColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        TextRenderer.DrawText(g, IconGlyph, _iconFont, iconRect, glyphColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
-        int textRightMargin = _badgeCount > 0 ? 40 : 6;
+        int textRightMargin = _badgeCount > 0 ? 44 : 10;
         var textRect = new Rectangle(rect.X + 36, rect.Y, rect.Width - 36 - textRightMargin, rect.Height);
         TextRenderer.DrawText(g, Text, Font, textRect, fg,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
         if (_badgeCount > 0)
         {
             string badgeText = _badgeCount > 99 ? "99+" : _badgeCount.ToString();
-            var badgeRect = new Rectangle(rect.Right - 34, rect.Y + (rect.Height - 20) / 2, 26, 20);
+            var badgeRect = new Rectangle(rect.Right - 36, rect.Y + (rect.Height - 20) / 2, 28, 20);
             using var badgePath = HologramTheme.CreateRoundedPath(badgeRect, 9);
             using var badgeBrush = new LinearGradientBrush(badgeRect, HologramTheme.HologramCyan, HologramTheme.AccentStart, 45f);
             g.FillPath(badgeBrush, badgePath);
-            TextRenderer.DrawText(g, badgeText, new Font("Segoe UI", 8f, FontStyle.Bold), badgeRect, Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(g, badgeText, _badgeFont, badgeRect, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _iconFont.Dispose();
+            _badgeFont.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }

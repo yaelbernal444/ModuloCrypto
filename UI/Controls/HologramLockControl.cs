@@ -687,7 +687,7 @@ public sealed class HologramLockControl : Control
 
     private void DrawHologramHud(Graphics g)
     {
-        // Etiqueta superior izquierda: Estado del Holograma
+        // Etiqueta superior izquierda: Estado del Holograma (medida dinámicamente sin encimarse)
         string stateTag = _state switch
         {
             HologramState.Idle => "● IDLE • CUBO BINARIO 3D",
@@ -707,7 +707,10 @@ public sealed class HologramLockControl : Control
             _ => HologramTheme.HologramViolet
         };
 
-        var badgeRect = new Rectangle(16, 14, 265, 30);
+        Size stateMeasured = TextRenderer.MeasureText(g, stateTag, _hudBadgeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        int stateW = Math.Clamp(stateMeasured.Width + 24, 160, Math.Max(180, Width - 32));
+        var badgeRect = new Rectangle(16, 14, stateW, 30);
+
         using (var path = HologramTheme.CreateRoundedPath(badgeRect, 14))
         using (var bg = new SolidBrush(Color.FromArgb(190, 21, 18, 38)))
         using (var border = new Pen(Color.FromArgb(150, tagColor), 1f))
@@ -716,10 +719,19 @@ public sealed class HologramLockControl : Control
             g.DrawPath(border, path);
         }
         TextRenderer.DrawText(g, stateTag, _hudBadgeFont, badgeRect, tagColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-        // Etiqueta superior derecha: Algoritmo activo
-        var algRect = new Rectangle(Width - 180, 14, 164, 30);
+        // Etiqueta superior derecha: Algoritmo activo (se apila debajo si el panel es estrecho)
+        string algText = $"ALG: {ActiveAlgorithmLabel}";
+        Size algMeasured = TextRenderer.MeasureText(g, algText, _hudBadgeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        int algW = Math.Max(130, algMeasured.Width + 24);
+        var algRect = new Rectangle(Width - algW - 16, 14, algW, 30);
+
+        if (badgeRect.Right + 10 > algRect.Left)
+        {
+            algRect = new Rectangle(16, 50, Math.Min(algW, Math.Max(130, Width - 32)), 30);
+        }
+
         using (var path = HologramTheme.CreateRoundedPath(algRect, 14))
         using (var bg = new SolidBrush(Color.FromArgb(190, 21, 18, 38)))
         using (var border = new Pen(Color.FromArgb(140, HologramTheme.AccentGlow), 1f))
@@ -727,13 +739,13 @@ public sealed class HologramLockControl : Control
             g.FillPath(bg, path);
             g.DrawPath(border, path);
         }
-        TextRenderer.DrawText(g, $"ALG: {ActiveAlgorithmLabel}", _hudBadgeFont, algRect, HologramTheme.HologramCyan,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        TextRenderer.DrawText(g, algText, _hudBadgeFont, algRect, HologramTheme.HologramCyan,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-        // Subtítulo inferior centrado
-        var subRect = new Rectangle(16, Height - 32, Width - 32, 24);
+        // Subtítulo inferior centrado con EndEllipsis
+        var subRect = new Rectangle(16, Height - 32, Math.Max(40, Width - 32), 24);
         TextRenderer.DrawText(g, StatusSubtitle, _hudSubFont, subRect, HologramTheme.TextSecondary,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 
     private Color ComputeParticleColor(BinaryParticle p, float depthNorm)
