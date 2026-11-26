@@ -1693,15 +1693,15 @@ public partial class FormDashboard
             BackColor = HologramTheme.PanelGlass
         };
 
-        var btnTestIdle = new NeonButton { Text = "1. Estado Reposo (Cubo Binario 3D)", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 0, 0, 8) };
+        var btnTestIdle = new NeonButton { Text = "1. Estado Reposo (Cubo Azul)", Variant = NeonButtonVariant.Cyan, Margin = new Padding(0, 0, 0, 8) };
         btnTestIdle.FitToText(minWidth: 340, height: 40);
         btnTestIdle.Click += (_, _) => { _hologram.SetIdle(string.Empty); SwitchView("dashboard"); };
 
-        var btnTestLock = new NeonButton { Text = "2. Estado Cifrar (Candado Cerrado)", Variant = NeonButtonVariant.Primary, Margin = new Padding(0, 0, 0, 8) };
+        var btnTestLock = new NeonButton { Text = "2. Estado Cifrar (Candado Cerrado Rojo)", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 0, 0, 8) };
         btnTestLock.FitToText(minWidth: 340, height: 40);
         btnTestLock.Click += (_, _) => { _hologram.TriggerEncryptAnimation("AESGCM"); SwitchView("dashboard"); };
 
-        var btnTestUnlock = new NeonButton { Text = "3. Estado Descifrar (Candado Abierto)", Variant = NeonButtonVariant.Success, Margin = new Padding(0, 0, 0, 8) };
+        var btnTestUnlock = new NeonButton { Text = "3. Estado Descifrar (Candado Abierto Verde)", Variant = NeonButtonVariant.Success, Margin = new Padding(0, 0, 0, 8) };
         btnTestUnlock.FitToText(minWidth: 340, height: 40);
         btnTestUnlock.Click += (_, _) => { _hologram.TriggerDecryptAnimation("AESGCM"); SwitchView("dashboard"); };
 

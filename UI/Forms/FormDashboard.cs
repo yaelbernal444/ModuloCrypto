@@ -53,7 +53,6 @@ public partial class FormDashboard : Form
 
     // Dashboard / Crypto Stage Controls
     private HologramLockControl _hologram = null!;
-    private Label _lblAlgDesc = null!;
     private Label _lblFileBadge = null!;
     private TextBox _txtPassphrase = null!;
     private TextBox _txtDataViewer = null!;
@@ -578,19 +577,7 @@ public partial class FormDashboard : Form
             StatusSubtitle = string.Empty
         };
 
-        _lblAlgDesc = new Label
-        {
-            Dock = DockStyle.Bottom,
-            Height = 32,
-            Font = new Font("Segoe UI", 8.8f),
-            ForeColor = HologramTheme.TextSecondary,
-            TextAlign = ContentAlignment.MiddleCenter,
-            BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = true
-        };
-
         holoCard.Controls.Add(_hologram);
-        holoCard.Controls.Add(_lblAlgDesc);
 
         var actionCard = new GlassPanel
         {
@@ -908,7 +895,7 @@ public partial class FormDashboard : Form
             Padding = new Padding(0, 6, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
-        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 124));
         metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
@@ -974,9 +961,7 @@ public partial class FormDashboard : Form
     {
         if (_cmbAlgorithm.SelectedItem is CryptoAlgorithmInfo info)
         {
-            string owner = CryptoCatalog.GetOwnerNode(info.Code);
             _hologram.ActiveAlgorithmLabel = info.Code;
-            _lblAlgDesc.Text = $"{info.DisplayName} • {info.Category} (Dueño v2.0: {owner})";
         }
     }
 

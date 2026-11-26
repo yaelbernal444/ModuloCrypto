@@ -67,6 +67,7 @@ public static class V2CertificateService
                     {
                         _currentCert = loaded;
                         NodeRuntimeState.CertificateActive = true;
+                        SyncSelfPeerThumbprint(_currentCert);
                         return _currentCert;
                     }
                     loaded.Dispose();
@@ -111,6 +112,7 @@ public static class V2CertificateService
                 _currentCert?.Dispose();
                 _currentCert = X509CertificateLoader.LoadPkcs12(pfxBytes, secretPass, X509KeyStorageFlags.Exportable);
                 NodeRuntimeState.CertificateActive = true;
+                SyncSelfPeerThumbprint(_currentCert);
                 return _currentCert;
             }
             finally
@@ -140,6 +142,30 @@ public static class V2CertificateService
         byte[] protectedBytes = ProtectedData.Protect(randomSecret, DpapiEntropy, DataProtectionScope.CurrentUser);
         File.WriteAllBytes(KeyPath, protectedBytes);
         return randomSecret;
+    }
+
+    private static void SyncSelfPeerThumbprint(X509Certificate2 cert)
+    {
+        try
+        {
+            string thumb = GetThumbprintSha256Hex(cert);
+            string pem = cert.ExportCertificatePem();
+            string selfId = ExpectedNodeId;
+
+            var selfPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, selfId, StringComparison.OrdinalIgnoreCase));
+            if (selfPeer != null)
+            {
+                selfPeer.CertThumbprint = thumb;
+                selfPeer.PinnedThumbprintSha256 = thumb;
+                selfPeer.CertificatePem = pem;
+                selfPeer.IsConfirmed = true;
+                selfPeer.HasThumbprintMismatch = false;
+                selfPeer.Status = "online";
+                ModuloCrypto.Core.Data.AppDbContext.UpsertTrustedPeer(selfPeer);
+            }
+        }
+        catch { }
     }
 
     public static string ExportPublicCertBase64()

@@ -64,8 +64,14 @@ public sealed class HologramLockControl : Control
     private ProjectedPoint[] _projected = Array.Empty<ProjectedPoint>();
     private readonly Font[] _bitFonts;
     private readonly Font _hudBadgeFont = new("Cascadia Mono", 9.2f, FontStyle.Bold);
-    private readonly Font _hudSubFont = new("Segoe UI Semibold", 8.5f);
     private readonly Random _rng = new(2026);
+
+    private static readonly Color IdleCyan = Color.FromArgb(0, 210, 255);      // #00D2FF
+    private static readonly Color IdleBlue = Color.FromArgb(30, 144, 255);     // #1E90FF
+    private static readonly Color LockedRed = HologramTheme.Danger;            // #FF4757
+    private static readonly Color LockedCrimson = Color.FromArgb(255, 30, 66); // #FF1E42
+    private static readonly Color UnlockedGreen = HologramTheme.Success;       // #2ED573
+    private static readonly Color UnlockedEmerald = Color.FromArgb(0, 230, 118); // #00E676
 
     private HologramState _state = HologramState.Idle;
     private float _angleY;
@@ -97,7 +103,7 @@ public sealed class HologramLockControl : Control
     {
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
-                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         BackColor = HologramTheme.BackgroundBase;
 
         _bitFonts = new[]
@@ -131,7 +137,7 @@ public sealed class HologramLockControl : Control
         _state = HologramState.Encrypting;
         _stateTimer = 0f;
         _spinVelocity = 0.14f;
-        _pulseColor = HologramTheme.HologramCyan;
+        _pulseColor = LockedRed;
         _pulseRadius = 0.05f;
         _pulseAlpha = 1f;
         StatusSubtitle = $"Cifrando con {algorithmCode}...";
@@ -144,7 +150,7 @@ public sealed class HologramLockControl : Control
         _stateTimer = 0f;
         _morphToLock = Math.Max(_morphToLock, 0.75f);
         _spinVelocity = -0.13f;
-        _pulseColor = HologramTheme.Success;
+        _pulseColor = UnlockedGreen;
         _pulseRadius = 0.05f;
         _pulseAlpha = 1f;
         StatusSubtitle = $"Descifrando con {algorithmCode}...";
@@ -427,7 +433,7 @@ public sealed class HologramLockControl : Control
                 if (_stateTimer >= 1.15f && _morphToLock >= 0.99f)
                 {
                     _state = HologramState.Locked;
-                    _pulseColor = HologramTheme.HologramCyan;
+                    _pulseColor = LockedRed;
                     _pulseRadius = 0.08f;
                     _pulseAlpha = 1f;
                     StatusSubtitle = $"CIFRADO • LOCKED ({ActiveAlgorithmLabel})";
@@ -448,7 +454,7 @@ public sealed class HologramLockControl : Control
                 if (_stateTimer >= 1.1f && _shackleOpen >= 0.99f)
                 {
                     _state = HologramState.Unlocked;
-                    _pulseColor = HologramTheme.Success;
+                    _pulseColor = UnlockedGreen;
                     _pulseRadius = 0.08f;
                     _pulseAlpha = 1f;
                     StatusSubtitle = $"DESCIFRADO • UNLOCKED ({ActiveAlgorithmLabel})";
@@ -508,7 +514,10 @@ public sealed class HologramLockControl : Control
             g.DrawEllipse(pulsePen, cx - pr, cy - pr, pr * 2f, pr * 2f);
 
             float pr2 = pr * 0.72f;
-            using var pulsePen2 = new Pen(Color.FromArgb(alpha / 2, HologramTheme.HologramViolet), 1.5f);
+            Color secondaryPulse = (_state == HologramState.Encrypting || _state == HologramState.Locked)
+                ? LockedCrimson
+                : ((_state == HologramState.Decrypting || _state == HologramState.Unlocked) ? UnlockedEmerald : IdleBlue);
+            using var pulsePen2 = new Pen(Color.FromArgb(alpha / 2, secondaryPulse), 1.5f);
             g.DrawEllipse(pulsePen2, cx - pr2, cy - pr2, pr2 * 2f, pr2 * 2f);
         }
 
@@ -630,9 +639,9 @@ public sealed class HologramLockControl : Control
 
         Color centerCol = _state switch
         {
-            HologramState.Unlocked => Color.FromArgb(48, HologramTheme.Success),
-            HologramState.Locked => Color.FromArgb(55, HologramTheme.HologramCyan),
-            _ => Color.FromArgb(52, HologramTheme.AccentStart)
+            HologramState.Decrypting or HologramState.Unlocked => Color.FromArgb(55, UnlockedGreen),
+            HologramState.Encrypting or HologramState.Locked => Color.FromArgb(58, LockedRed),
+            _ => Color.FromArgb(55, IdleBlue)
         };
         pgb.CenterColor = centerCol;
         pgb.SurroundColors = new[] { Color.FromArgb(0, HologramTheme.BackgroundBase) };
@@ -652,12 +661,19 @@ public sealed class HologramLockControl : Control
             new(cx + rx * 1.15f, cy - scaleUnit * 1.05f),
             new(cx - rx * 1.15f, cy - scaleUnit * 1.05f)
         };
-        Color beamColor = _state == HologramState.Unlocked ? HologramTheme.Success : HologramTheme.HologramCyan;
+
+        (Color primaryBeam, Color secondaryBeam) = _state switch
+        {
+            HologramState.Decrypting or HologramState.Unlocked => (UnlockedGreen, UnlockedEmerald),
+            HologramState.Encrypting or HologramState.Locked => (LockedRed, LockedCrimson),
+            _ => (IdleCyan, IdleBlue)
+        };
+
         using (var beamBrush = new LinearGradientBrush(
             new PointF(cx, baseY),
             new PointF(cx, cy - scaleUnit),
-            Color.FromArgb(42, beamColor),
-            Color.FromArgb(0, HologramTheme.AccentStart)))
+            Color.FromArgb(44, primaryBeam),
+            Color.FromArgb(0, secondaryBeam)))
         {
             g.FillPolygon(beamBrush, cone);
         }
@@ -670,7 +686,7 @@ public sealed class HologramLockControl : Control
             float h = ry * 2f * factor;
             var rRect = new RectangleF(cx - w / 2f, baseY - h / 2f, w, h);
 
-            Color ringCol = ring == 1 ? HologramTheme.HologramViolet : beamColor;
+            Color ringCol = ring == 1 ? secondaryBeam : primaryBeam;
             int alpha = 180 - ring * 35;
 
             using var glowPen = new Pen(Color.FromArgb(alpha / 3, ringCol), 5f);
@@ -687,7 +703,7 @@ public sealed class HologramLockControl : Control
         }
 
         // Núcleo central del proyector
-        using var centerGlow = new SolidBrush(Color.FromArgb(90, beamColor));
+        using var centerGlow = new SolidBrush(Color.FromArgb(95, primaryBeam));
         g.FillEllipse(centerGlow, cx - rx * 0.28f, baseY - ry * 0.28f, rx * 0.56f, ry * 0.56f);
     }
 
@@ -706,11 +722,9 @@ public sealed class HologramLockControl : Control
 
         Color tagColor = _state switch
         {
-            HologramState.Unlocked => HologramTheme.Success,
-            HologramState.Locked => HologramTheme.HologramCyan,
-            HologramState.Encrypting => HologramTheme.AccentGlow,
-            HologramState.Decrypting => HologramTheme.HologramCyan,
-            _ => HologramTheme.HologramViolet
+            HologramState.Decrypting or HologramState.Unlocked => UnlockedGreen,
+            HologramState.Encrypting or HologramState.Locked => LockedRed,
+            _ => IdleCyan
         };
 
         Size stateMeasured = TextRenderer.MeasureText(g, stateTag, _hudBadgeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
@@ -740,17 +754,12 @@ public sealed class HologramLockControl : Control
 
         using (var path = HologramTheme.CreateRoundedPath(algRect, 14))
         using (var bg = new SolidBrush(Color.FromArgb(190, 21, 18, 38)))
-        using (var border = new Pen(Color.FromArgb(140, HologramTheme.AccentGlow), 1f))
+        using (var border = new Pen(Color.FromArgb(140, tagColor), 1f))
         {
             g.FillPath(bg, path);
             g.DrawPath(border, path);
         }
-        TextRenderer.DrawText(g, algText, _hudBadgeFont, algRect, HologramTheme.HologramCyan,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-
-        // Subtítulo inferior centrado con EndEllipsis
-        var subRect = new Rectangle(16, Height - 32, Math.Max(40, Width - 32), 24);
-        TextRenderer.DrawText(g, StatusSubtitle, _hudSubFont, subRect, HologramTheme.TextSecondary,
+        TextRenderer.DrawText(g, algText, _hudBadgeFont, algRect, tagColor,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 
@@ -758,29 +767,42 @@ public sealed class HologramLockControl : Control
     {
         if (p.IsAmbientSphere)
         {
-            int a = (int)(35 + depthNorm * 95);
-            return BlendColor(HologramTheme.HologramCyan, HologramTheme.HologramViolet, p.ColorMix, a);
+            int a = (int)(38 + depthNorm * 98);
+            return _state switch
+            {
+                HologramState.Decrypting or HologramState.Unlocked => BlendColor(UnlockedGreen, UnlockedEmerald, p.ColorMix, a),
+                HologramState.Encrypting or HologramState.Locked => BlendColor(LockedRed, LockedCrimson, p.ColorMix, a),
+                _ => BlendColor(IdleCyan, IdleBlue, p.ColorMix, a)
+            };
         }
 
-        int alpha = (int)(90 + depthNorm * 165);
+        int alpha = (int)(95 + depthNorm * 160);
 
         if (p.IsKeyhole)
-            return Color.FromArgb(Math.Min(255, alpha + 30), 220, 250, 255);
+        {
+            int khAlpha = Math.Min(255, alpha + 30);
+            return _state switch
+            {
+                HologramState.Decrypting or HologramState.Unlocked => Color.FromArgb(khAlpha, 220, 255, 235),
+                HologramState.Encrypting or HologramState.Locked => Color.FromArgb(khAlpha, 255, 225, 230),
+                _ => Color.FromArgb(khAlpha, 220, 250, 255)
+            };
+        }
 
         if (_state == HologramState.Unlocked || _state == HologramState.Decrypting)
         {
-            Color target = p.IsShackle ? HologramTheme.Success : HologramTheme.HologramCyan;
-            return BlendColor(target, HologramTheme.HologramViolet, p.ColorMix * 0.45f, alpha);
+            Color primary = p.IsShackle ? UnlockedGreen : UnlockedEmerald;
+            return BlendColor(primary, UnlockedGreen, p.ColorMix * 0.65f, alpha);
         }
 
         if (_state == HologramState.Locked || _state == HologramState.Encrypting)
         {
-            Color target = p.IsShackle ? HologramTheme.HologramCyan : HologramTheme.HologramViolet;
-            return BlendColor(target, HologramTheme.HologramCyan, 1f - p.ColorMix * 0.7f, alpha);
+            Color primary = p.IsShackle ? LockedRed : LockedCrimson;
+            return BlendColor(primary, LockedRed, 1f - p.ColorMix * 0.65f, alpha);
         }
 
-        // Idle cube: eléctrico azul cian + violeta neón
-        return BlendColor(HologramTheme.HologramCyan, HologramTheme.HologramViolet, p.ColorMix, alpha);
+        // Idle cube: gradiente en tonos azul eléctrico (#1E90FF) y cian (#00D2FF), sin mezcla violeta
+        return BlendColor(IdleCyan, IdleBlue, p.ColorMix, alpha);
     }
 
     private static Color BlendColor(Color a, Color b, float t, int alpha)
@@ -814,7 +836,6 @@ public sealed class HologramLockControl : Control
             _timer.Dispose();
             foreach (var f in _bitFonts) f.Dispose();
             _hudBadgeFont.Dispose();
-            _hudSubFont.Dispose();
         }
         base.Dispose(disposing);
     }
