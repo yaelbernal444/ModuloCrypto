@@ -24,14 +24,225 @@ public partial class FormDashboard
     private TextBox _txtSearchHistory = null!;
     private ComboBox _cmbFilterOrigin = null!;
 
-    // Red de Nodos (IP / TOFU / UDP 5099)
+    // Red de Nodos (IP Activa / TOFU / UDP 5099)
     private DataGridView _gridPeers = null!;
     private TextBox _txtEditPeerIp = null!;
     private TextBox _txtEditPeerPort = null!;
+    private Label _lblActiveIpEndpoint = null!;
+    private Label _lblActiveIpInterface = null!;
+    private ComboBox _cmbActiveAdapter = null!;
+    private bool _suppressAdapterComboEvent;
 
     // Ajustes
     private Label _lblSettingsDbStats = null!;
     private TextBox _txtSettingsCertInfo = null!;
+
+    /// <summary>
+    /// Crea el recuadro de IP Activa exclusivamente para la vista Red de Nodos.
+    /// </summary>
+    private GlassPanel CreateNetworkViewIpCardControl()
+    {
+        var ipCard = new GlassPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            MinimumSize = new Size(0, 56),
+            CornerRadius = 12,
+            NeonBorderGlow = true,
+            BorderColor = HologramTheme.HologramCyan,
+            FillColorTop = Color.FromArgb(24, 21, 44),
+            FillColorBottom = HologramTheme.PanelGlass,
+            Padding = new Padding(12, 8, 12, 8),
+            Margin = new Padding(0, 0, 0, 8)
+        };
+
+        var flow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = Color.Transparent,
+            Margin = new Padding(0)
+        };
+
+        var lblVersionBadge = new Label
+        {
+            Text = $" {_runtime.VersionBadgeText} ",
+            Font = new Font("Cascadia Mono", 8.8f, FontStyle.Bold),
+            ForeColor = Color.White,
+            BackColor = NodeRuntimeState.IsV2 ? HologramTheme.AccentStart : Color.FromArgb(65, 110, 215),
+            AutoSize = true,
+            Padding = new Padding(8, 5, 8, 5),
+            Margin = new Padding(0, 4, 12, 4),
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+
+        var lblCaption = new Label
+        {
+            Text = "MI IP ACTIVA:",
+            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
+            ForeColor = HologramTheme.TextSecondary,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 6, 4),
+            BackColor = Color.Transparent
+        };
+
+        _lblActiveIpEndpoint = new Label
+        {
+            Text = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}",
+            Font = new Font("Cascadia Mono", 12f, FontStyle.Bold),
+            ForeColor = HologramTheme.HologramCyan,
+            AutoSize = true,
+            Margin = new Padding(0, 3, 10, 4),
+            BackColor = Color.Transparent
+        };
+
+        _lblActiveIpInterface = new Label
+        {
+            Text = $"[{NodeRuntimeState.ActiveInterfaceName}]",
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
+            ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success,
+            AutoSize = true,
+            Margin = new Padding(0, 7, 12, 4),
+            BackColor = Color.Transparent
+        };
+
+        _cmbActiveAdapter = new ComboBox
+        {
+            Size = new Size(215, 28),
+            Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
+            Margin = new Padding(0, 4, 10, 4)
+        };
+        HologramTheme.StyleComboBox(_cmbActiveAdapter, HologramTheme.HologramCyan);
+        _cmbActiveAdapter.SelectedIndexChanged += async (_, _) =>
+        {
+            if (_suppressAdapterComboEvent) return;
+            if (_cmbActiveAdapter.SelectedItem is LocalNetworkEndpoint ep)
+            {
+                NetworkAddressService.SelectActiveEndpoint(ep.Ipv4Address);
+                RefreshActiveIpCardUi();
+                await _runtime.AnnouncePresenceAsync();
+            }
+        };
+
+        var btnCopyIp = new NeonButton
+        {
+            Text = "📋 Copiar IP",
+            Variant = NeonButtonVariant.Cyan,
+            CornerRadius = 8,
+            Margin = new Padding(0, 2, 8, 2)
+        };
+        btnCopyIp.FitToText(minWidth: 118, height: 32);
+        btnCopyIp.Click += async (_, _) =>
+        {
+            string epText = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
+            Clipboard.SetText(epText);
+            btnCopyIp.Text = "✓ Copiada";
+            btnCopyIp.Variant = NeonButtonVariant.Success;
+            btnCopyIp.FitToText(minWidth: 118, height: 32);
+            await Task.Delay(1300);
+            if (!btnCopyIp.IsDisposed)
+            {
+                btnCopyIp.Text = "📋 Copiar IP";
+                btnCopyIp.Variant = NeonButtonVariant.Cyan;
+                btnCopyIp.FitToText(minWidth: 118, height: 32);
+            }
+        };
+
+        var btnRefreshIp = new NeonButton
+        {
+            Text = "↻ Refrescar IP",
+            Variant = NeonButtonVariant.Secondary,
+            CornerRadius = 8,
+            Margin = new Padding(0, 2, 4, 2)
+        };
+        btnRefreshIp.FitToText(minWidth: 128, height: 32);
+        btnRefreshIp.Click += async (_, _) =>
+        {
+            btnRefreshIp.Enabled = false;
+            NetworkAddressService.RefreshRuntimePrimaryEndpoint();
+            RefreshActiveIpCardUi();
+            await _runtime.AnnouncePresenceAsync();
+            RefreshNetworkGrid();
+            btnRefreshIp.Enabled = true;
+        };
+
+        flow.Controls.AddRange(new Control[]
+        {
+            lblVersionBadge,
+            lblCaption,
+            _lblActiveIpEndpoint,
+            _lblActiveIpInterface,
+            _cmbActiveAdapter,
+            btnCopyIp,
+            btnRefreshIp
+        });
+
+        ipCard.Controls.Add(flow);
+        return ipCard;
+    }
+
+    private void RefreshActiveIpCardUi()
+    {
+        var endpoints = NetworkAddressService.GetAvailableIpv4Endpoints();
+        string endpointDisplay = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
+        string ifaceDisplay = NodeRuntimeState.IsLoopbackFallback
+            ? "[Sin red LAN]"
+            : $"[{NodeRuntimeState.ActiveInterfaceName} • Bcast {NodeRuntimeState.SubnetBroadcastAddress}]";
+
+        if (_lblActiveIpEndpoint != null)
+            _lblActiveIpEndpoint.Text = endpointDisplay;
+
+        if (_lblActiveIpInterface != null)
+        {
+            _lblActiveIpInterface.Text = ifaceDisplay;
+            _lblActiveIpInterface.ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success;
+        }
+
+        if (_cmbActiveAdapter != null)
+        {
+            _suppressAdapterComboEvent = true;
+            try
+            {
+                _cmbActiveAdapter.Items.Clear();
+                int selIdx = 0;
+                for (int i = 0; i < endpoints.Count; i++)
+                {
+                    _cmbActiveAdapter.Items.Add(endpoints[i]);
+                    if (string.Equals(endpoints[i].Ipv4Address, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase))
+                        selIdx = i;
+                }
+                if (_cmbActiveAdapter.Items.Count > 0)
+                    _cmbActiveAdapter.SelectedIndex = selIdx;
+                _cmbActiveAdapter.Visible = endpoints.Count > 1;
+            }
+            finally
+            {
+                _suppressAdapterComboEvent = false;
+            }
+        }
+
+        var selfPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+            string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase));
+        if (selfPeer != null)
+        {
+            selfPeer.IpAddress = NodeRuntimeState.LocalIpAddress;
+            selfPeer.Port = NodeRuntimeState.ApiPort;
+        }
+    }
+
+    private void HandleNetworkEndpointsChangedEvent(LocalNetworkEndpoint ep)
+    {
+        if (IsDisposed) return;
+        BeginInvoke(async () =>
+        {
+            RefreshActiveIpCardUi();
+            RefreshNetworkGrid();
+            RefreshTargetPeerCombo();
+            await _runtime.AnnouncePresenceAsync();
+        });
+    }
 
     private void BuildSolicitudesView()
     {
@@ -61,7 +272,7 @@ public partial class FormDashboard
         };
         var lblTitle = new Label
         {
-            Text = $"Bandeja de Solicitudes Entrantes (.ZIP v{NodeRuntimeState.ProtocolVersion}) — {NodeRuntimeState.CurrentNodeId}",
+            Text = $"Solicitudes Entrantes (.ZIP v{NodeRuntimeState.ProtocolVersion}) — {NodeRuntimeState.CurrentNodeId}",
             Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Top,
@@ -69,7 +280,7 @@ public partial class FormDashboard
             BackColor = HologramTheme.PanelGlass
         };
         string subInbox = NodeRuntimeState.IsV2
-            ? "Validación estricta de 14 pasos: 3 archivos planos, Anti-ZIP-Bomb, RSA-PSS-SHA256 (11 campos), TOFU y Anti-Replay"
+            ? "Validación de 14 pasos: 3 archivos planos, Anti-ZIP-Bomb, RSA-PSS-SHA256 (11 campos), TOFU y Anti-Replay"
             : "Modo Híbrido v1.0: soporte de 5 archivos (manifest.json, datos.enc, payload.bin, certificado.pem, root_cert.cer) y descifrado remoto";
 
         var lblSub = new Label
@@ -110,11 +321,11 @@ public partial class FormDashboard
 
         var btnForward = new NeonButton
         {
-            Text = NodeRuntimeState.IsV2 ? "↪ Reenviar v2.0 (9.6)" : "↪ Reenviar .ZIP v1.0",
+            Text = NodeRuntimeState.IsV2 ? "↪ Reenviar v2.0" : "↪ Reenviar v1.0",
             Variant = NeonButtonVariant.Primary,
             Margin = new Padding(0, 2, 8, 2)
         };
-        btnForward.FitToText(minWidth: 155, height: 38);
+        btnForward.FitToText(minWidth: 140, height: 38);
         btnForward.Click += async (_, _) =>
         {
             btnForward.Enabled = false;
@@ -351,7 +562,6 @@ public partial class FormDashboard
                     pubJson = localMatch.ParametrosPublicosJson;
             }
 
-            // Si no tenemos la llave localmente pero el nodo productor está online en v2.0, podemos intentar /api/crypto/inverse o pedir clave manual
             if (string.IsNullOrWhiteSpace(secretKey) &&
                 !string.Equals(parsed.Manifest.ProducerNode, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
             {
@@ -727,7 +937,7 @@ public partial class FormDashboard
 
         var lblTitle = new Label
         {
-            Text = $"Consultas e Historial de Registros Cifrados ({NodeRuntimeState.CurrentNodeId} • v{NodeRuntimeState.ProtocolVersion})",
+            Text = $"Consultas de Registros ({NodeRuntimeState.CurrentNodeId} • v{NodeRuntimeState.ProtocolVersion})",
             Font = new Font("Segoe UI", 14f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Top,
@@ -758,7 +968,7 @@ public partial class FormDashboard
             Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbFilterOrigin);
-        _cmbFilterOrigin.Items.AddRange(new object[] { "Todos", "Local", "Relay", "Recibido" });
+        _cmbFilterOrigin.Items.AddRange(new object[] { "Todos", "Local", "Relay", "Recibido", "Resultado" });
         _cmbFilterOrigin.SelectedIndex = 0;
         _cmbFilterOrigin.SelectedIndexChanged += (_, _) => RefreshConsultasGrid();
 
@@ -861,7 +1071,7 @@ public partial class FormDashboard
         _currentBytes = Convert.FromBase64String(r.BytesCifrados);
         _currentFileName = r.NombreArchivo;
         _currentExtension = r.Extension;
-        _isShowingEncrypted = true;
+        _isShowingEncrypted = !string.Equals(r.Origen, "Resultado", StringComparison.OrdinalIgnoreCase);
         _binarySummaryReport = null;
         _lastSavedDecryptedPath = null;
 
@@ -870,7 +1080,11 @@ public partial class FormDashboard
 
         SelectAlgorithmInCombo(r.AlgoritmoCodigo);
         UpdateMetadataPanel(r, !string.IsNullOrWhiteSpace(r.FirmaRaizBase64), !string.IsNullOrWhiteSpace(r.FirmaRaizBase64));
-        _hologram.TriggerEncryptAnimation(r.AlgoritmoCodigo);
+
+        if (_isShowingEncrypted)
+            _hologram.TriggerEncryptAnimation(r.AlgoritmoCodigo);
+        else
+            _hologram.TriggerDecryptAnimation(r.AlgoritmoCodigo);
 
         if (r.AlgoritmoCodigo == "LSBSTEGO") SetViewerMode("IMG");
         else RenderCurrentBytesInViewer();
@@ -899,8 +1113,8 @@ public partial class FormDashboard
 
         var card = new GlassPanel { Dock = DockStyle.Fill, CornerRadius = 18, Padding = new Padding(18) };
 
-        // Recuadro Dinámico de IP Local replicado en la vista Red de Nodos
-        var networkViewIpCard = CreateActiveIpCardControl();
+        // Recuadro de IP Activa ubicado exclusivamente dentro de Red de Nodos
+        var networkViewIpCard = CreateNetworkViewIpCardControl();
 
         var header = new TableLayoutPanel
         {
@@ -908,7 +1122,7 @@ public partial class FormDashboard
             AutoSize = true,
             ColumnCount = 1,
             RowCount = 2,
-            Padding = new Padding(0, 8, 0, 0),
+            Padding = new Padding(0, 6, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
@@ -926,8 +1140,8 @@ public partial class FormDashboard
             : "Directorio de Nodos v1.0 (Escaneo LAN :5000 • Localhost 5000–5008)";
 
         string netSub = NodeRuntimeState.IsV2
-            ? "Beacons CC-BEACON cada 30s (timeout 90s), escaneo HTTP de respaldo, fijado TOFU y diagnóstico de conectividad de 3 capas"
-            : "Interoperabilidad dual ModuloCrypto v1.0 / CentroCiberseguridad v1 y diagnóstico de conectividad de 3 capas (ICMP + TCP + HTTP)";
+            ? "Beacons CC-BEACON cada 30s, escaneo HTTP de respaldo, fijado TOFU y diagnóstico de conectividad de 3 capas"
+            : "Interoperabilidad dual ModuloCrypto v1.0 / CentroCiberseguridad v1 y diagnóstico de conectividad de 3 capas";
 
         var lblTitle = new Label
         {
@@ -971,7 +1185,7 @@ public partial class FormDashboard
         btnTestConn.Click += async (_, _) =>
         {
             btnTestConn.Enabled = false;
-            btnTestConn.Text = "Diagnosticando (ICMP + TCP + HTTP)...";
+            btnTestConn.Text = "Diagnosticando...";
             btnTestConn.FitToText(minWidth: 235, height: 38);
             try
             {
@@ -1215,12 +1429,12 @@ public partial class FormDashboard
             string colName = _gridPeers.Columns[e.ColumnIndex].Name;
             if (colName == "Estado" && e.Value is string s)
             {
-                e.CellStyle!.ForeColor = s.Contains("BLOQUEADO") ? HologramTheme.Danger :
+                e.CellStyle!.ForeColor = s.Contains("BLOQUEADO") || s.Contains("CAMBIADA") ? HologramTheme.Danger :
                                          s.Contains("Online") ? HologramTheme.Success : HologramTheme.TextSecondary;
             }
             else if (colName == "ConfianzaTOFU" && e.Value is string tofu)
             {
-                e.CellStyle!.ForeColor = tofu.Contains("CAMBIO") ? HologramTheme.Danger :
+                e.CellStyle!.ForeColor = tofu.Contains("CAMBIADA") ? HologramTheme.Danger :
                                          tofu.Contains("Fijada") || tofu.Contains("Activa") ? HologramTheme.Success : HologramTheme.Warning;
             }
         };
@@ -1481,7 +1695,7 @@ public partial class FormDashboard
 
         var btnTestIdle = new NeonButton { Text = "1. Estado Reposo (Cubo Binario 3D)", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 0, 0, 8) };
         btnTestIdle.FitToText(minWidth: 340, height: 40);
-        btnTestIdle.Click += (_, _) => { _hologram.SetIdle("Prueba Manual • Cubo Binario 3D"); SwitchView("dashboard"); };
+        btnTestIdle.Click += (_, _) => { _hologram.SetIdle(string.Empty); SwitchView("dashboard"); };
 
         var btnTestLock = new NeonButton { Text = "2. Estado Cifrar (Candado Cerrado)", Variant = NeonButtonVariant.Primary, Margin = new Padding(0, 0, 0, 8) };
         btnTestLock.FitToText(minWidth: 340, height: 40);

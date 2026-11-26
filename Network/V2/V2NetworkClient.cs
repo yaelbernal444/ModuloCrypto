@@ -295,7 +295,8 @@ public static class V2NetworkClient
     }
 
     /// <summary>
-    /// Invoca POST /api/crypto/inverse en un nodo proveedor v2.0 y abre el sobre CC-ENV-1 de resultado.enc.
+    /// Invoca POST /api/crypto/inverse en un nodo proveedor v2.0 (soportando respuesta directa .zip o job 202 Accepted)
+    /// y abre el sobre CC-ENV-1 de resultado.enc con la clave privada local.
     /// </summary>
     public static async Task<(bool Success, byte[]? DecryptedPlainBytes, V2ParsedZipPacket? ResultZip, string ErrorMessage)> CallRemoteInverseAsync(
         PeerNode providerPeer,
@@ -304,12 +305,26 @@ public static class V2NetworkClient
         byte[] cipherOrPackageBytes,
         Dictionary<string, string> publicParameters,
         CcHybridEnvelope? secretEnvelope = null,
-        string? keyId = null)
+        string? keyId = null,
+        byte[]? rawSecretBytesToSeal = null)
     {
         if (providerPeer.HasThumbprintMismatch)
             return (false, null, null, $"El nodo {providerPeer.NodeId} está bloqueado por cambio de huella TOFU.");
 
         string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+
+        if (secretEnvelope == null && rawSecretBytesToSeal is { Length: > 0 })
+        {
+            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+                await FetchAndValidatePeerCertificateAsync(providerPeer);
+
+            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+                return (false, null, null, $"No se pudo obtener el certificado X.509 de {providerPeer.NodeId} para sellar el sobre CC-ENV-1.");
+
+            using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
+            secretEnvelope = V2EnvelopeService.Seal(rawSecretBytesToSeal, providerCert, providerPeer.NodeId, packetId);
+        }
+
         var invReq = new V2CryptoInverseRequest
         {
             RequestId = requestId,
@@ -349,7 +364,25 @@ public static class V2NetworkClient
             return (false, null, null, $"HTTP {(int)resp.StatusCode}: {errBody}");
         }
 
-        byte[] resultZipBytes = await resp.Content.ReadAsByteArrayAsync();
+        byte[] resultZipBytes;
+        if ((int)resp.StatusCode == 202)
+        {
+            string jobJson = await resp.Content.ReadAsStringAsync();
+            var jobAccepted = JsonSerializer.Deserialize<V2JobAcceptedResponse>(jobJson, JsonOpts);
+            if (jobAccepted == null || string.IsNullOrWhiteSpace(jobAccepted.JobId))
+                return (false, null, null, "El proveedor devolvió 202 Accepted sin jobId válido.");
+
+            var (pollOk, polledBytes, pollErr) = await PollJobResultZipAsync(providerPeer, jobAccepted.JobId, requestId);
+            if (!pollOk || polledBytes == null)
+                return (false, null, null, pollErr);
+
+            resultZipBytes = polledBytes;
+        }
+        else
+        {
+            resultZipBytes = await resp.Content.ReadAsByteArrayAsync();
+        }
+
         string tempResZip = Path.Combine(Path.GetTempPath(), $"RES_recv_{Guid.NewGuid():N}.zip");
         try
         {
@@ -366,6 +399,52 @@ public static class V2NetworkClient
         {
             try { if (File.Exists(tempResZip)) File.Delete(tempResZip); } catch { }
         }
+    }
+
+    private static async Task<(bool Success, byte[]? ResultBytes, string ErrorMessage)> PollJobResultZipAsync(
+        PeerNode providerPeer,
+        string jobId,
+        string requestId)
+    {
+        string statusUrl = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/jobs/{jobId}";
+        string resultUrl = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/jobs/{jobId}/result";
+
+        for (int attempt = 0; attempt < 15; attempt++)
+        {
+            await Task.Delay(1500);
+
+            using var statusReq = new HttpRequestMessage(HttpMethod.Get, statusUrl);
+            AddStandardV2Headers(statusReq, requestId);
+
+            var statusResp = await Http.SendAsync(statusReq);
+            if (!statusResp.IsSuccessStatusCode)
+            {
+                string err = await statusResp.Content.ReadAsStringAsync();
+                return (false, null, $"Error consultando estado del job {jobId}: {err}");
+            }
+
+            string body = await statusResp.Content.ReadAsStringAsync();
+            var statusDto = JsonSerializer.Deserialize<V2JobStatusResponse>(body, JsonOpts);
+            if (statusDto == null) continue;
+
+            if (string.Equals(statusDto.Status, "failed", StringComparison.OrdinalIgnoreCase))
+                return (false, null, $"El trabajo asíncrono {jobId} falló ({statusDto.ErrorCode}): {statusDto.ErrorDetail}");
+
+            if (string.Equals(statusDto.Status, "completed", StringComparison.OrdinalIgnoreCase))
+            {
+                using var resReq = new HttpRequestMessage(HttpMethod.Get, resultUrl);
+                AddStandardV2Headers(resReq, requestId);
+                var resResp = await Http.SendAsync(resReq);
+                if (!resResp.IsSuccessStatusCode)
+                {
+                    string err = await resResp.Content.ReadAsStringAsync();
+                    return (false, null, $"Error descargando resultado del job {jobId}: {err}");
+                }
+                return (true, await resResp.Content.ReadAsByteArrayAsync(), "OK");
+            }
+        }
+
+        return (false, null, $"Tiempo de espera agotado sondeando el trabajo asíncrono {jobId}.");
     }
 
     public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5001, int endPort = 5020)

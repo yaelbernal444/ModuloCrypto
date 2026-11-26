@@ -88,6 +88,9 @@ public sealed class HologramLockControl : Control
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string StatusSubtitle { get; set; } = "Núcleo Holográfico Listo";
 
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool ShowHud { get; set; } = true;
+
     public HologramState CurrentState => _state;
 
     public HologramLockControl()
@@ -611,7 +614,10 @@ public sealed class HologramLockControl : Control
         }
 
         // 6. HUD Superior / Inferior del Holograma
-        DrawHologramHud(g);
+        if (ShowHud)
+        {
+            DrawHologramHud(g);
+        }
     }
 
     private void DrawAmbientBackdrop(Graphics g, float cx, float cy, float minDim)

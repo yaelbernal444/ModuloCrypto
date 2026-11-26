@@ -51,12 +51,12 @@ public sealed class FormLogin : Form
     public FormLogin(ProtocolVersionMode initialVersion = ProtocolVersionMode.V2, int initialTeam = 1)
     {
         SelectedProtocolVersion = initialVersion;
-        SelectedTeamNumber = Math.Clamp(initialTeam, 1, 99);
+        SelectedTeamNumber = Math.Clamp(initialTeam, 1, 8);
 
-        Text = "ModuloCrypto — Inicio de Sesión (Arquitectura Dual v1.0 / v2.0)";
+        Text = "ModuloCrypto — Iniciar Sesión";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1060, 720);
+        MinimumSize = new Size(1040, 700);
         BackColor = HologramTheme.BackgroundBase;
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
@@ -66,7 +66,7 @@ public sealed class FormLogin : Form
 
         _mainCard = new GlassPanel
         {
-            Size = new Size(960, 600),
+            Size = new Size(940, 560),
             CornerRadius = 22,
             NeonBorderGlow = true,
             BorderColor = Color.FromArgb(115, HologramTheme.AccentGlow),
@@ -76,7 +76,7 @@ public sealed class FormLogin : Form
         };
         Controls.Add(_mainCard);
 
-        // Panel Izquierdo: Identidad Visual + Holograma Binario en Vivo
+        // Panel Izquierdo: Identidad Visual + Holograma Binario en Vivo (sin HUD redundante)
         var leftPanel = new Panel
         {
             Dock = DockStyle.Left,
@@ -110,15 +110,14 @@ public sealed class FormLogin : Form
         _previewHologram = new HologramLockControl
         {
             Dock = DockStyle.Fill,
-            ActiveAlgorithmLabel = "EQ01",
-            StatusSubtitle = "Núcleo Criptográfico Holográfico • Listo"
+            ShowHud = false
         };
 
         leftPanel.Controls.Add(_previewHologram);
         leftPanel.Controls.Add(lblTagline);
         leftPanel.Controls.Add(lblBrand);
 
-        // Panel Derecho: Formulario Limpio con Selector de Versión (v1.0 / v2.0) + Equipo (1..99)
+        // Panel Derecho: Formulario Limpio con Selector de Versión (Versión 1.0 / Versión 2.0) y Equipo (EQ01..EQ08)
         var rightPanel = new Panel
         {
             Dock = DockStyle.Fill,
@@ -132,7 +131,7 @@ public sealed class FormLogin : Form
             Font = new Font("Segoe UI", 20f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Location = new Point(44, 30),
-            Size = new Size(415, 44),
+            Size = new Size(395, 44),
             AutoEllipsis = false
         };
 
@@ -142,15 +141,15 @@ public sealed class FormLogin : Form
             Font = new Font("Segoe UI", 10.5f, FontStyle.Regular),
             ForeColor = HologramTheme.TextSecondary,
             Location = new Point(44, 76),
-            Size = new Size(415, 26),
+            Size = new Size(395, 26),
             AutoEllipsis = false
         };
 
-        var lblUser = CreateFieldLabel("USUARIO", 44, 118, 415);
+        var lblUser = CreateFieldLabel("USUARIO", 44, 118, 395);
         _txtUsername = new TextBox
         {
             Location = new Point(44, 144),
-            Size = new Size(415, 34),
+            Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -159,11 +158,11 @@ public sealed class FormLogin : Form
             PlaceholderText = "Ingresa tu usuario"
         };
 
-        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 192, 415);
+        var lblPass = CreateFieldLabel("CONTRASEÑA", 44, 192, 395);
         _txtPassword = new TextBox
         {
             Location = new Point(44, 218),
-            Size = new Size(415, 34),
+            Size = new Size(395, 34),
             BackColor = HologramTheme.PanelInput,
             ForeColor = HologramTheme.TextPrimary,
             BorderStyle = BorderStyle.FixedSingle,
@@ -173,26 +172,26 @@ public sealed class FormLogin : Form
             PlaceholderText = "Ingresa tu contraseña"
         };
 
-        var lblProto = CreateFieldLabel("VERSIÓN DE PROTOCOLO", 44, 268, 300);
+        var lblProto = CreateFieldLabel("VERSIÓN DE PROTOCOLO", 44, 268, 255);
         _cmbProtocolVersion = new ComboBox
         {
             Location = new Point(44, 294),
-            Size = new Size(305, 34),
-            Font = new Font("Segoe UI", 9.2f, FontStyle.Bold)
+            Size = new Size(265, 34),
+            Font = new Font("Segoe UI", 9.6f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbProtocolVersion, HologramTheme.HologramCyan);
-        _cmbProtocolVersion.Items.Add("Versión 1.0 — Legado ModuloCrypto (NODO-01 • :5000)");
-        _cmbProtocolVersion.Items.Add("Versión 2.0 — Estándar Interoperable (EQ01 • :5001 + UDP 5099)");
+        _cmbProtocolVersion.Items.Add("Versión 1.0");
+        _cmbProtocolVersion.Items.Add("Versión 2.0");
 
-        _lblTeamCaption = CreateFieldLabel("EQUIPO", 359, 268, 100);
+        _lblTeamCaption = CreateFieldLabel("EQUIPO", 323, 268, 116);
         _cmbTeamNumber = new ComboBox
         {
-            Location = new Point(359, 294),
-            Size = new Size(100, 34),
-            Font = new Font("Cascadia Mono", 9.2f, FontStyle.Bold)
+            Location = new Point(323, 294),
+            Size = new Size(116, 34),
+            Font = new Font("Cascadia Mono", 9.6f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbTeamNumber, HologramTheme.HologramViolet);
-        for (int t = 1; t <= 99; t++)
+        for (int t = 1; t <= 8; t++)
         {
             _cmbTeamNumber.Items.Add($"EQ{t:D2}");
         }
@@ -208,7 +207,7 @@ public sealed class FormLogin : Form
             Font = new Font("Segoe UI", 9.2f),
             ForeColor = HologramTheme.Danger,
             Location = new Point(44, 340),
-            Size = new Size(415, 36)
+            Size = new Size(395, 34)
         };
 
         var btnLogin = new NeonButton
@@ -217,7 +216,7 @@ public sealed class FormLogin : Form
             Variant = NeonButtonVariant.Primary,
             AutoFitWidth = false,
             Location = new Point(44, 386),
-            Size = new Size(415, 48),
+            Size = new Size(395, 48),
             Font = new Font("Segoe UI", 10.2f, FontStyle.Bold)
         };
         btnLogin.Click += (_, _) => HandleLogin();
@@ -228,20 +227,10 @@ public sealed class FormLogin : Form
             Variant = NeonButtonVariant.Secondary,
             AutoFitWidth = false,
             Location = new Point(44, 448),
-            Size = new Size(415, 46),
+            Size = new Size(395, 46),
             Font = new Font("Segoe UI", 9.8f, FontStyle.Bold)
         };
         btnRegister.Click += (_, _) => OpenRegisterModal();
-
-        var lblIpPreview = new Label
-        {
-            Text = $"IP Local Detectada: {NodeRuntimeState.LocalIpAddress} ({NodeRuntimeState.ActiveInterfaceName})",
-            Font = new Font("Cascadia Mono", 8.5f, FontStyle.Bold),
-            ForeColor = HologramTheme.HologramCyan,
-            Location = new Point(44, 514),
-            Size = new Size(415, 24),
-            TextAlign = ContentAlignment.MiddleCenter
-        };
 
         rightPanel.Controls.AddRange(new Control[]
         {
@@ -251,8 +240,7 @@ public sealed class FormLogin : Form
             lblProto, _cmbProtocolVersion,
             _lblTeamCaption, _cmbTeamNumber,
             _lblFeedback,
-            btnLogin, btnRegister,
-            lblIpPreview
+            btnLogin, btnRegister
         });
 
         _mainCard.Controls.Add(rightPanel);
@@ -285,24 +273,11 @@ public sealed class FormLogin : Form
     {
         bool isV2 = _cmbProtocolVersion.SelectedIndex == 1;
         SelectedProtocolVersion = isV2 ? ProtocolVersionMode.V2 : ProtocolVersionMode.V1;
-        SelectedTeamNumber = Math.Clamp(_cmbTeamNumber.SelectedIndex + 1, 1, 99);
+        SelectedTeamNumber = isV2 ? Math.Clamp(_cmbTeamNumber.SelectedIndex + 1, 1, 8) : 1;
 
         _lblTeamCaption.Visible = isV2;
         _cmbTeamNumber.Visible = isV2;
-        _cmbProtocolVersion.Width = isV2 ? 305 : 415;
-
-        if (isV2)
-        {
-            string eqId = $"EQ{SelectedTeamNumber:D2}";
-            int port = 5000 + SelectedTeamNumber;
-            _previewHologram.ActiveAlgorithmLabel = eqId;
-            _previewHologram.StatusSubtitle = $"Estándar v2.0 • {eqId} (:{port} + UDP 5099)";
-        }
-        else
-        {
-            _previewHologram.ActiveAlgorithmLabel = "NODO-01";
-            _previewHologram.StatusSubtitle = "Versión 1.0 Legado • NODO-01 (:5000)";
-        }
+        _cmbProtocolVersion.Width = isV2 ? 265 : 395;
     }
 
     private static Label CreateFieldLabel(string text, int x, int y, int width) => new()

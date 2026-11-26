@@ -51,12 +51,6 @@ public partial class FormDashboard : Form
     private StatusPill _pillSqlite = null!;
     private StatusPill _pillCert = null!;
 
-    // Recuadros dinámicos de IP local (Topbar + Red de Nodos)
-    private readonly List<Label> _ipEndpointLabels = new();
-    private readonly List<Label> _ipInterfaceBadges = new();
-    private readonly List<ComboBox> _ipAdapterCombos = new();
-    private bool _suppressAdapterComboEvent;
-
     // Dashboard / Crypto Stage Controls
     private HologramLockControl _hologram = null!;
     private Label _lblAlgDesc = null!;
@@ -111,16 +105,12 @@ public partial class FormDashboard : Form
         _currentBytes = Encoding.UTF8.GetBytes(
             NodeRuntimeState.IsV2
                 ? $"Mensaje confidencial ModuloCrypto — Estándar de Comunicación v2.0 ({NodeRuntimeState.CurrentNodeId})."
-                : $"Mensaje confidencial ModuloCrypto — Versión 1.0 Legado ({NodeRuntimeState.CurrentNodeId}).");
+                : $"Mensaje confidencial ModuloCrypto — Versión 1.0 ({NodeRuntimeState.CurrentNodeId}).");
 
-        string protoDesc = NodeRuntimeState.IsV2
-            ? $"Estándar v2.0 • HTTP :{NodeRuntimeState.ApiPort} • UDP :{NodeRuntimeState.UdpDiscoveryPort}"
-            : $"Versión 1.0 Legado • HTTP :{NodeRuntimeState.ApiPort}";
-
-        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} ({protoDesc})";
+        Text = $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId} (v{NodeRuntimeState.ProtocolVersion})";
         WindowState = FormWindowState.Maximized;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1240, 760);
+        MinimumSize = new Size(1240, 740);
         BackColor = HologramTheme.BackgroundBase;
         ForeColor = HologramTheme.TextPrimary;
         DoubleBuffered = true;
@@ -135,7 +125,7 @@ public partial class FormDashboard : Form
         BuildNetworkView();
         BuildSettingsView();
 
-        RefreshActiveIpCardsUi();
+        RefreshActiveIpCardUi();
         UpdateSqlitePillState();
         SwitchView("dashboard");
         RefreshPendingSolicitudesBadge();
@@ -173,221 +163,6 @@ public partial class FormDashboard : Form
         };
     }
 
-    /// <summary>
-    /// Crea un recuadro destacado (tarjeta glass con borde cian neón) que muestra el Badge de Versión,
-    /// Mi IP / Endpoint activo en Cascadia Mono grande (#00D2FF), interfaz activa, selector de adaptador,
-    /// botón [📋 Copiar IP] y botón [↻ Refrescar IP].
-    /// </summary>
-    private GlassPanel CreateActiveIpCardControl()
-    {
-        var ipCard = new GlassPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            MinimumSize = new Size(0, 56),
-            CornerRadius = 12,
-            NeonBorderGlow = true,
-            BorderColor = HologramTheme.HologramCyan,
-            FillColorTop = Color.FromArgb(24, 21, 44),
-            FillColorBottom = HologramTheme.PanelGlass,
-            Padding = new Padding(12, 8, 12, 8),
-            Margin = new Padding(0, 4, 0, 4)
-        };
-
-        var flow = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            WrapContents = true,
-            FlowDirection = FlowDirection.LeftToRight,
-            BackColor = Color.Transparent,
-            Margin = new Padding(0)
-        };
-
-        var lblVersionBadge = new Label
-        {
-            Text = $" {(_runtime.VersionBadgeText)} ",
-            Font = new Font("Cascadia Mono", 8.8f, FontStyle.Bold),
-            ForeColor = Color.White,
-            BackColor = NodeRuntimeState.IsV2 ? HologramTheme.AccentStart : Color.FromArgb(65, 110, 215),
-            AutoSize = true,
-            Padding = new Padding(8, 5, 8, 5),
-            Margin = new Padding(0, 4, 12, 4),
-            TextAlign = ContentAlignment.MiddleCenter
-        };
-
-        var lblCaption = new Label
-        {
-            Text = "MI IP ACTIVA:",
-            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
-            ForeColor = HologramTheme.TextSecondary,
-            AutoSize = true,
-            Margin = new Padding(0, 8, 6, 4),
-            BackColor = Color.Transparent
-        };
-
-        var lblIpEndpoint = new Label
-        {
-            Text = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}",
-            Font = new Font("Cascadia Mono", 12f, FontStyle.Bold),
-            ForeColor = HologramTheme.HologramCyan,
-            AutoSize = true,
-            Margin = new Padding(0, 3, 10, 4),
-            BackColor = Color.Transparent
-        };
-        _ipEndpointLabels.Add(lblIpEndpoint);
-
-        var lblInterfaceBadge = new Label
-        {
-            Text = $"[{NodeRuntimeState.ActiveInterfaceName}]",
-            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
-            ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success,
-            AutoSize = true,
-            Margin = new Padding(0, 7, 12, 4),
-            BackColor = Color.Transparent
-        };
-        _ipInterfaceBadges.Add(lblInterfaceBadge);
-
-        var cmbAdapter = new ComboBox
-        {
-            Size = new Size(215, 28),
-            Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
-            Margin = new Padding(0, 4, 10, 4)
-        };
-        HologramTheme.StyleComboBox(cmbAdapter, HologramTheme.HologramCyan);
-        cmbAdapter.SelectedIndexChanged += async (_, _) =>
-        {
-            if (_suppressAdapterComboEvent) return;
-            if (cmbAdapter.SelectedItem is LocalNetworkEndpoint ep)
-            {
-                NetworkAddressService.SelectActiveEndpoint(ep.Ipv4Address);
-                RefreshActiveIpCardsUi();
-                await _runtime.AnnouncePresenceAsync();
-            }
-        };
-        _ipAdapterCombos.Add(cmbAdapter);
-
-        var btnCopyIp = new NeonButton
-        {
-            Text = "📋 Copiar IP",
-            Variant = NeonButtonVariant.Cyan,
-            CornerRadius = 8,
-            Margin = new Padding(0, 2, 8, 2)
-        };
-        btnCopyIp.FitToText(minWidth: 118, height: 32);
-        btnCopyIp.Click += async (_, _) =>
-        {
-            string epText = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
-            Clipboard.SetText(epText);
-            btnCopyIp.Text = "✓ Copiada";
-            btnCopyIp.Variant = NeonButtonVariant.Success;
-            btnCopyIp.FitToText(minWidth: 118, height: 32);
-            await Task.Delay(1300);
-            if (!btnCopyIp.IsDisposed)
-            {
-                btnCopyIp.Text = "📋 Copiar IP";
-                btnCopyIp.Variant = NeonButtonVariant.Cyan;
-                btnCopyIp.FitToText(minWidth: 118, height: 32);
-            }
-        };
-
-        var btnRefreshIp = new NeonButton
-        {
-            Text = "↻ Refrescar IP",
-            Variant = NeonButtonVariant.Secondary,
-            CornerRadius = 8,
-            Margin = new Padding(0, 2, 4, 2)
-        };
-        btnRefreshIp.FitToText(minWidth: 128, height: 32);
-        btnRefreshIp.Click += async (_, _) =>
-        {
-            btnRefreshIp.Enabled = false;
-            NetworkAddressService.RefreshRuntimePrimaryEndpoint();
-            RefreshActiveIpCardsUi();
-            await _runtime.AnnouncePresenceAsync();
-            RefreshNetworkGrid();
-            btnRefreshIp.Enabled = true;
-        };
-
-        flow.Controls.AddRange(new Control[]
-        {
-            lblVersionBadge,
-            lblCaption,
-            lblIpEndpoint,
-            lblInterfaceBadge,
-            cmbAdapter,
-            btnCopyIp,
-            btnRefreshIp
-        });
-
-        ipCard.Controls.Add(flow);
-        return ipCard;
-    }
-
-    private void RefreshActiveIpCardsUi()
-    {
-        var endpoints = NetworkAddressService.GetAvailableIpv4Endpoints();
-        string endpointDisplay = $"{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}";
-        string ifaceDisplay = NodeRuntimeState.IsLoopbackFallback
-            ? "[Sin red LAN]"
-            : $"[{NodeRuntimeState.ActiveInterfaceName} • Bcast {NodeRuntimeState.SubnetBroadcastAddress}]";
-
-        foreach (var lbl in _ipEndpointLabels)
-        {
-            lbl.Text = endpointDisplay;
-        }
-
-        foreach (var badge in _ipInterfaceBadges)
-        {
-            badge.Text = ifaceDisplay;
-            badge.ForeColor = NodeRuntimeState.IsLoopbackFallback ? HologramTheme.Warning : HologramTheme.Success;
-        }
-
-        _suppressAdapterComboEvent = true;
-        try
-        {
-            foreach (var cmb in _ipAdapterCombos)
-            {
-                cmb.Items.Clear();
-                int selIdx = 0;
-                for (int i = 0; i < endpoints.Count; i++)
-                {
-                    cmb.Items.Add(endpoints[i]);
-                    if (string.Equals(endpoints[i].Ipv4Address, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase))
-                        selIdx = i;
-                }
-                if (cmb.Items.Count > 0)
-                    cmb.SelectedIndex = selIdx;
-                cmb.Visible = endpoints.Count > 1;
-            }
-        }
-        finally
-        {
-            _suppressAdapterComboEvent = false;
-        }
-
-        // Actualizar también el nodo propio en NetworkPeers
-        var selfPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
-            string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase));
-        if (selfPeer != null)
-        {
-            selfPeer.IpAddress = NodeRuntimeState.LocalIpAddress;
-            selfPeer.Port = NodeRuntimeState.ApiPort;
-        }
-    }
-
-    private void HandleNetworkEndpointsChangedEvent(LocalNetworkEndpoint ep)
-    {
-        if (IsDisposed) return;
-        BeginInvoke(async () =>
-        {
-            RefreshActiveIpCardsUi();
-            RefreshNetworkGrid();
-            RefreshTargetPeerCombo();
-            await _runtime.AnnouncePresenceAsync();
-        });
-    }
-
     private void UpdateSqlitePillState()
     {
         if (_pillSqlite == null) return;
@@ -399,7 +174,7 @@ public partial class FormDashboard : Form
 
     private void BuildShellLayout()
     {
-        // 1. Sidebar Izquierdo (274 px de ancho para holgura total en High-DPI)
+        // 1. Sidebar Izquierdo (274 px de ancho)
         var sidebar = new Panel
         {
             Dock = DockStyle.Left,
@@ -436,9 +211,7 @@ public partial class FormDashboard : Form
                 new Rectangle(62, 18, 200, 26), HologramTheme.TextPrimary,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
 
-            string subLabel = NodeRuntimeState.IsV2
-                ? $"ESTÁNDAR v2.0 • {NodeRuntimeState.CurrentNodeId}"
-                : $"VERSIÓN 1.0 • {NodeRuntimeState.CurrentNodeId}";
+            string subLabel = $"{NodeRuntimeState.CurrentNodeId} • v{NodeRuntimeState.ProtocolVersion}";
 
             TextRenderer.DrawText(g, subLabel, _logoSubFont,
                 new Rectangle(62, 45, 200, 18), HologramTheme.HologramCyan,
@@ -448,11 +221,14 @@ public partial class FormDashboard : Form
             g.DrawLine(sepPen, 16, logoPanel.Height - 1, logoPanel.Width - 16, logoPanel.Height - 1);
         };
 
-        // Tarjeta de Perfil Inferior
+        // Tarjeta de Perfil Inferior simplificada a 3 elementos exactos:
+        // 1. Avatar circular + Nombre completo
+        // 2. Estado "● Online" en verde
+        // 3. Botón "Cerrar Sesión"
         var profileWrap = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 160,
+            Height = 144,
             Padding = new Padding(12, 8, 12, 14),
             BackColor = HologramTheme.PanelGlass
         };
@@ -469,10 +245,11 @@ public partial class FormDashboard : Form
 
         var btnLogout = new NeonButton
         {
-            Text = "Cerrar Sesión / Cambiar Versión",
+            Text = "Cerrar Sesión",
             Variant = NeonButtonVariant.Secondary,
+            AutoFitWidth = false,
             Dock = DockStyle.Bottom,
-            Height = 34,
+            Height = 36,
             CornerRadius = 9
         };
         btnLogout.Click += (_, _) =>
@@ -485,14 +262,13 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 3,
+            RowCount = 2,
             BackColor = HologramTheme.PanelGlassLight,
-            Padding = new Padding(0, 0, 0, 6)
+            Padding = new Padding(0, 2, 0, 6)
         };
         profileInfoTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 52f));
         profileInfoTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 22f));
-        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 20f));
+        profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 26f));
         profileInfoTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
         var avatarBox = new Panel
@@ -504,7 +280,7 @@ public partial class FormDashboard : Form
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            var avRect = new Rectangle(2, 4, 42, 42);
+            var avRect = new Rectangle(2, 2, 42, 42);
             using var avBrush = new LinearGradientBrush(avRect, HologramTheme.AccentStart, HologramTheme.HologramCyan, 135f);
             g.FillEllipse(avBrush, avRect);
             using var ringPen = new Pen(HologramTheme.HologramCyan, 1.5f);
@@ -515,47 +291,37 @@ public partial class FormDashboard : Form
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
             using var dotGlow = new SolidBrush(Color.FromArgb(90, HologramTheme.Success));
-            g.FillEllipse(dotGlow, 32, 34, 14, 14);
+            g.FillEllipse(dotGlow, 32, 32, 14, 14);
             using var dot = new SolidBrush(HologramTheme.Success);
-            g.FillEllipse(dot, 35, 37, 8, 8);
+            g.FillEllipse(dot, 35, 35, 8, 8);
         };
         profileInfoTable.Controls.Add(avatarBox, 0, 0);
-        profileInfoTable.SetRowSpan(avatarBox, 3);
+        profileInfoTable.SetRowSpan(avatarBox, 2);
 
         var lblProfName = new Label
         {
             Text = _userFullName,
-            Font = new Font("Segoe UI", 9.8f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
+            TextAlign = ContentAlignment.BottomLeft,
             BackColor = HologramTheme.PanelGlassLight,
             AutoEllipsis = true
         };
         var lblProfStatus = new Label
         {
-            Text = $"● Online • {NodeRuntimeState.CurrentNodeId} (v{NodeRuntimeState.ProtocolVersion})",
-            Font = new Font("Cascadia Mono", 8f, FontStyle.Bold),
+            Text = "● Online",
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
             ForeColor = HologramTheme.Success,
             Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
-            BackColor = HologramTheme.PanelGlassLight,
-            AutoEllipsis = true
-        };
-        var lblProfRole = new Label
-        {
-            Text = _currentUser.Rol,
-            Font = new Font("Segoe UI", 8f),
-            ForeColor = HologramTheme.TextSecondary,
-            Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.TopLeft,
+            Padding = new Padding(0, 2, 0, 0),
             BackColor = HologramTheme.PanelGlassLight,
-            AutoEllipsis = true
+            AutoEllipsis = false
         };
 
         profileInfoTable.Controls.Add(lblProfName, 1, 0);
         profileInfoTable.Controls.Add(lblProfStatus, 1, 1);
-        profileInfoTable.Controls.Add(lblProfRole, 1, 2);
 
         profileCard.Controls.Add(profileInfoTable);
         profileCard.Controls.Add(btnLogout);
@@ -569,10 +335,10 @@ public partial class FormDashboard : Form
 
         var navItems = new (string key, string glyph, string text)[]
         {
-            ("dashboard", "◆", "Dashboard / Cifrado"),
+            ("dashboard", "◆", "Dashboard"),
             ("inbox",     "✉", "Solicitudes"),
-            ("history",   "▤", "Consultas / Historial"),
-            ("network",   "◎", "Red de Nodos (IP)"),
+            ("history",   "▤", "Consultas"),
+            ("network",   "◎", "Red de Nodos"),
             ("settings",  "⚙", "Ajustes")
         };
 
@@ -591,7 +357,7 @@ public partial class FormDashboard : Form
         sidebar.Controls.Add(profileWrap);
         sidebar.Controls.Add(logoPanel);
 
-        // 2. Contenedor Principal Derecho (Topbar con Recuadro de IP Activa + ViewHost)
+        // 2. Contenedor Principal Derecho (Topbar limpio de 2 filas sin panel de IP + ViewHost)
         var mainRight = new Panel
         {
             Dock = DockStyle.Fill,
@@ -602,15 +368,14 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Top,
             AutoSize = true,
-            MinimumSize = new Size(0, 146),
+            MinimumSize = new Size(0, 108),
             ColumnCount = 2,
-            RowCount = 3,
+            RowCount = 2,
             BackColor = HologramTheme.PanelGlass,
-            Padding = new Padding(20, 8, 20, 8)
+            Padding = new Padding(22, 12, 22, 10)
         };
         topbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         topbar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         topbar.Paint += (_, e) =>
@@ -619,61 +384,64 @@ public partial class FormDashboard : Form
             e.Graphics.DrawLine(pen, 0, topbar.Height - 1, topbar.Width, topbar.Height - 1);
         };
 
-        // Fila 0, Col 0: Saludo y nodo activo
+        // Fila 0, Col 0: Saludo y subtítulo compacto con holgura vertical para no recortarse
         var greetingStack = new Panel
         {
             Dock = DockStyle.Fill,
-            Height = 50,
+            Height = 58,
             BackColor = HologramTheme.PanelGlass
         };
         var lblWelcome = new Label
         {
             Text = $"Bienvenido, {_userFullName}",
-            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 14.5f, FontStyle.Bold),
             ForeColor = HologramTheme.TextPrimary,
             Dock = DockStyle.Top,
-            Height = 26,
+            Height = 32,
+            TextAlign = ContentAlignment.MiddleLeft,
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = true
         };
         string subWelcomeText = NodeRuntimeState.IsV2
-            ? $"Nodo activo: {NodeRuntimeState.CurrentNodeId} (Estándar v2.0) • Dueño oficial: {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}"
-            : $"Nodo activo: {NodeRuntimeState.CurrentNodeId} (Versión 1.0 Legado) • 21 Algoritmos Oficiales Habilitados";
+            ? $"{NodeRuntimeState.CurrentNodeId} • Versión 2.0 • {string.Join(", ", NodeRuntimeState.OwnedAlgorithms)}"
+            : $"{NodeRuntimeState.CurrentNodeId} • Versión 1.0";
 
         var lblSubWelcome = new Label
         {
             Text = subWelcomeText,
-            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Top,
-            Height = 20,
+            Height = 24,
+            TextAlign = ContentAlignment.MiddleLeft,
             BackColor = HologramTheme.PanelGlass,
             AutoEllipsis = true
         };
         greetingStack.Controls.Add(lblSubWelcome);
         greetingStack.Controls.Add(lblWelcome);
 
-        // Fila 0, Col 1: Selector de algoritmo activo
+        // Fila 0, Col 1: Selector ALGORITMO ACTIVO
         var algPanel = new Panel
         {
-            Size = new Size(320, 50),
+            Size = new Size(320, 58),
             Margin = new Padding(12, 0, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
         var lblAlgCap = new Label
         {
-            Text = "ALGORITMO ACTIVO (21 OFICIALES)",
-            Font = new Font("Cascadia Mono", 8.2f, FontStyle.Bold),
+            Text = "ALGORITMO ACTIVO",
+            Font = new Font("Cascadia Mono", 8.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Top,
-            Height = 18,
+            Height = 22,
+            TextAlign = ContentAlignment.MiddleLeft,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = true
+            AutoEllipsis = false
         };
         _cmbAlgorithm = new ComboBox
         {
             Dock = DockStyle.Top,
-            Height = 30,
+            Height = 32,
             Font = new Font("Cascadia Mono", 9.2f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbAlgorithm, HologramTheme.HologramCyan);
@@ -684,22 +452,19 @@ public partial class FormDashboard : Form
         algPanel.Controls.Add(_cmbAlgorithm);
         algPanel.Controls.Add(lblAlgCap);
 
-        // Fila 1 (Span 2 columnas): Recuadro Dinámico de IP Local Activa (estilo tarjeta glass con borde cian neón)
-        var topIpCard = CreateActiveIpCardControl();
-
-        // Fila 2 (Span 2 columnas): FlowLayoutPanel con las 3 píldoras autoajustadas
+        // Fila 1 (Span 2 columnas): FlowLayoutPanel con las 3 píldoras concisas
         var pillsFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
             AutoSize = true,
-            Padding = new Padding(0, 4, 0, 2),
+            Padding = new Padding(0, 6, 0, 2),
             BackColor = HologramTheme.PanelGlass
         };
         _pillApi = new StatusPill
         {
-            Text = NodeRuntimeState.ApiOnline ? $"API v{NodeRuntimeState.ProtocolVersion}: Online :{NodeRuntimeState.ApiPort}" : "API: Offline",
+            Text = NodeRuntimeState.ApiOnline ? $"API :{NodeRuntimeState.ApiPort}" : "API: Offline",
             IsActive = NodeRuntimeState.ApiOnline,
             Margin = new Padding(0, 2, 10, 2)
         };
@@ -711,7 +476,7 @@ public partial class FormDashboard : Form
         };
         _pillCert = new StatusPill
         {
-            Text = NodeRuntimeState.CertificateActive ? "Certificado X.509: Activo" : "X.509: Inactivo",
+            Text = NodeRuntimeState.CertificateActive ? "X.509: Activo" : "X.509: Inactivo",
             IsActive = NodeRuntimeState.CertificateActive,
             Margin = new Padding(0, 2, 10, 2)
         };
@@ -719,9 +484,7 @@ public partial class FormDashboard : Form
 
         topbar.Controls.Add(greetingStack, 0, 0);
         topbar.Controls.Add(algPanel, 1, 0);
-        topbar.Controls.Add(topIpCard, 0, 1);
-        topbar.SetColumnSpan(topIpCard, 2);
-        topbar.Controls.Add(pillsFlow, 0, 2);
+        topbar.Controls.Add(pillsFlow, 0, 1);
         topbar.SetColumnSpan(pillsFlow, 2);
 
         _viewHost = new Panel
@@ -812,13 +575,13 @@ public partial class FormDashboard : Form
         {
             Dock = DockStyle.Fill,
             ActiveAlgorithmLabel = "AESGCM",
-            StatusSubtitle = $"{NodeRuntimeState.CurrentNodeId} (v{NodeRuntimeState.ProtocolVersion}) • Cubo Binario 3D en Reposo"
+            StatusSubtitle = string.Empty
         };
 
         _lblAlgDesc = new Label
         {
             Dock = DockStyle.Bottom,
-            Height = 36,
+            Height = 32,
             Font = new Font("Segoe UI", 8.8f),
             ForeColor = HologramTheme.TextSecondary,
             TextAlign = ContentAlignment.MiddleCenter,
@@ -922,32 +685,32 @@ public partial class FormDashboard : Form
             finally { if (!btnSendZip.IsDisposed) btnSendZip.Enabled = true; }
         };
 
-        var btnThirdAction = new NeonButton
+        var btnRemoteDecrypt = new NeonButton
         {
-            Text = NodeRuntimeState.IsV2 ? "📦 Exportar .ZIP" : "🌐 Descifrar Remoto",
+            Text = "🌐 Descifrar Remoto",
             Variant = NeonButtonVariant.Secondary,
             Dock = DockStyle.Fill,
             Margin = new Padding(4)
         };
-        btnThirdAction.Click += async (_, _) =>
+        btnRemoteDecrypt.Click += async (_, _) =>
         {
-            btnThirdAction.Enabled = false;
+            btnRemoteDecrypt.Enabled = false;
             try
             {
                 if (NodeRuntimeState.IsV2)
-                    HandleExportZipLocally();
+                    await HandleRemoteDecryptActionV2Async();
                 else
                     await HandleRemoteDecryptActionV1Async();
             }
             finally
             {
-                if (!btnThirdAction.IsDisposed) btnThirdAction.Enabled = true;
+                if (!btnRemoteDecrypt.IsDisposed) btnRemoteDecrypt.Enabled = true;
             }
         };
 
         actionGrid.Controls.Add(btnRelayEncrypt, 0, 2);
         actionGrid.Controls.Add(btnSendZip, 1, 2);
-        actionGrid.Controls.Add(btnThirdAction, 2, 2);
+        actionGrid.Controls.Add(btnRemoteDecrypt, 2, 2);
 
         actionCard.Controls.Add(actionGrid);
 
@@ -956,7 +719,7 @@ public partial class FormDashboard : Form
         leftCol.Controls.Add(spacer);
         leftCol.Controls.Add(actionCard);
 
-        // === COLUMNA DERECHA: VISOR + METADATOS ===
+        // === COLUMNA DERECHA: VISOR + MANIFIESTO ===
         var rightCol = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -989,7 +752,7 @@ public partial class FormDashboard : Form
 
         _lblFileBadge = new Label
         {
-            Text = "VISOR DE CARGA • mensaje_seguro.txt",
+            Text = "VISOR • mensaje_seguro.txt",
             Font = new Font("Segoe UI", 9.4f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             Dock = DockStyle.Fill,
@@ -1077,7 +840,7 @@ public partial class FormDashboard : Form
                 _currentExtension = ".txt";
                 _isFromNetworkUntrusted = false;
                 _lastSavedDecryptedPath = null;
-                _lblFileBadge.Text = $"VISOR DE CARGA • {_currentFileName} ({_currentBytes.Length} B)";
+                _lblFileBadge.Text = $"VISOR • {_currentFileName} ({_currentBytes.Length} B)";
             }
         };
 
@@ -1116,20 +879,18 @@ public partial class FormDashboard : Form
 
         var lblMetaTitle = new Label
         {
-            Text = NodeRuntimeState.IsV2
-                ? "MANIFIESTO v2.0 • TRAZABILIDAD Y FIRMA (11 CAMPOS)"
-                : "MANIFIESTO v1.0 • TRAZABILIDAD TOR Y FIRMA X.509",
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+            Text = $"MANIFIESTO v{NodeRuntimeState.ProtocolVersion}",
+            Font = new Font("Segoe UI", 9.6f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramViolet,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             BackColor = HologramTheme.PanelGlass,
-            AutoEllipsis = true
+            AutoEllipsis = false
         };
         _lblMetaSignatureBadge = new Label
         {
-            Text = $"● X.509 Listo ({NodeRuntimeState.CurrentNodeId})",
-            Font = new Font("Cascadia Mono", 8.4f, FontStyle.Bold),
+            Text = "● X.509 Activo",
+            Font = new Font("Cascadia Mono", 8.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
             AutoSize = true,
             Margin = new Padding(8, 4, 0, 4),
@@ -1147,7 +908,7 @@ public partial class FormDashboard : Form
             Padding = new Padding(0, 6, 0, 0),
             BackColor = HologramTheme.PanelGlass
         };
-        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
         metaGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
@@ -1155,15 +916,15 @@ public partial class FormDashboard : Form
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         metaGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "PacketId (UUID):", "---");
-        _txtMetaRootNode = AddMetaRow(metaGrid, 1, NodeRuntimeState.IsV2 ? "producerNode / source:" : "Nodo Raíz (Origen):", NodeRuntimeState.CurrentNodeId);
-        _txtMetaHops = AddMetaRow(metaGrid, 2, "Ruta / Trazabilidad:", NodeRuntimeState.CurrentNodeId);
-        _txtMetaKeyRef = AddMetaRow(metaGrid, 3, NodeRuntimeState.IsV2 ? "keyRef (Custodia):" : "Link Descifrado Remoto:", $"owner={NodeRuntimeState.CurrentNodeId}");
+        _txtMetaPacketId = AddMetaRow(metaGrid, 0, "Packet ID", "---");
+        _txtMetaRootNode = AddMetaRow(metaGrid, 1, NodeRuntimeState.IsV2 ? "Productor" : "Nodo Raíz", NodeRuntimeState.CurrentNodeId);
+        _txtMetaHops = AddMetaRow(metaGrid, 2, "Ruta", NodeRuntimeState.CurrentNodeId);
+        _txtMetaKeyRef = AddMetaRow(metaGrid, 3, NodeRuntimeState.IsV2 ? "KeyRef" : "Link Remoto", $"owner={NodeRuntimeState.CurrentNodeId}");
 
         var lblPub = new Label
         {
-            Text = "publicParameters:",
-            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
+            Text = "Parámetros",
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
             ForeColor = HologramTheme.TextSecondary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.TopLeft,
@@ -1194,7 +955,7 @@ public partial class FormDashboard : Form
         var lbl = new Label
         {
             Text = label,
-            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
             ForeColor = HologramTheme.TextSecondary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -1215,7 +976,7 @@ public partial class FormDashboard : Form
         {
             string owner = CryptoCatalog.GetOwnerNode(info.Code);
             _hologram.ActiveAlgorithmLabel = info.Code;
-            _lblAlgDesc.Text = $"[#{CryptoCatalog.GetAlgorithmId(info.Code)} • Dueño v2.0: {owner} • {info.Category}]  {info.Description}";
+            _lblAlgDesc.Text = $"{info.DisplayName} • {info.Category} (Dueño v2.0: {owner})";
         }
     }
 
@@ -1332,7 +1093,7 @@ public partial class FormDashboard : Form
 
         ClearRelayContext();
 
-        _hologram.SetIdle($"Archivo cargado en {NodeRuntimeState.CurrentNodeId}: {_currentFileName} ({FormatFileSize(_currentBytes.Length)})");
+        _hologram.SetIdle(string.Empty);
 
         if (ImageViewerExtensions.Contains(_currentExtension))
         {
@@ -1627,6 +1388,193 @@ public partial class FormDashboard : Form
         ExecuteDecryption(remote.AlgoritmoCodigo, _currentBytes, remote.LlaveSecretaBase64, remote.ParametrosPublicosJson);
     }
 
+    /// <summary>
+    /// Flujo oficial v2.0 de Descifrado Remoto (POST /api/crypto/inverse con sobre híbrido CC-ENV-1):
+    /// 1. Verifica que haya un paquete cifrado cargado (_activeRecord).
+    /// 2. Identifica el nodo dueño del algoritmo (EQ01–EQ08) en TrustedPeers con huella confirmada TOFU.
+    /// 3. Sella la clave secreta con CC-ENV-1 para el certificado del dueño (o usa keyId si es asimétrico).
+    /// 4. Recibe el .zip tipo result (o sondea GET /api/jobs/{jobId} si devuelve 202), valida firma y abre resultado.enc.
+    /// 5. Muestra el contenido descifrado en el Visor, anima el candado abierto y registra en Consultas con origen "Resultado".
+    /// </summary>
+    private async Task HandleRemoteDecryptActionV2Async()
+    {
+        if (_activeRecord == null)
+        {
+            MessageBox.Show(this,
+                "Primero cifra un paquete o carga un paquete .zip v2.0 desde Solicitudes o Consultas.",
+                $"Descifrado Remoto v2.0 — {NodeRuntimeState.CurrentNodeId}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        string algCode = _activeRecord.AlgoritmoCodigo.Trim().ToUpperInvariant();
+        string ownerNodeId = NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
+
+        var ownerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+            string.Equals(p.NodeId, ownerNodeId, StringComparison.OrdinalIgnoreCase));
+
+        if (ownerPeer == null)
+        {
+            MessageBox.Show(this,
+                $"No se encontró el nodo dueño {ownerNodeId} (algoritmo {algCode}) en el directorio de nodos.\n" +
+                $"Verifícalo en la vista 'Red de Nodos'.",
+                "Nodo Dueño No Encontrado",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!ownerPeer.IsOnline || string.IsNullOrWhiteSpace(ownerPeer.CertificatePem))
+        {
+            await V2NetworkClient.PingNodeAsync(ownerPeer, customTimeoutMs: 1200);
+            RefreshNetworkGrid();
+        }
+
+        if (!ownerPeer.IsOnline || ownerPeer.HasThumbprintMismatch || !ownerPeer.IsConfirmed)
+        {
+            string reason = ownerPeer.HasThumbprintMismatch
+                ? $"presenta un cambio de huella X.509 (BLOQUEADO TOFU)"
+                : (!ownerPeer.IsOnline
+                    ? $"está OFFLINE en {ownerPeer.BaseUrl}"
+                    : $"aún no tiene su huella X.509 confirmada mediante TOFU");
+
+            MessageBox.Show(this,
+                $"No es posible delegar el descifrado remoto de {algCode} al nodo dueño {ownerNodeId} ({ownerPeer.BaseUrl}) porque {reason}.\n\n" +
+                $"Ve a la vista 'Red de Nodos', ejecuta [🧪 Probar Conexión] y confirma su huella con [🛡 Confirmar Huella TOFU].",
+                $"Verificación de Nodo Dueño ({ownerNodeId})",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        byte[] cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
+        var pubParams = V2PacketZipService.ParseFlatPublicParameters(_activeRecord.ParametrosPublicosJson);
+
+        bool isAsymmetric = algCode is "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC";
+        byte[]? rawSecretBytes = null;
+
+        if (!isAsymmetric)
+        {
+            string secretCandidate = !string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
+                ? _activeRecord.LlaveSecretaBase64
+                : _txtPassphrase.Text.Trim();
+
+            if (string.IsNullOrWhiteSpace(secretCandidate))
+            {
+                string? prompted = PromptExternalPassphraseModal(
+                    algCode,
+                    _activeRecord.NodoRaiz,
+                    ownerNodeId,
+                    sigValid: true);
+                if (prompted == null) return;
+                secretCandidate = prompted;
+            }
+
+            rawSecretBytes = ResolveRawSecretBytesForV2(algCode, secretCandidate);
+        }
+
+        try
+        {
+            var (success, plainBytes, resultZip, errMsg) = await V2NetworkClient.CallRemoteInverseAsync(
+                ownerPeer,
+                algCode,
+                _activeRecord.PacketId,
+                cipherBytes,
+                pubParams,
+                keyId: _activeRecord.LinkDescifradoRemoto,
+                rawSecretBytesToSeal: rawSecretBytes);
+
+            if (!success || plainBytes == null)
+            {
+                MessageBox.Show(this,
+                    $"El nodo dueño {ownerNodeId} ({ownerPeer.BaseUrl}) rechazó o no pudo completar POST /api/crypto/inverse:\n\n{errMsg}",
+                    "Error en Descifrado Remoto v2.0",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            _currentBytes = plainBytes;
+            _isShowingEncrypted = false;
+            _binarySummaryReport = null;
+            _lastSavedDecryptedPath = null;
+
+            var (origName, origExt) = ExtractOriginalFileMetaFromJson(_activeRecord.ParametrosPublicosJson);
+            if (!string.IsNullOrWhiteSpace(origExt)) _currentExtension = origExt;
+            if (!string.IsNullOrWhiteSpace(origName)) _currentFileName = Path.GetFileName(origName);
+
+            _hologram.TriggerDecryptAnimation(algCode);
+
+            var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
+            if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
+            if (hops[^1] != ownerNodeId) hops.Add(ownerNodeId);
+
+            // Registrar en Consultas con origen "Resultado"
+            var resultadoRecord = new RegistroCifrado
+            {
+                UsuarioId = _currentUser.Id,
+                PacketId = resultZip?.Manifest.PacketId ?? Guid.NewGuid().ToString("D").ToLowerInvariant(),
+                NombreArchivo = _currentFileName,
+                Extension = _currentExtension,
+                BytesCifrados = Convert.ToBase64String(plainBytes),
+                AlgoritmoCodigo = algCode,
+                ParametrosPublicosJson = _activeRecord.ParametrosPublicosJson,
+                LlaveSecretaBase64 = string.Empty,
+                LinkDescifradoRemoto = $"result://{ownerNodeId}/{_activeRecord.PacketId}",
+                NodoRaiz = ownerNodeId,
+                FirmaRaizBase64 = resultZip?.Manifest.ManifestSignatureBase64 ?? _activeRecord.FirmaRaizBase64,
+                RutaSaltosJson = JsonSerializer.Serialize(hops),
+                Origen = "Resultado",
+                FechaOperacion = DateTime.Now
+            };
+
+            using (var db = new AppDbContext())
+            {
+                db.RegistrosCifrados.Add(resultadoRecord);
+                db.SaveChanges();
+            }
+
+            UpdateMetadataPanel(resultadoRecord, resultZip?.SignatureValid ?? true, hasSignature: true);
+            RefreshConsultasGrid();
+
+            if (ImageViewerExtensions.Contains(_currentExtension))
+                SetViewerMode("IMG");
+            else
+                SetViewerMode("TEXT");
+        }
+        finally
+        {
+            if (rawSecretBytes != null)
+                CryptographicOperations.ZeroMemory(rawSecretBytes);
+        }
+    }
+
+    private static byte[] ResolveRawSecretBytesForV2(string algCode, string secretBase64OrPassphrase)
+    {
+        try
+        {
+            byte[] decoded = Convert.FromBase64String(secretBase64OrPassphrase.Trim());
+            if (algCode == "AESGCM" && decoded.Length is 16 or 32) return decoded;
+            if (algCode == "DES" && decoded.Length == 8) return decoded;
+            if (algCode == "TRIPLEDES" && decoded.Length == 24) return decoded;
+            if (algCode == "CHACHA20" && decoded.Length == 32) return decoded;
+            if (algCode is not ("AESGCM" or "DES" or "TRIPLEDES" or "CHACHA20") && decoded.Length > 0)
+                return decoded;
+        }
+        catch { }
+
+        byte[] utf8 = Encoding.UTF8.GetBytes(secretBase64OrPassphrase);
+        return algCode switch
+        {
+            "AESGCM" => SHA256.HashData(utf8),
+            "DES" => SHA256.HashData(utf8)[..8],
+            "TRIPLEDES" => SHA256.HashData(utf8)[..24],
+            "CHACHA20" => SHA256.HashData(utf8),
+            _ => utf8
+        };
+    }
+
     private void ExecuteDecryption(string algCode, byte[] cipherBytes, string secretKeyBase64, string pubJson)
     {
         try
@@ -1657,12 +1605,6 @@ public partial class FormDashboard : Form
                 _currentExtension = ".bin";
 
             _hologram.TriggerDecryptAnimation(algCode);
-
-            if (_activeRecord != null)
-            {
-                string hopsStr = string.Join(" → ", V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson));
-                _hologram.StatusSubtitle = $"DESCIFRADO EN {NodeRuntimeState.CurrentNodeId} • Origen: {_activeRecord.NodoRaiz} • Ruta: {hopsStr}";
-            }
 
             bool isPlainText = PlainTextExtensions.Contains(_currentExtension);
             bool isViewerImage = ImageViewerExtensions.Contains(_currentExtension);
@@ -1777,44 +1719,6 @@ public partial class FormDashboard : Form
         return $"{bytes / (1024.0 * 1024.0):F2} MB";
     }
 
-    private void HandleExportZipLocally()
-    {
-        if (_activeRecord == null)
-        {
-            MessageBox.Show(this, "Primero cifra un paquete para exportarlo en formato .zip.",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        byte[] cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
-        string sha8 = Convert.ToHexString(SHA256.HashData(cipherBytes))[..8].ToUpperInvariant();
-        string defaultName = $"{NodeRuntimeState.CurrentNodeId}_{_activeRecord.AlgoritmoCodigo}_{DateTime.UtcNow:yyyyMMdd_HHmmss}_{sha8}.zip";
-
-        using var sfd = new SaveFileDialog
-        {
-            Filter = $"Paquete Protocolo v{NodeRuntimeState.ProtocolVersion} (*.zip)|*.zip",
-            FileName = defaultName
-        };
-        if (sfd.ShowDialog(this) != DialogResult.OK) return;
-
-        if (NodeRuntimeState.IsV2)
-        {
-            V2PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, destinationPath: sfd.FileName);
-            MessageBox.Show(this,
-                $"Paquete .zip v2.0 exportado con 3 archivos planos (datos.enc, certificado.pem, manifest.json):\n{sfd.FileName}",
-                "Exportación v2.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-        else
-        {
-            var hops = V1PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
-            if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
-            V1PacketZipService.CreatePacketZip(_activeRecord, cipherBytes, hops, destinationPath: sfd.FileName);
-            MessageBox.Show(this,
-                $"Paquete .zip v1.0 exportado con 5 archivos híbridos:\n{sfd.FileName}",
-                "Exportación v1.0 Exitosa", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-    }
-
     private async Task HandleSendZipToPeerAsync()
     {
         if (_activeRecord == null)
@@ -1890,11 +1794,11 @@ public partial class FormDashboard : Form
 
         _txtMetaPacketId.Text = r.PacketId;
         _txtMetaRootNode.Text = NodeRuntimeState.IsV2
-            ? $"producer={r.NodoRaiz} | source={NodeRuntimeState.CurrentNodeId}"
+            ? $"{r.NodoRaiz} (source: {NodeRuntimeState.CurrentNodeId})"
             : r.NodoRaiz;
         _txtMetaHops.Text = string.Join("  →  ", hops);
         _txtMetaKeyRef.Text = NodeRuntimeState.IsV2
-            ? $"keyId={r.LinkDescifradoRemoto} | ownerNode={r.NodoRaiz}"
+            ? $"{r.LinkDescifradoRemoto} ({r.NodoRaiz})"
             : r.LinkDescifradoRemoto;
 
         try
@@ -1915,8 +1819,8 @@ public partial class FormDashboard : Form
         else
         {
             _lblMetaSignatureBadge.Text = signatureValid
-                ? $"● X.509 ({r.NodoRaiz}) VÁLIDA"
-                : $"● X.509 ({r.NodoRaiz}) INVÁLIDA";
+                ? "● X.509 Activo"
+                : "● X.509 Inválida";
             _lblMetaSignatureBadge.ForeColor = signatureValid ? HologramTheme.Success : HologramTheme.Danger;
         }
     }
@@ -1928,7 +1832,6 @@ public partial class FormDashboard : Form
         {
             RefreshPendingSolicitudesBadge();
             RefreshSolicitudesGrid();
-            _hologram.StatusSubtitle = $"Paquete v{NodeRuntimeState.ProtocolVersion} recibido en {NodeRuntimeState.CurrentNodeId} desde {solicitud.NodoOrigen} ({solicitud.AlgoritmoCodigo})";
         });
     }
 
@@ -1939,10 +1842,6 @@ public partial class FormDashboard : Form
         {
             RefreshNetworkGrid();
             RefreshTargetPeerCombo();
-            if (peer.HasThumbprintMismatch)
-            {
-                _hologram.StatusSubtitle = $"🚨 ALERTA TOFU: Cambio de huella detectado en {peer.NodeId} ({peer.IpAddress}:{peer.Port})";
-            }
         });
     }
 
