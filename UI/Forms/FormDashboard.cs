@@ -1,3 +1,4 @@
+using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
@@ -13,7 +14,6 @@ using System.Drawing.Drawing2D;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Windows.Forms;
 
 namespace ModuloCrypto.UI.Forms;
@@ -1191,18 +1191,10 @@ public partial class FormDashboard : Form
             if (_viewerMode == "TEXT" && !_isShowingEncrypted && _binarySummaryReport == null)
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
 
-            string origFileNameBeforeEncrypt = _currentFileName;
-            string origExtensionBeforeEncrypt = _currentExtension;
-
-            var strategy = CryptoCatalog.GetStrategy(algInfo.Code);
-            var result = strategy.Encrypt(_currentBytes, _txtPassphrase.Text);
-
-            string enrichedPubJson = EnrichPublicParametersWithOriginalFileMeta(
-                result.PublicParametersJson,
-                origFileNameBeforeEncrypt,
-                origExtensionBeforeEncrypt);
-
             string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+            var strategy = CryptoCatalog.GetStrategy(algInfo.Code);
+            var result = strategy.Encrypt(_currentBytes, _txtPassphrase.Text, NodeRuntimeState.IsV2 ? packetId : null);
+
             string producerNode;
             string rootSignature;
             string remoteLink;
@@ -1243,7 +1235,7 @@ public partial class FormDashboard : Form
                 Extension = outExt,
                 BytesCifrados = Convert.ToBase64String(result.OutputBytes),
                 AlgoritmoCodigo = algInfo.Code,
-                ParametrosPublicosJson = enrichedPubJson,
+                ParametrosPublicosJson = result.PublicParametersJson,
                 LlaveSecretaBase64 = result.SecretKeyBase64,
                 LinkDescifradoRemoto = remoteLink,
                 NodoRaiz = producerNode,
@@ -1289,47 +1281,8 @@ public partial class FormDashboard : Form
 
     private static string BuildDefaultKeyLink(string packetId) =>
         NodeRuntimeState.IsV2
-            ? $"key-{packetId}"
+            ? V2FormatValidators.BuildKeyId(NodeRuntimeState.CurrentNodeId, packetId)
             : $"http://{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}/api/crypto/decrypt/{packetId}";
-
-    private static string EnrichPublicParametersWithOriginalFileMeta(string pubJson, string origFileName, string origExt)
-    {
-        try
-        {
-            var node = JsonNode.Parse(string.IsNullOrWhiteSpace(pubJson) ? "{}" : pubJson) as JsonObject ?? new JsonObject();
-            if (!string.IsNullOrWhiteSpace(origFileName))
-                node["originalFileName"] = Path.GetFileName(origFileName);
-            if (!string.IsNullOrWhiteSpace(origExt))
-                node["originalExtension"] = origExt;
-            return node.ToJsonString();
-        }
-        catch
-        {
-            return pubJson;
-        }
-    }
-
-    private static (string? OrigName, string? OrigExt) ExtractOriginalFileMetaFromJson(string? pubJson)
-    {
-        if (string.IsNullOrWhiteSpace(pubJson)) return (null, null);
-        try
-        {
-            using var doc = JsonDocument.Parse(pubJson);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
-
-            string? name = doc.RootElement.TryGetProperty("originalFileName", out var nProp) && nProp.ValueKind == JsonValueKind.String
-                ? nProp.GetString()
-                : null;
-            string? ext = doc.RootElement.TryGetProperty("originalExtension", out var eProp) && eProp.ValueKind == JsonValueKind.String
-                ? eProp.GetString()
-                : null;
-            return (name, ext);
-        }
-        catch
-        {
-            return (null, null);
-        }
-    }
 
     private void HandleDecryptLocalAction()
     {
@@ -1344,7 +1297,12 @@ public partial class FormDashboard : Form
             ? _txtPassphrase.Text
             : _activeRecord.LlaveSecretaBase64;
 
-        ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, keyToUse, _activeRecord.ParametrosPublicosJson);
+        var ctx = new DecryptionContext(
+            PacketId: _activeRecord.PacketId,
+            OriginalFileName: _activeRecord.NombreArchivo,
+            OriginalExtension: _activeRecord.Extension);
+
+        ExecuteDecryption(_activeRecord.AlgoritmoCodigo, _currentBytes, keyToUse, _activeRecord.ParametrosPublicosJson, ctx);
     }
 
     private async Task HandleRemoteDecryptActionV1Async()
@@ -1370,7 +1328,12 @@ public partial class FormDashboard : Form
             return;
         }
 
-        ExecuteDecryption(remote.AlgoritmoCodigo, _currentBytes, remote.LlaveSecretaBase64, remote.ParametrosPublicosJson);
+        var ctx = new DecryptionContext(
+            PacketId: _activeRecord.PacketId,
+            OriginalFileName: _activeRecord.NombreArchivo,
+            OriginalExtension: _activeRecord.Extension);
+
+        ExecuteDecryption(remote.AlgoritmoCodigo, _currentBytes, remote.LlaveSecretaBase64, remote.ParametrosPublicosJson, ctx);
     }
 
     /// <summary>
@@ -1485,9 +1448,10 @@ public partial class FormDashboard : Form
             _binarySummaryReport = null;
             _lastSavedDecryptedPath = null;
 
-            var (origName, origExt) = ExtractOriginalFileMetaFromJson(_activeRecord.ParametrosPublicosJson);
-            if (!string.IsNullOrWhiteSpace(origExt)) _currentExtension = origExt;
-            if (!string.IsNullOrWhiteSpace(origName)) _currentFileName = Path.GetFileName(origName);
+            if (!string.IsNullOrWhiteSpace(_activeRecord.Extension))
+                _currentExtension = _activeRecord.Extension;
+            if (!string.IsNullOrWhiteSpace(_activeRecord.NombreArchivo))
+                _currentFileName = Path.GetFileName(_activeRecord.NombreArchivo);
 
             _hologram.TriggerDecryptAnimation(algCode);
 
@@ -1560,25 +1524,35 @@ public partial class FormDashboard : Form
         };
     }
 
-    private void ExecuteDecryption(string algCode, byte[] cipherBytes, string secretKeyBase64, string pubJson)
+    private void ExecuteDecryption(
+        string algCode,
+        byte[] cipherBytes,
+        string secretKeyBase64,
+        string pubJson,
+        DecryptionContext? context = null)
     {
         try
         {
+            var effectiveContext = context ?? new DecryptionContext(
+                PacketId: _activeRecord?.PacketId,
+                OriginalFileName: _activeRecord?.NombreArchivo,
+                OriginalExtension: _activeRecord?.Extension);
+
             var strategy = CryptoCatalog.GetStrategy(algCode);
-            var res = strategy.Decrypt(cipherBytes, secretKeyBase64, pubJson);
+            var res = strategy.Decrypt(cipherBytes, secretKeyBase64, pubJson, effectiveContext);
 
             _currentBytes = res.OutputBytes;
             _isShowingEncrypted = false;
             _binarySummaryReport = null;
             _lastSavedDecryptedPath = null;
 
-            var (origName, origExt) = ExtractOriginalFileMetaFromJson(pubJson);
-            if (!string.IsNullOrWhiteSpace(origExt))
-                _currentExtension = origExt;
-            if (!string.IsNullOrWhiteSpace(origName))
-                _currentFileName = Path.GetFileName(origName);
-            else if (algCode.Equals("LSBSTEGO", StringComparison.OrdinalIgnoreCase) &&
-                     _currentExtension.Equals(".png", StringComparison.OrdinalIgnoreCase))
+            if (!string.IsNullOrWhiteSpace(effectiveContext.OriginalExtension))
+                _currentExtension = effectiveContext.OriginalExtension;
+            if (!string.IsNullOrWhiteSpace(effectiveContext.OriginalFileName))
+                _currentFileName = Path.GetFileName(effectiveContext.OriginalFileName);
+
+            if (algCode.Equals("LSBSTEGO", StringComparison.OrdinalIgnoreCase) &&
+                _currentExtension.Equals(".png", StringComparison.OrdinalIgnoreCase))
             {
                 _currentExtension = DetectLikelyExtension(_currentBytes);
                 _currentFileName = Path.ChangeExtension(_currentFileName, _currentExtension);

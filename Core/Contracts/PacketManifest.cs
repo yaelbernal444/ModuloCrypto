@@ -1,11 +1,12 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace ModuloCrypto.Core.Contracts;
 
 /// <summary>
-/// Excepción tipada con código oficial del Estándar de Comunicación v2.0 (ej. E-ZIP-STRUCTURE, E-ZIP-BOMB, E-SIZE, E-SIGNATURE).
+/// Excepción tipada con código y estatus HTTP oficial del Estándar de Comunicación v2.0 (Anexo B).
 /// </summary>
 public sealed class PacketValidationException : Exception
 {
@@ -17,6 +18,32 @@ public sealed class PacketValidationException : Exception
     {
         ErrorCode = errorCode;
         HttpStatusCode = httpStatusCode;
+    }
+}
+
+public static class V2FormatValidators
+{
+    private static readonly Regex NodeIdRegex = new("^EQ[0-9]{2}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex UuidV4LowerRegex = new("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex KeyIdRegex = new("^EQ[0-9]{2}-KEY-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex TimestampUtcRegex = new(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ThumbprintUpperRegex = new("^[0-9A-F]{64}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex Sha256LowerRegex = new("^[0-9a-f]{64}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public static bool IsValidNodeId(string? value) => !string.IsNullOrEmpty(value) && NodeIdRegex.IsMatch(value);
+    public static bool IsValidUuidV4Lower(string? value) => !string.IsNullOrEmpty(value) && UuidV4LowerRegex.IsMatch(value);
+    public static bool IsValidKeyId(string? value) => !string.IsNullOrEmpty(value) && KeyIdRegex.IsMatch(value);
+    public static bool IsValidTimestampUtc(string? value) => !string.IsNullOrEmpty(value) && TimestampUtcRegex.IsMatch(value);
+    public static bool IsValidThumbprintUpper(string? value) => !string.IsNullOrEmpty(value) && ThumbprintUpperRegex.IsMatch(value);
+    public static bool IsValidSha256Lower(string? value) => !string.IsNullOrEmpty(value) && Sha256LowerRegex.IsMatch(value);
+
+    public static string BuildKeyId(string ownerNode, string? uuidLower = null)
+    {
+        string node = IsValidNodeId(ownerNode) ? ownerNode : "EQ01";
+        string uuid = IsValidUuidV4Lower(uuidLower)
+            ? uuidLower!
+            : Guid.NewGuid().ToString("D").ToLowerInvariant();
+        return $"{node}-KEY-{uuid}";
     }
 }
 
@@ -50,26 +77,88 @@ public sealed class ManifestVerification
     public string Detail { get; set; } = string.Empty;
 }
 
-public sealed class CcEnvelope
+/// <summary>
+/// Sobre híbrido estandarizado CC-ENV-1 (Sección 8.3):
+/// - CEK aleatoria de 32 bytes envuelta con RSA-OAEP-SHA256 (wrappedKeyBase64 = 256 bytes para RSA-2048)
+/// - AES-256-GCM con nonceBase64 (12 bytes) y tagBase64 (16 bytes)
+/// - En resultEnvelope dentro de manifest.json, ciphertextBase64 es null (no se serializa) porque el cifrado viaja en resultado.enc.
+/// </summary>
+public sealed class CcHybridEnvelope
 {
-    [JsonPropertyName("algorithmCode")]
-    public string AlgorithmCode { get; set; } = string.Empty;
+    [JsonPropertyName("envelope")]
+    public string Envelope { get; set; } = "CC-ENV-1";
 
-    [JsonPropertyName("operation")]
-    public string Operation { get; set; } = "forward";
+    [JsonIgnore]
+    public string Version
+    {
+        get => Envelope;
+        set { if (!string.IsNullOrWhiteSpace(value)) Envelope = value; }
+    }
 
-    [JsonPropertyName("producerNode")]
-    public string ProducerNode { get; set; } = "EQ01";
+    [JsonPropertyName("recipientNode")]
+    public string RecipientNode { get; set; } = "EQ01";
 
-    [JsonPropertyName("keyRef")]
-    public ManifestKeyRef? KeyRef { get; set; }
+    [JsonPropertyName("recipientThumbprintSha256")]
+    public string RecipientThumbprintSha256 { get; set; } = string.Empty;
 
-    [JsonPropertyName("publicParameters")]
-    public Dictionary<string, string> PublicParameters { get; set; } = new();
+    [JsonPropertyName("keyWrapAlgorithm")]
+    public string KeyWrapAlgorithm { get; set; } = "RSA-OAEP-SHA256";
+
+    [JsonPropertyName("contentEncryptionAlgorithm")]
+    public string ContentEncryptionAlgorithm { get; set; } = "AES-256-GCM";
+
+    [JsonPropertyName("wrappedKeyBase64")]
+    public string WrappedKeyBase64 { get; set; } = string.Empty;
+
+    [JsonIgnore]
+    public string EncryptedKeyBase64
+    {
+        get => WrappedKeyBase64;
+        set { if (!string.IsNullOrWhiteSpace(value)) WrappedKeyBase64 = value; }
+    }
+
+    [JsonPropertyName("nonceBase64")]
+    public string NonceBase64 { get; set; } = string.Empty;
+
+    [JsonPropertyName("tagBase64")]
+    public string TagBase64 { get; set; } = string.Empty;
+
+    [JsonPropertyName("ciphertextBase64")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CiphertextBase64 { get; set; }
+
+    [JsonExtensionData]
+    public Dictionary<string, System.Text.Json.JsonElement>? ExtensionData { get; set; }
+
+    public string ResolveWrappedKeyBase64()
+    {
+        if (!string.IsNullOrWhiteSpace(WrappedKeyBase64))
+            return WrappedKeyBase64;
+        if (ExtensionData != null &&
+            ExtensionData.TryGetValue("encryptedKeyBase64", out var el) &&
+            el.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            return el.GetString() ?? string.Empty;
+        }
+        return string.Empty;
+    }
+
+    public string ResolveEnvelopeVersion()
+    {
+        if (!string.IsNullOrWhiteSpace(Envelope))
+            return Envelope;
+        if (ExtensionData != null &&
+            ExtensionData.TryGetValue("version", out var el) &&
+            el.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            return el.GetString() ?? string.Empty;
+        }
+        return string.Empty;
+    }
 }
 
 /// <summary>
-/// Contrato JSON oficial de manifest.json conforme al Estándar de Comunicación entre Nodos v2.0 (Sección 8).
+/// Contrato JSON oficial de manifest.json conforme al Estándar de Comunicación entre Nodos v2.0 (Sección 9.5 — 29 campos exactos).
 /// </summary>
 public sealed class PacketManifest
 {
@@ -145,7 +234,7 @@ public sealed class PacketManifest
     public ManifestKeyRef? KeyRef { get; set; }
 
     [JsonPropertyName("publicParameters")]
-    public Dictionary<string, string> PublicParameters { get; set; } = new();
+    public Dictionary<string, string> PublicParameters { get; set; } = new(StringComparer.Ordinal);
 
     [JsonPropertyName("publicParametersSha256")]
     public string PublicParametersSha256 { get; set; } = EmptySha256Lower;
@@ -154,7 +243,7 @@ public sealed class PacketManifest
     public ManifestVerification? Verification { get; set; }
 
     [JsonPropertyName("resultEnvelope")]
-    public CcEnvelope? ResultEnvelope { get; set; }
+    public CcHybridEnvelope? ResultEnvelope { get; set; }
 
     [JsonPropertyName("certificateThumbprintSha256")]
     public string CertificateThumbprintSha256 { get; set; } = string.Empty;
@@ -167,7 +256,7 @@ public sealed class PacketManifest
 
     /// <summary>
     /// Sección 8.5: Ordena llaves con StringComparer.Ordinal, forma "llave=valor" unidos con '\n' (LF, sin salto final)
-    /// y calcula SHA-256 en hex minúsculas.
+    /// y calcula SHA-256 en hex minúsculas. Si está vacío devuelve SHA-256("").
     /// </summary>
     public static string ComputePublicParametersSha256(IDictionary<string, string>? parameters)
     {
@@ -210,7 +299,7 @@ public sealed class PacketManifest
 }
 
 /// <summary>
-/// Mensaje UDP de autodescubrimiento en el puerto 5099 (Sección 5 / Punto 2).
+/// Mensaje UDP de autodescubrimiento en el puerto 5099 (Sección 5).
 /// </summary>
 public sealed class CcBeaconMessage
 {
@@ -300,19 +389,4 @@ public sealed class PeerCertificateResponse
 
     [JsonPropertyName("notAfterUtc")]
     public string NotAfterUtc { get; set; } = string.Empty;
-}
-
-public sealed class StandardErrorResponse
-{
-    [JsonPropertyName("errorCode")]
-    public string ErrorCode { get; set; } = string.Empty;
-
-    [JsonPropertyName("message")]
-    public string Message { get; set; } = string.Empty;
-
-    [JsonPropertyName("nodeId")]
-    public string NodeId { get; set; } = "EQ01";
-
-    [JsonPropertyName("timestampUtc")]
-    public string TimestampUtc { get; set; } = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
 }

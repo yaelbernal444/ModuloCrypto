@@ -619,10 +619,9 @@ public partial class FormDashboard
             if (!hops.Contains(NodeRuntimeState.CurrentNodeId))
                 hops.Add(NodeRuntimeState.CurrentNodeId);
 
-            pubJson = EnrichPublicParametersWithOriginalFileMeta(pubJson, parsed.Manifest.OriginalFileName, parsed.Manifest.OriginalExtension);
             string keyRefDisplay = parsed.Manifest.KeyRef != null
-                ? $"keyRef://{parsed.Manifest.KeyRef.OwnerNode}/{parsed.Manifest.KeyRef.KeyId}"
-                : $"keyRef://{parsed.Manifest.ProducerNode}/{parsed.Manifest.PacketId}";
+                ? parsed.Manifest.KeyRef.KeyId
+                : V2FormatValidators.BuildKeyId(parsed.Manifest.ProducerNode, parsed.Manifest.PacketId);
 
             FinalizeAcceptedSolicitud(
                 db,
@@ -639,7 +638,8 @@ public partial class FormDashboard
                 parsed.Manifest.ManifestSignatureBase64,
                 hops,
                 parsed.SignatureValid && parsed.IntegrityValid,
-                hasSignature: true);
+                hasSignature: true,
+                requestId: parsed.Manifest.RequestId);
         }
         catch (Exception ex)
         {
@@ -696,8 +696,6 @@ public partial class FormDashboard
             _relayRootCertBase64 = parsed.Manifest.CertificadoRaizBase64;
             _relayRemoteDecryptLink = parsed.Manifest.LinkDescifradoRemoto;
 
-            pubJson = EnrichPublicParametersWithOriginalFileMeta(pubJson, parsed.Manifest.NombreArchivo, parsed.Manifest.Extension);
-
             FinalizeAcceptedSolicitud(
                 db,
                 sol,
@@ -737,7 +735,8 @@ public partial class FormDashboard
         List<string> hops,
         bool sigValid,
         bool hasSignature,
-        byte[]? preDecryptedBytes = null)
+        byte[]? preDecryptedBytes = null,
+        string? requestId = null)
     {
         _relayProducerNode = rootNode;
         _relayHopHistory = new List<string>(hops);
@@ -788,7 +787,12 @@ public partial class FormDashboard
         }
         else
         {
-            ExecuteDecryption(registroRecibido.AlgoritmoCodigo, cipherBytes, secretKey, pubJson);
+            var ctx = new DecryptionContext(
+                PacketId: packetId,
+                RequestId: requestId,
+                OriginalFileName: fileName,
+                OriginalExtension: extension);
+            ExecuteDecryption(registroRecibido.AlgoritmoCodigo, cipherBytes, secretKey, pubJson, ctx);
         }
     }
 

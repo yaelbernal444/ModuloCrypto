@@ -300,25 +300,45 @@ internal static class Program
             if (!Regex.IsMatch(thumbV2, "^[0-9A-F]{64}$"))
                 throw new Exception($"Huella SHA-256 v2.0 inválida: {thumbV2}");
 
-            // Sobre híbrido CC-ENV-1 (positiva y negativa E-ENV-RECIPIENT)
+            // Sobre híbrido CC-ENV-1 (verificación estricta de tamaños en bytes + negativa E-ENV-RECIPIENT y E-ENV-DECRYPT)
             byte[] secretForEnv = RandomNumberGenerator.GetBytes(32);
             string envAad = Guid.NewGuid().ToString("D").ToLowerInvariant();
             var sealedEnv = V2EnvelopeService.Seal(secretForEnv, certV2, "EQ01", envAad);
+
+            if (Convert.FromBase64String(sealedEnv.WrappedKeyBase64).Length != 256 ||
+                Convert.FromBase64String(sealedEnv.NonceBase64).Length != 12 ||
+                Convert.FromBase64String(sealedEnv.TagBase64).Length != 16)
+            {
+                throw new Exception("CC-ENV-1 no cumplió los tamaños exactos (wrappedKey=256B, nonce=12B, tag=16B).");
+            }
+
             byte[] openedSecret = V2EnvelopeService.Open(sealedEnv, envAad, certV2);
             if (!secretForEnv.SequenceEqual(openedSecret))
                 throw new Exception("Falló round-trip del sobre híbrido CC-ENV-1.");
 
             var wrongRecipientEnv = new CcHybridEnvelope
             {
-                Version = "CC-ENV-1",
+                Envelope = "CC-ENV-1",
                 RecipientNode = "EQ02",
                 RecipientThumbprintSha256 = new string('F', 64),
-                EncryptedKeyBase64 = sealedEnv.EncryptedKeyBase64,
+                WrappedKeyBase64 = sealedEnv.WrappedKeyBase64,
                 NonceBase64 = sealedEnv.NonceBase64,
                 CiphertextBase64 = sealedEnv.CiphertextBase64,
                 TagBase64 = sealedEnv.TagBase64
             };
             ExpectValidationException(() => V2EnvelopeService.Open(wrongRecipientEnv, envAad, certV2), "E-ENV-RECIPIENT", 401);
+
+            var badTagEnv = new CcHybridEnvelope
+            {
+                Envelope = "CC-ENV-1",
+                RecipientNode = "EQ01",
+                RecipientThumbprintSha256 = sealedEnv.RecipientThumbprintSha256,
+                WrappedKeyBase64 = sealedEnv.WrappedKeyBase64,
+                NonceBase64 = sealedEnv.NonceBase64,
+                CiphertextBase64 = sealedEnv.CiphertextBase64,
+                TagBase64 = Convert.ToBase64String(new byte[16])
+            };
+            ExpectValidationException(() => V2EnvelopeService.Open(badTagEnv, envAad, certV2), "E-ENV-DECRYPT", 401);
 
             await using (var v2Runtime = new V2ProtocolRuntime())
             {
@@ -362,7 +382,7 @@ internal static class Program
                 if (!diagReport.TcpPortOpen || !diagReport.HttpApiSuccess || diagReport.HasVersionMismatch)
                     throw new Exception($"Falló ConnectivityDiagnostics en v2.0: {diagReport.SummaryTitle}");
 
-                // 3. Validar POST /api/crypto/forward y POST /api/crypto/inverse para AESGCM y DES
+                // 3. Validar POST /api/crypto/forward y POST /api/crypto/inverse para AESGCM y DES (Emisión estricta Tabla 4.2 + resultEnvelope sin ciphertextBase64)
                 foreach (string ownedAlg in new[] { "AESGCM", "DES" })
                 {
                     var (fwdOk, fwdRes, fwdErr) = await V2NetworkClient.CallRemoteForwardAsync(
@@ -376,6 +396,36 @@ internal static class Program
                     if (!fwdOk || fwdRes == null || fwdRes.SecretKeyEnvelope == null)
                         throw new Exception($"Falló POST /api/crypto/forward para {ownedAlg}: {fwdErr}");
 
+                    if (!V2FormatValidators.IsValidKeyId(fwdRes.KeyRef.KeyId))
+                        throw new Exception($"keyRef.keyId no cumple el formato estricto v2.0: {fwdRes.KeyRef.KeyId}");
+
+                    if (ownedAlg == "AESGCM")
+                    {
+                        if (fwdRes.PublicParameters.Count != 3 ||
+                            fwdRes.PublicParameters["keySizeBits"] != "256" ||
+                            Convert.FromBase64String(fwdRes.PublicParameters["nonceBase64"]).Length != 12 ||
+                            Convert.FromBase64String(fwdRes.PublicParameters["tagBase64"]).Length != 16)
+                        {
+                            throw new Exception("Emisión AESGCM de EQ01 no cumple estrictamente la Tabla 4.2.");
+                        }
+                    }
+                    else if (ownedAlg == "DES")
+                    {
+                        if (fwdRes.PublicParameters.Count != 3 ||
+                            fwdRes.PublicParameters["mode"] != "CBC" ||
+                            fwdRes.PublicParameters["padding"] != "PKCS7" ||
+                            Convert.FromBase64String(fwdRes.PublicParameters["ivBase64"]).Length != 8)
+                        {
+                            throw new Exception("Emisión DES de EQ01 no cumple estrictamente la Tabla 4.2.");
+                        }
+                    }
+
+                    var openedFwdSecrets = V2EnvelopeService.OpenSecretsDictionary(
+                        fwdRes.SecretKeyEnvelope,
+                        fwdRes.RequestId,
+                        fwdRes.PacketId);
+                    byte[] rawKeyFromFwd = Convert.FromBase64String(openedFwdSecrets["key"]);
+
                     byte[] cipherFromForward = Convert.FromBase64String(fwdRes.CiphertextBase64);
 
                     var (invOk, plainFromInverse, resZip, invErr) = await V2NetworkClient.CallRemoteInverseAsync(
@@ -384,25 +434,103 @@ internal static class Program
                         fwdRes.PacketId,
                         cipherFromForward,
                         fwdRes.PublicParameters,
-                        secretEnvelope: fwdRes.SecretKeyEnvelope,
-                        keyId: fwdRes.KeyRef.KeyId);
+                        keyId: fwdRes.KeyRef.KeyId,
+                        rawSecretBytesToSeal: rawKeyFromFwd);
 
                     if (!invOk || plainFromInverse == null || resZip == null || !sample.SequenceEqual(plainFromInverse))
                         throw new Exception($"Falló POST /api/crypto/inverse para {ownedAlg}: {invErr}");
+
+                    if (resZip.Manifest.ResultEnvelope == null || resZip.Manifest.ResultEnvelope.CiphertextBase64 != null)
+                        throw new Exception("El resultEnvelope del paquete result no debe incluir ciphertextBase64.");
+
+                    if (Convert.FromBase64String(resZip.Manifest.ManifestSignatureBase64).Length != 256)
+                        throw new Exception("La firma RSA-PSS-SHA256 del manifiesto no mide 256 bytes.");
                 }
 
-                // 4. Validar paquete .zip estricto de 3 archivos + Reenvío 9.6 + Pruebas Negativas de Conformidad
-                var aesRes = CryptoCatalog.GetStrategy("AESGCM").Encrypt(sample);
+                // 4. Prueba obligatoria de paquete estilo Equipo 6 (EQ06):
+                // datos.enc de 6 bytes, publicParameters con "ivBase64" (12 B), "tagBase64" (16 B), "opt.keySizeBits": "256", "mode": "v3-local"
+                // probado tanto con AAD = packetId como con AAD = null, y pasando la llave en Base64, Hex (64 chars) y passphrase UTF-8
+                byte[] eq06Plain6Bytes = Encoding.UTF8.GetBytes("EQ06OK"); // 6 bytes exactos
+                string eq06Passphrase = "Passphrase-Equipo06-2026!";
+                byte[] eq06DerivedKey32 = SHA256.HashData(Encoding.UTF8.GetBytes(eq06Passphrase));
+                string eq06KeyBase64 = Convert.ToBase64String(eq06DerivedKey32);
+                string eq06KeyHex64 = Convert.ToHexString(eq06DerivedKey32).ToLowerInvariant();
+
+                foreach (bool useAadPacketId in new[] { true, false })
+                {
+                    string eq06PacketId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+                    byte[] eq06Iv12 = RandomNumberGenerator.GetBytes(12);
+                    byte[] eq06Cipher6 = new byte[6];
+                    byte[] eq06Tag16 = new byte[16];
+
+                    using (var aesEq06 = new AesGcm(eq06DerivedKey32, 16))
+                    {
+                        if (useAadPacketId)
+                            aesEq06.Encrypt(eq06Iv12, eq06Plain6Bytes, eq06Cipher6, eq06Tag16, Encoding.UTF8.GetBytes(eq06PacketId));
+                        else
+                            aesEq06.Encrypt(eq06Iv12, eq06Plain6Bytes, eq06Cipher6, eq06Tag16);
+                    }
+
+                    var eq06PubParams = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["ivBase64"] = Convert.ToBase64String(eq06Iv12),
+                        ["tagBase64"] = Convert.ToBase64String(eq06Tag16),
+                        ["opt.keySizeBits"] = "256",
+                        ["mode"] = "v3-local"
+                    };
+
+                    var eq06Rec = new RegistroCifrado
+                    {
+                        PacketId = eq06PacketId,
+                        AlgoritmoCodigo = "AESGCM",
+                        NombreArchivo = "corto_eq06.txt",
+                        Extension = ".txt",
+                        NodoRaiz = "EQ01"
+                    };
+
+                    string eq06ZipPath = V2PacketZipService.CreatePacketZip(
+                        eq06Rec,
+                        eq06Cipher6,
+                        packetType: "package",
+                        operation: "forward",
+                        explicitPublicParameters: eq06PubParams);
+                    tempFiles.Add(eq06ZipPath);
+
+                    var parsedEq06 = V2PacketZipService.ReadPacketZip(eq06ZipPath, enforceStrictSignature: true, validateTimestamp: true);
+                    if (parsedEq06.PayloadBytes.Length != 6 ||
+                        parsedEq06.Manifest.PublicParameters.Count != 4 ||
+                        parsedEq06.Manifest.PublicParameters.ContainsKey("originalFileName") ||
+                        parsedEq06.Manifest.PublicParameters.ContainsKey("originalExtension"))
+                    {
+                        throw new Exception("El paquete estilo EQ06 fue contaminado con campos extra en publicParameters.");
+                    }
+
+                    string eq06PubJson = JsonSerializer.Serialize(parsedEq06.Manifest.PublicParameters);
+                    var eq06Ctx = new DecryptionContext(PacketId: eq06PacketId, OriginalFileName: "corto_eq06.txt", OriginalExtension: ".txt");
+                    var aesStrat = CryptoCatalog.GetStrategy("AESGCM");
+
+                    foreach (string keyFormat in new[] { eq06KeyBase64, eq06KeyHex64, eq06Passphrase })
+                    {
+                        var decEq06 = aesStrat.Decrypt(parsedEq06.PayloadBytes, keyFormat, eq06PubJson, eq06Ctx);
+                        if (!eq06Plain6Bytes.SequenceEqual(decEq06.OutputBytes))
+                            throw new Exception($"Falló descifrado tolerante estilo EQ06 (useAad={useAadPacketId}, formato llave={keyFormat[..8]}...).");
+                    }
+                }
+
+                // 5. Validar paquete .zip estricto de 3 archivos + Reenvío 9.6 + Pruebas Negativas de Conformidad (Anexo B)
+                string strictPkgId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+                var aesRes = CryptoCatalog.GetStrategy("AESGCM").Encrypt(sample, null, strictPkgId);
                 var recV2 = new RegistroCifrado
                 {
                     UsuarioId = authOk.Id,
-                    PacketId = Guid.NewGuid().ToString("D").ToLowerInvariant(),
+                    PacketId = strictPkgId,
                     NombreArchivo = "mensaje_v2.txt",
                     Extension = ".txt",
                     BytesCifrados = Convert.ToBase64String(aesRes.OutputBytes),
                     AlgoritmoCodigo = "AESGCM",
                     ParametrosPublicosJson = aesRes.PublicParametersJson,
                     LlaveSecretaBase64 = aesRes.SecretKeyBase64,
+                    LinkDescifradoRemoto = V2FormatValidators.BuildKeyId("EQ01", strictPkgId),
                     NodoRaiz = "EQ01",
                     RutaSaltosJson = "[\"EQ01\"]",
                     Origen = "Local"
@@ -425,10 +553,10 @@ internal static class Program
                 string forwardedZipPath = V2PacketZipService.RepackageForForwarding(packageZipPath);
                 tempFiles.Add(forwardedZipPath);
                 var parsedFwd = V2PacketZipService.ReadPacketZip(forwardedZipPath, enforceStrictSignature: true);
-                if (!parsedFwd.SignatureValid || parsedFwd.Manifest.ProducerNode != "EQ01")
+                if (!parsedFwd.SignatureValid || parsedFwd.Manifest.ProducerNode != "EQ01" || parsedFwd.Manifest.PublicParameters.Count != 3)
                     throw new Exception("Falló RepackageForForwarding (Sección 9.6).");
 
-                // Prueba negativa 1: E-ZIP-STRUCTURE (4 archivos)
+                // Prueba negativa 1: 400 E-ZIP-STRUCTURE (4 archivos)
                 string zip4Files = Path.Combine(Path.GetTempPath(), $"v2_neg_4files_{Guid.NewGuid():N}.zip");
                 tempFiles.Add(zip4Files);
                 File.Copy(packageZipPath, zip4Files, true);
@@ -439,7 +567,7 @@ internal static class Program
                 }
                 ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zip4Files), "E-ZIP-STRUCTURE", 400);
 
-                // Prueba negativa 2: E-HASH (datos.enc alterado)
+                // Prueba negativa 2: 422 E-HASH (datos.enc alterado)
                 string zipBadHash = Path.Combine(Path.GetTempPath(), $"v2_neg_hash_{Guid.NewGuid():N}.zip");
                 tempFiles.Add(zipBadHash);
                 File.Copy(packageZipPath, zipBadHash, true);
@@ -449,34 +577,34 @@ internal static class Program
                     using var ds = zh.CreateEntry("datos.enc").Open();
                     ds.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF });
                 }
-                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadHash), "E-HASH", 400);
+                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadHash), "E-HASH", 422);
 
-                // Prueba negativa 3: E-PARAMS-HASH (publicParameters alterado sin actualizar publicParametersSha256)
+                // Prueba negativa 3: 422 E-PARAMS-HASH (publicParameters alterado sin actualizar publicParametersSha256)
                 string zipBadParams = CreateTamperedManifestZip(packageZipPath, m =>
                 {
                     m.PublicParameters["tampered"] = "true";
                 });
                 tempFiles.Add(zipBadParams);
-                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadParams), "E-PARAMS-HASH", 400);
+                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadParams), "E-PARAMS-HASH", 422);
 
-                // Prueba negativa 4: E-SIGNATURE (firma RSA-PSS alterada)
+                // Prueba negativa 4: 422 E-SIGNATURE (firma RSA-PSS alterada)
                 string zipBadSig = CreateTamperedManifestZip(packageZipPath, m =>
                 {
                     m.ManifestSignatureBase64 = Convert.ToBase64String(new byte[256]);
                 });
                 tempFiles.Add(zipBadSig);
-                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadSig), "E-SIGNATURE", 400);
+                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipBadSig), "E-SIGNATURE", 422);
 
-                // Prueba negativa 5: E-TIMESTAMP (timestamp fuera de ±10 minutos, re-firmado con certificado válido)
+                // Prueba negativa 5: 422 E-TIMESTAMP (timestamp fuera de ±10 minutos, re-firmado con certificado válido)
                 string zipOldTs = CreateTamperedManifestZip(packageZipPath, m =>
                 {
                     m.TimestampUtc = DateTime.UtcNow.AddMinutes(-30).ToString("yyyy-MM-ddTHH:mm:ssZ");
                     m.ManifestSignatureBase64 = V2CertificateService.SignDataPss(Encoding.UTF8.GetBytes(m.BuildCanonicalSigningString()));
                 });
                 tempFiles.Add(zipOldTs);
-                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipOldTs, validateTimestamp: true), "E-TIMESTAMP", 400);
+                ExpectValidationException(() => V2PacketZipService.ReadPacketZip(zipOldTs, validateTimestamp: true), "E-TIMESTAMP", 422);
 
-                // Prueba negativa 6: E-DUPLICATE (mismo packetId procesado 2 veces en SQLite SeenPackets -> 409)
+                // Prueba negativa 6: 409 E-DUPLICATE (mismo packetId procesado 2 veces en SQLite SeenPackets -> 409)
                 _ = V2PacketZipService.ReadPacketZip(packageZipPath, validateTimestamp: true, checkAndRecordReplay: true, customDbPath: tempDbPath);
                 ExpectValidationException(
                     () => V2PacketZipService.ReadPacketZip(packageZipPath, validateTimestamp: true, checkAndRecordReplay: true, customDbPath: tempDbPath),
@@ -487,8 +615,9 @@ internal static class Program
             Console.WriteLine(
                 $"SELFTEST_OK: DualArchitecture=v1.0+v2.0, SQLiteWAL=OK, IPv4={primaryEp.Ipv4Address}({primaryEp.InterfaceName}), " +
                 $"Algorithms={passedAlgorithms}/21, V1_5FileZIP_DualAPI_RemoteKey=OK, " +
-                $"V2_EQ01_X509_CC_ENV_1_ForwardInverse_AESGCM_DES=OK, " +
-                $"V2_14StepValidation(E-ZIP-STRUCTURE,E-HASH,E-PARAMS-HASH,E-SIGNATURE,E-TIMESTAMP,E-DUPLICATE,E-ENV-RECIPIENT)=OK");
+                $"V2_StrictEmission_EQ01_Table4_2(AESGCM,DES)=OK, V2_CC_ENV_1_ExactByteSizes(32B,12B,16B,256B,NoCiphertextInResultEnvelope)=OK, " +
+                $"V2_EQ06_6ByteAliasTolerance(ivBase64,opt.keySizeBits,AAD_PacketId_or_Null,Base64_Hex_Passphrase)=OK, " +
+                $"V2_14StepValidation(E-ZIP-STRUCTURE:400,E-HASH:422,E-PARAMS-HASH:422,E-SIGNATURE:422,E-TIMESTAMP:422,E-DUPLICATE:409,E-ENV-RECIPIENT:401,E-ENV-DECRYPT:401)=OK");
             return 0;
         }
         catch (Exception ex)

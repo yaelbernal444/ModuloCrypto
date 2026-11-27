@@ -212,9 +212,12 @@ public static class V2CertificateService
         try
         {
             byte[] sigBytes = Convert.FromBase64String(signatureBase64.Trim());
+            if (sigBytes.Length != 256)
+                return false;
+
             using X509Certificate2 cert = LoadCertificateFromPemOrBase64(certPemOrBase64);
             using RSA? rsa = cert.GetRSAPublicKey();
-            if (rsa == null || rsa.KeySize < 2048)
+            if (rsa == null || rsa.KeySize != 2048)
                 return false;
 
             return rsa.VerifyData(data, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);

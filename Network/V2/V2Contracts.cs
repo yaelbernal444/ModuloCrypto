@@ -4,42 +4,6 @@ using System.Text.Json.Serialization;
 namespace ModuloCrypto.Network.V2;
 
 /// <summary>
-/// Sobre híbrido estandarizado CC-ENV-1 (RSA-OAEP-SHA256 + AES-256-GCM con AAD = requestId o packetId).
-/// </summary>
-public sealed class CcHybridEnvelope
-{
-    [JsonPropertyName("version")]
-    public string Version { get; set; } = "CC-ENV-1";
-
-    [JsonPropertyName("recipientNode")]
-    public string RecipientNode { get; set; } = "EQ01";
-
-    [JsonPropertyName("recipientThumbprintSha256")]
-    public string RecipientThumbprintSha256 { get; set; } = string.Empty;
-
-    [JsonPropertyName("keyWrapAlgorithm")]
-    public string KeyWrapAlgorithm { get; set; } = "RSA-OAEP-SHA256";
-
-    [JsonPropertyName("contentEncryptionAlgorithm")]
-    public string ContentEncryptionAlgorithm { get; set; } = "AES-256-GCM";
-
-    [JsonPropertyName("aadContext")]
-    public string AadContext { get; set; } = string.Empty;
-
-    [JsonPropertyName("encryptedKeyBase64")]
-    public string EncryptedKeyBase64 { get; set; } = string.Empty;
-
-    [JsonPropertyName("nonceBase64")]
-    public string NonceBase64 { get; set; } = string.Empty;
-
-    [JsonPropertyName("ciphertextBase64")]
-    public string CiphertextBase64 { get; set; } = string.Empty;
-
-    [JsonPropertyName("tagBase64")]
-    public string TagBase64 { get; set; } = string.Empty;
-}
-
-/// <summary>
 /// Parte JSON 'request' enviada en POST /api/crypto/forward (firmada en 'requestSignature' sobre los bytes crudos exactos).
 /// </summary>
 public sealed class V2CryptoForwardRequest
@@ -52,6 +16,9 @@ public sealed class V2CryptoForwardRequest
 
     [JsonPropertyName("requesterNode")]
     public string RequesterNode { get; set; } = "EQ01";
+
+    [JsonPropertyName("targetNode")]
+    public string? TargetNode { get; set; }
 
     [JsonPropertyName("algorithmCode")]
     public string AlgorithmCode { get; set; } = "AESGCM";
@@ -68,11 +35,19 @@ public sealed class V2CryptoForwardRequest
     [JsonPropertyName("keySizeBits")]
     public int KeySizeBits { get; set; } = 256;
 
+    [JsonPropertyName("secrets")]
+    public CcHybridEnvelope? Secrets { get; set; }
+
     [JsonPropertyName("secretEnvelope")]
-    public CcHybridEnvelope? SecretEnvelope { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public CcHybridEnvelope? SecretEnvelope
+    {
+        get => Secrets;
+        set { if (value != null) Secrets = value; }
+    }
 
     [JsonPropertyName("parameters")]
-    public Dictionary<string, string> Parameters { get; set; } = new();
+    public Dictionary<string, string> Parameters { get; set; } = new(StringComparer.Ordinal);
 
     [JsonPropertyName("forceAsync")]
     public bool ForceAsync { get; set; }
@@ -108,7 +83,7 @@ public sealed class V2CryptoForwardResponse
     public string EncryptedSha256 { get; set; } = string.Empty;
 
     [JsonPropertyName("publicParameters")]
-    public Dictionary<string, string> PublicParameters { get; set; } = new();
+    public Dictionary<string, string> PublicParameters { get; set; } = new(StringComparer.Ordinal);
 
     [JsonPropertyName("publicParametersSha256")]
     public string PublicParametersSha256 { get; set; } = PacketManifest.EmptySha256Lower;
@@ -140,6 +115,9 @@ public sealed class V2CryptoInverseRequest
     [JsonPropertyName("requesterNode")]
     public string RequesterNode { get; set; } = "EQ01";
 
+    [JsonPropertyName("targetNode")]
+    public string? TargetNode { get; set; }
+
     [JsonPropertyName("algorithmCode")]
     public string AlgorithmCode { get; set; } = "AESGCM";
 
@@ -149,11 +127,19 @@ public sealed class V2CryptoInverseRequest
     [JsonPropertyName("keyId")]
     public string? KeyId { get; set; }
 
+    [JsonPropertyName("secrets")]
+    public CcHybridEnvelope? Secrets { get; set; }
+
     [JsonPropertyName("secretEnvelope")]
-    public CcHybridEnvelope? SecretEnvelope { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public CcHybridEnvelope? SecretEnvelope
+    {
+        get => Secrets;
+        set { if (value != null) Secrets = value; }
+    }
 
     [JsonPropertyName("publicParameters")]
-    public Dictionary<string, string> PublicParameters { get; set; } = new();
+    public Dictionary<string, string> PublicParameters { get; set; } = new(StringComparer.Ordinal);
 
     [JsonPropertyName("forceAsync")]
     public bool ForceAsync { get; set; }

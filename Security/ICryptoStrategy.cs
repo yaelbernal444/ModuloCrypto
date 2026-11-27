@@ -13,6 +13,16 @@ public sealed class CryptoAlgorithmInfo
     public override string ToString() => $"{Code} — {DisplayName}";
 }
 
+/// <summary>
+/// Contexto explícito de descifrado para pasar PacketId, RequestId, OriginalFileName y OriginalExtension
+/// sin inyectar ni contaminar jamás el diccionario publicParameters del manifiesto.
+/// </summary>
+public sealed record DecryptionContext(
+    string? PacketId = null,
+    string? RequestId = null,
+    string? OriginalFileName = null,
+    string? OriginalExtension = null);
+
 public sealed class CryptoOperationResult
 {
     public bool Success { get; init; } = true;
@@ -30,5 +40,14 @@ public interface ICryptoStrategy
 
     CryptoOperationResult Encrypt(byte[] plainBytes, string? optionalPassphrase = null);
 
+    CryptoOperationResult Encrypt(byte[] plainBytes, string? optionalPassphrase, string? packetId)
+        => Encrypt(plainBytes, optionalPassphrase);
+
     CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson);
+
+    CryptoOperationResult Decrypt(
+        byte[] cipherBytes,
+        string secretKeyBase64,
+        string publicParametersJson,
+        DecryptionContext? context) => Decrypt(cipherBytes, secretKeyBase64, publicParametersJson);
 }

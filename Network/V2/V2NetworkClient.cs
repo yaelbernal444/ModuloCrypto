@@ -11,7 +11,7 @@ using System.Text.Json;
 namespace ModuloCrypto.Network.V2;
 
 /// <summary>
-/// Cliente HTTP v2.0 con SocketsHttpHandler optimizado, cabeceras X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id,
+/// Cliente HTTP v2.0 con SocketsHttpHandler optimizado, cabeceras obligatorias X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id,
 /// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1), escaneo de subred /24 en puertos 5001–5020
 /// (SemaphoreSlim(64, 64), timeout 500 ms, cooldown 5 min) y validación TOFU.
 /// </summary>
@@ -38,7 +38,7 @@ public static class V2NetworkClient
     {
         string reqId = string.IsNullOrWhiteSpace(requestId)
             ? Guid.NewGuid().ToString("D").ToLowerInvariant()
-            : requestId;
+            : requestId.Trim().ToLowerInvariant();
 
         req.Headers.TryAddWithoutValidation("X-CC-Node", NodeRuntimeState.CurrentNodeId);
         req.Headers.TryAddWithoutValidation("X-CC-Protocol", "2.0");
@@ -188,7 +188,7 @@ public static class V2NetworkClient
     {
         if (targetPeer.HasThumbprintMismatch || string.Equals(targetPeer.Status, "blocked", StringComparison.OrdinalIgnoreCase))
         {
-            return (false, $"BLOQUEO TOFU (E-CERT-UNTRUSTED): El nodo {targetPeer.NodeId} presentó un cambio de huella X.509. Reconfirma su huella en 'Red de Nodos (IP)' antes de enviar paquetes.");
+            return (false, $"BLOQUEO TOFU (E-CERT-UNTRUSTED): El nodo {targetPeer.NodeId} presentó un cambio de huella X.509. Reconfirma su huella en 'Red de Nodos' antes de enviar paquetes.");
         }
 
         byte[] fileBytes = await File.ReadAllBytesAsync(zipPath);
@@ -257,6 +257,7 @@ public static class V2NetworkClient
             RequestId = requestId,
             PacketId = packetId,
             RequesterNode = NodeRuntimeState.CurrentNodeId,
+            TargetNode = providerPeer.NodeId,
             AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
             Operation = "forward",
             OriginalFileName = fileName,
@@ -296,7 +297,7 @@ public static class V2NetworkClient
 
     /// <summary>
     /// Invoca POST /api/crypto/inverse en un nodo proveedor v2.0 (soportando respuesta directa .zip o job 202 Accepted)
-    /// y abre el sobre CC-ENV-1 de resultado.enc con la clave privada local.
+    /// y abre el sobre CC-ENV-1 de resultado.enc + manifest.resultEnvelope (con AAD = packetId).
     /// </summary>
     public static async Task<(bool Success, byte[]? DecryptedPlainBytes, V2ParsedZipPacket? ResultZip, string ErrorMessage)> CallRemoteInverseAsync(
         PeerNode providerPeer,
@@ -313,16 +314,36 @@ public static class V2NetworkClient
 
         string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
 
-        if (secretEnvelope == null && rawSecretBytesToSeal is { Length: > 0 })
+        if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+            await FetchAndValidatePeerCertificateAsync(providerPeer);
+
+        if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+            return (false, null, null, $"No se pudo obtener el certificado X.509 de {providerPeer.NodeId} para sellar el sobre CC-ENV-1.");
+
+        using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
+
+        // Si tenemos rawSecretBytesToSeal (o si nos pasaron un secretEnvelope ligado a otro requestId),
+        // sellamos el diccionario plano {"key": "<base64>"} con AAD = requestId para el certificado del proveedor
+        if (rawSecretBytesToSeal is { Length: > 0 })
         {
-            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
-                await FetchAndValidatePeerCertificateAsync(providerPeer);
-
-            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
-                return (false, null, null, $"No se pudo obtener el certificado X.509 de {providerPeer.NodeId} para sellar el sobre CC-ENV-1.");
-
-            using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
-            secretEnvelope = V2EnvelopeService.Seal(rawSecretBytesToSeal, providerCert, providerPeer.NodeId, packetId);
+            string keyB64 = Convert.ToBase64String(rawSecretBytesToSeal);
+            secretEnvelope = V2EnvelopeService.SealSecretsDictionary(
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = keyB64 },
+                providerCert,
+                providerPeer.NodeId,
+                requestId);
+        }
+        else if (secretEnvelope != null &&
+                 string.Equals(providerPeer.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            // Si el sobre fue emitido para nosotros por /api/crypto/forward con su propio requestId previo,
+            // lo abrimos y re-sellamos con el nuevo requestId de esta petición inverse
+            try
+            {
+                var openedDict = V2EnvelopeService.OpenSecretsDictionary(secretEnvelope, string.Empty, packetId);
+                secretEnvelope = V2EnvelopeService.SealSecretsDictionary(openedDict, providerCert, providerPeer.NodeId, requestId);
+            }
+            catch { }
         }
 
         var invReq = new V2CryptoInverseRequest
@@ -330,10 +351,11 @@ public static class V2NetworkClient
             RequestId = requestId,
             PacketId = packetId,
             RequesterNode = NodeRuntimeState.CurrentNodeId,
+            TargetNode = providerPeer.NodeId,
             AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
             Operation = "inverse",
-            KeyId = keyId ?? packetId,
-            SecretEnvelope = secretEnvelope,
+            KeyId = keyId ?? V2FormatValidators.BuildKeyId(providerPeer.NodeId, packetId),
+            Secrets = secretEnvelope,
             PublicParameters = publicParameters,
             TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         };
@@ -388,11 +410,29 @@ public static class V2NetworkClient
         {
             await File.WriteAllBytesAsync(tempResZip, resultZipBytes);
             var parsedRes = V2PacketZipService.ReadPacketZip(tempResZip, enforceStrictSignature: true);
-            string envJson = Encoding.UTF8.GetString(parsedRes.PayloadBytes);
-            var resultEnv = JsonSerializer.Deserialize<CcHybridEnvelope>(envJson, JsonOpts)
-                ?? throw new PacketValidationException("E-ENV-DECRYPT", 400, "resultado.enc no contiene un sobre CC-ENV-1 válido.");
 
-            byte[] plainBytes = V2EnvelopeService.Open(resultEnv, requestId);
+            byte[] plainBytes;
+            if (parsedRes.Manifest.ResultEnvelope != null)
+            {
+                // Estándar v2.0 (Sección 8.3): el cifrado va en resultado.enc y los metadatos CC-ENV-1 (sin ciphertextBase64) en manifest.resultEnvelope con AAD = packetId
+                plainBytes = V2EnvelopeService.Open(
+                    parsedRes.Manifest.ResultEnvelope,
+                    expectedAadContext: parsedRes.Manifest.PacketId,
+                    detachedCiphertext: parsedRes.PayloadBytes,
+                    fallbackAadContext: requestId);
+            }
+            else
+            {
+                // Alias tolerante por si un nodo tercero serializó el sobre JSON dentro de resultado.enc
+                string envJson = Encoding.UTF8.GetString(parsedRes.PayloadBytes);
+                var inlineEnv = JsonSerializer.Deserialize<CcHybridEnvelope>(envJson, JsonOpts)
+                    ?? throw new PacketValidationException("E-ENV-DECRYPT", 401, "El paquete result no contiene resultEnvelope en manifest.json ni en resultado.enc.");
+                plainBytes = V2EnvelopeService.Open(
+                    inlineEnv,
+                    expectedAadContext: parsedRes.Manifest.PacketId,
+                    fallbackAadContext: requestId);
+            }
+
             return (true, plainBytes, parsedRes, "OK");
         }
         finally

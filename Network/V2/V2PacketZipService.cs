@@ -23,25 +23,25 @@ public sealed class V2ParsedZipPacket
 
 /// <summary>
 /// Empaqueta, reempaqueta y valida paquetes .zip v2.0 cumpliendo en orden estricto los 14 pasos de la Sección 13.1:
-/// 1. E-SIZE (> 50 MB -> 413)
-/// 2. E-ZIP-INVALID (ZIP corrupto -> 400)
-/// 3. E-ZIP-STRUCTURE (≠ 3 entradas, subcarpetas o nombres inválidos -> 400)
-/// 4. E-ZIP-BOMB (> 200 MB descomprimido o ratio > 100:1 -> 400)
-/// 5. E-MANIFEST (manifest.json malformado o campos obligatorios vacíos -> 400)
-/// 6. E-VERSION (version != "2.0" -> 400)
-/// 7. E-ALGORITHM (algoritmo no oficial -> 400)
-/// 8. E-HASH (encryptedSha256 != SHA256(payload) -> 400)
-/// 9. E-PARAMS-HASH (publicParametersSha256 != canonical SHA256(publicParameters) -> 400)
-/// 10. E-CERT (PEM inválido, fuera de vigencia, RSA < 2048 o CN != sourceNode -> 400)
-/// 11. E-CERT-THUMBPRINT (certificateThumbprintSha256 != huella real del DER -> 400)
-/// 12. E-SIGNATURE (signatureAlgorithm != "RSA-PSS-SHA256" o firma RSA-PSS de 11 campos inválida -> 400)
-/// 13. E-TIMESTAMP (timestampUtc fuera de ±10 minutos -> 400)
-/// 14. E-DUPLICATE (packetId ya registrado en SeenPackets -> 409)
+/// 1. 413 E-SIZE (> 52,428,800 B)
+/// 2. 400 E-ZIP-INVALID (ZIP corrupto)
+/// 3. 400 E-ZIP-STRUCTURE (≠ 3 entradas, subcarpetas o nombres inválidos)
+/// 4. 400 E-ZIP-BOMB (> 209,715,200 B descomprimido o ratio > 100:1)
+/// 5. 400 E-MANIFEST (manifest.json malformado, campos obligatorios vacíos o publicParameters anidado)
+/// 6. 400 E-VERSION (version != "2.0")
+/// 7. 400 E-ALGORITHM (algoritmo no oficial o algorithmId incoherente)
+/// 8. 422 E-HASH (encryptedSha256 != SHA256(payload) en 64 hex minúsculas)
+/// 9. 422 E-PARAMS-HASH (publicParametersSha256 != canonical SHA256(publicParameters))
+/// 10. 422 E-CERT (PEM inválido, fuera de vigencia, RSA != 2048 o CN != sourceNode)
+/// 11. 422 E-CERT-THUMBPRINT (certificateThumbprintSha256 != huella real del DER en 64 HEX MAYÚSCULAS)
+/// 12. 422 E-SIGNATURE (signatureAlgorithm != "RSA-PSS-SHA256" o firma RSA-PSS de 256 B sobre 11 campos inválida)
+/// 13. 422 E-TIMESTAMP (timestampUtc fuera de ±10 minutos o formato != yyyy-MM-ddTHH:mm:ssZ)
+/// 14. 409 E-DUPLICATE (packetId ya registrado en SeenPackets)
 /// </summary>
 public static class V2PacketZipService
 {
-    public const long MaxCompressedZipBytes = 50L * 1024L * 1024L;      // 50 MB
-    public const long MaxUncompressedTotalBytes = 200L * 1024L * 1024L;  // 200 MB
+    public const long MaxCompressedZipBytes = 50L * 1024L * 1024L;      // 52,428,800 B (50 MB)
+    public const long MaxUncompressedTotalBytes = 200L * 1024L * 1024L;  // 209,715,200 B (200 MB)
     public const double MaxCompressionRatio = 100.0;                     // 100:1
     public const int MaxMultipartEntries = 64;
     public static readonly TimeSpan TimestampWindow = TimeSpan.FromMinutes(10);
@@ -66,7 +66,9 @@ public static class V2PacketZipService
         string? producerNode = null,
         string? destinationPath = null,
         List<ManifestPartInfo>? multipartParts = null,
-        Dictionary<string, string>? explicitPublicParameters = null)
+        Dictionary<string, string>? explicitPublicParameters = null,
+        CcHybridEnvelope? resultEnvelope = null,
+        long? originalSizeBytesOverride = null)
     {
         string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
         Directory.CreateDirectory(outDir);
@@ -101,9 +103,10 @@ public static class V2PacketZipService
             ? parsedGuid.ToString("D").ToLowerInvariant()
             : Guid.NewGuid().ToString("D").ToLowerInvariant();
 
+        // Regla de Oro: jamás inyectar originalFileName, originalExtension ni _packetId en publicParameters
         var publicParamsDict = explicitPublicParameters != null
-            ? new Dictionary<string, string>(explicitPublicParameters, StringComparer.Ordinal)
-            : ParseFlatPublicParameters(registro.ParametrosPublicosJson);
+            ? SanitizePublicParametersForEmission(explicitPublicParameters)
+            : SanitizePublicParametersForEmission(ParseFlatPublicParameters(registro.ParametrosPublicosJson));
 
         string pubParamsSha256Lower = PacketManifest.ComputePublicParametersSha256(publicParamsDict);
 
@@ -118,6 +121,16 @@ public static class V2PacketZipService
         string payloadMode = multipartParts is { Count: > 0 }
             ? "multipart"
             : DetectPayloadMode(registro.Extension);
+
+        string officialKeyId = V2FormatValidators.IsValidKeyId(registro.LinkDescifradoRemoto)
+            ? registro.LinkDescifradoRemoto
+            : V2FormatValidators.BuildKeyId(actualProducer, packetId);
+
+        if (resultEnvelope != null)
+        {
+            // En manifest.resultEnvelope NUNCA debe incluirse ciphertextBase64 (los bytes cifrados van en resultado.enc)
+            resultEnvelope.CiphertextBase64 = null;
+        }
 
         var manifest = new PacketManifest
         {
@@ -138,29 +151,20 @@ public static class V2PacketZipService
             PayloadMode = payloadMode,
             OriginalFileName = string.IsNullOrWhiteSpace(registro.NombreArchivo) ? "archivo.bin" : registro.NombreArchivo,
             OriginalExtension = string.IsNullOrWhiteSpace(registro.Extension) ? ".bin" : registro.Extension,
-            OriginalSizeBytes = cipherBytes.Length,
+            OriginalSizeBytes = originalSizeBytesOverride ?? cipherBytes.Length,
             ContentType = GuessContentType(registro.Extension),
             EncryptedSha256 = sha256FullLower,
             EncryptedSizeBytes = cipherBytes.Length,
             Parts = multipartParts,
             KeyRef = new ManifestKeyRef
             {
-                KeyId = packetId,
+                KeyId = officialKeyId,
                 OwnerNode = actualProducer
             },
             PublicParameters = publicParamsDict,
             PublicParametersSha256 = pubParamsSha256Lower,
             Verification = isResult ? new ManifestVerification { Valid = true, Detail = "OK" } : null,
-            ResultEnvelope = isResult
-                ? new CcEnvelope
-                {
-                    AlgorithmCode = cleanAlg,
-                    Operation = operation,
-                    ProducerNode = actualProducer,
-                    KeyRef = new ManifestKeyRef { KeyId = packetId, OwnerNode = actualProducer },
-                    PublicParameters = publicParamsDict
-                }
-                : null,
+            ResultEnvelope = isResult ? resultEnvelope : null,
             CertificateThumbprintSha256 = certThumbUpper,
             SignatureAlgorithm = "RSA-PSS-SHA256"
         };
@@ -172,9 +176,27 @@ public static class V2PacketZipService
         return zipPath;
     }
 
+    private static Dictionary<string, string> SanitizePublicParametersForEmission(IDictionary<string, string>? source)
+    {
+        var clean = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (source == null) return clean;
+
+        foreach (var kv in source)
+        {
+            if (string.Equals(kv.Key, "originalFileName", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(kv.Key, "originalExtension", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(kv.Key, "_packetId", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            clean[kv.Key] = kv.Value ?? string.Empty;
+        }
+        return clean;
+    }
+
     /// <summary>
     /// Sección 9.6: Reempaquetado para Reenvío (Forwarding).
-    /// Conserva producerNode, datos.enc, publicParameters, keyRef y algorithmCode;
+    /// Conserva producerNode, datos.enc, publicParameters (sin modificar ni agregar nada), keyRef y algorithmCode;
     /// genera nuevo packetId y timestampUtc; coloca sourceNode = EQ01 y nueva firma de 11 campos.
     /// </summary>
     public static string RepackageForForwarding(string sourceZipPath, string? destinationPath = null)
@@ -270,7 +292,7 @@ public static class V2PacketZipService
     }
 
     /// <summary>
-    /// Ejecuta las 14 validaciones de la Sección 13.1 en orden estricto.
+    /// Ejecuta las 14 validaciones de la Sección 13.1 en orden estricto con los códigos y estatus HTTP exactos del Anexo B.
     /// </summary>
     public static V2ParsedZipPacket ReadPacketZip(
         string zipPath,
@@ -283,11 +305,11 @@ public static class V2PacketZipService
         if (!fileInfo.Exists)
             throw new PacketValidationException("E-ZIP-INVALID", 400, "El archivo .zip no existe.");
 
-        // PASO 1: E-SIZE (> 50 MB -> 413)
+        // PASO 1: 413 E-SIZE (> 52,428,800 B)
         if (fileInfo.Length > MaxCompressedZipBytes)
             throw new PacketValidationException("E-SIZE", 413, $"El archivo .zip supera el máximo comprimido de 50 MB ({fileInfo.Length:N0} bytes).");
 
-        // PASO 2: E-ZIP-INVALID
+        // PASO 2: 400 E-ZIP-INVALID
         ZipArchive archive;
         try
         {
@@ -300,7 +322,7 @@ public static class V2PacketZipService
 
         using (archive)
         {
-            // PASO 3: E-ZIP-STRUCTURE (exactamente 3 entradas planas en raíz: {datos.enc|resultado.enc}, certificado.pem, manifest.json)
+            // PASO 3: 400 E-ZIP-STRUCTURE (exactamente 3 entradas planas en raíz: {datos.enc|resultado.enc}, certificado.pem, manifest.json)
             if (archive.Entries.Count != 3)
             {
                 throw new PacketValidationException(
@@ -339,7 +361,7 @@ public static class V2PacketZipService
                     "El paquete .zip debe contener exclusivamente { datos.enc | resultado.enc }, certificado.pem y manifest.json.");
             }
 
-            // PASO 4: E-ZIP-BOMB (> 200 MB descomprimido o ratio > 100:1)
+            // PASO 4: 400 E-ZIP-BOMB (> 209,715,200 B descomprimido o ratio > 100:1)
             long totalUncompressed = 0;
             foreach (var entry in archive.Entries)
             {
@@ -366,12 +388,31 @@ public static class V2PacketZipService
             var payloadEntry = datosEntry ?? resultadoEntry!;
             string expectedPacketType = datosEntry != null ? "package" : "result";
 
-            // PASO 5: E-MANIFEST
+            // PASO 5: 400 E-MANIFEST
             PacketManifest manifest;
             try
             {
                 using var sr = new StreamReader(manifestEntry.Open(), Encoding.UTF8);
                 string json = sr.ReadToEnd();
+
+                using (var rawDoc = JsonDocument.Parse(json))
+                {
+                    if (rawDoc.RootElement.TryGetProperty("publicParameters", out var ppEl) &&
+                        ppEl.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var prop in ppEl.EnumerateObject())
+                        {
+                            if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+                            {
+                                throw new PacketValidationException(
+                                    "E-MANIFEST",
+                                    400,
+                                    $"publicParameters debe ser un mapa plano clave->cadena; la clave '{prop.Name}' contiene un objeto o arreglo anidado.");
+                            }
+                        }
+                    }
+                }
+
                 manifest = JsonSerializer.Deserialize<PacketManifest>(json, ReadJsonOpts)
                     ?? throw new PacketValidationException("E-MANIFEST", 400, "No se pudo deserializar manifest.json.");
             }
@@ -385,12 +426,12 @@ public static class V2PacketZipService
             }
 
             if (string.IsNullOrWhiteSpace(manifest.PacketId) ||
-                string.IsNullOrWhiteSpace(manifest.SourceNode) ||
-                string.IsNullOrWhiteSpace(manifest.ProducerNode) ||
+                !V2FormatValidators.IsValidNodeId(manifest.SourceNode) ||
+                !V2FormatValidators.IsValidNodeId(manifest.ProducerNode) ||
                 string.IsNullOrWhiteSpace(manifest.AlgorithmCode) ||
-                string.IsNullOrWhiteSpace(manifest.Operation))
+                (manifest.Operation is not ("forward" or "inverse")))
             {
-                throw new PacketValidationException("E-MANIFEST", 400, "Faltan campos obligatorios en manifest.json.");
+                throw new PacketValidationException("E-MANIFEST", 400, "Faltan campos obligatorios o tienen formato inválido en manifest.json.");
             }
 
             if (!string.Equals(manifest.PacketType, expectedPacketType, StringComparison.OrdinalIgnoreCase))
@@ -401,13 +442,13 @@ public static class V2PacketZipService
                     $"Inconsistencia entre archivo '{payloadEntry.FullName}' y packetType='{manifest.PacketType}'.");
             }
 
-            // PASO 6: E-VERSION
+            // PASO 6: 400 E-VERSION
             if (!string.Equals(manifest.Version, "2.0", StringComparison.Ordinal))
             {
                 throw new PacketValidationException("E-VERSION", 400, $"Versión de protocolo '{manifest.Version}' no soportada (se requiere '2.0').");
             }
 
-            // PASO 7: E-ALGORITHM
+            // PASO 7: 400 E-ALGORITHM
             if (!CryptoCatalog.IsOfficialCode(manifest.AlgorithmCode))
             {
                 throw new PacketValidationException("E-ALGORITHM", 400, $"Algoritmo '{manifest.AlgorithmCode}' desconocido o fuera del catálogo oficial.");
@@ -415,25 +456,27 @@ public static class V2PacketZipService
 
             byte[] payload = ReadStreamBounded(payloadEntry.Open(), MaxUncompressedTotalBytes);
 
-            // PASO 8: E-HASH (encryptedSha256 en hex minúsculas)
+            // PASO 8: 422 E-HASH (encryptedSha256 en 64 hex minúsculas)
             string computedPayloadSha256Lower = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
-            bool payloadHashOk = V2CertificateService.FixedTimeEqualsHex(computedPayloadSha256Lower, manifest.EncryptedSha256);
+            bool payloadHashOk = V2FormatValidators.IsValidSha256Lower(manifest.EncryptedSha256) &&
+                                 V2CertificateService.FixedTimeEqualsHex(computedPayloadSha256Lower, manifest.EncryptedSha256);
             if (!payloadHashOk && enforceStrictSignature)
             {
                 throw new PacketValidationException(
                     "E-HASH",
-                    400,
+                    422,
                     "El hash SHA-256 de los datos cifrados no coincide con encryptedSha256 del manifiesto.");
             }
 
-            // PASO 9: E-PARAMS-HASH (publicParametersSha256 canónico)
+            // PASO 9: 422 E-PARAMS-HASH (publicParametersSha256 canónico en 64 hex minúsculas)
             string computedPubParamsSha256Lower = PacketManifest.ComputePublicParametersSha256(manifest.PublicParameters);
-            bool pubParamsHashOk = V2CertificateService.FixedTimeEqualsHex(computedPubParamsSha256Lower, manifest.PublicParametersSha256);
+            bool pubParamsHashOk = V2FormatValidators.IsValidSha256Lower(manifest.PublicParametersSha256) &&
+                                   V2CertificateService.FixedTimeEqualsHex(computedPubParamsSha256Lower, manifest.PublicParametersSha256);
             if (!pubParamsHashOk && enforceStrictSignature)
             {
                 throw new PacketValidationException(
                     "E-PARAMS-HASH",
-                    400,
+                    422,
                     "El hash canónico publicParametersSha256 no coincide con publicParameters.");
             }
 
@@ -442,13 +485,13 @@ public static class V2PacketZipService
                 ValidateMultipartInnerZip(payload, manifest.Parts);
             }
 
-            // PASO 10: E-CERT (Certificado PEM válido, vigencia, RSA >= 2048 y CN == sourceNode)
+            // PASO 10: 422 E-CERT (Certificado PEM válido, vigencia, RSA-2048 y CN == sourceNode)
             string certPem;
             using (var srPem = new StreamReader(pemEntry.Open(), Encoding.UTF8))
                 certPem = srPem.ReadToEnd();
 
             if (string.IsNullOrWhiteSpace(certPem) || !certPem.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
-                throw new PacketValidationException("E-CERT", 400, "El archivo certificado.pem no contiene un certificado PEM válido.");
+                throw new PacketValidationException("E-CERT", 422, "El archivo certificado.pem no contiene un certificado PEM válido.");
 
             X509Certificate2 cert;
             try
@@ -457,7 +500,7 @@ public static class V2PacketZipService
             }
             catch (Exception ex)
             {
-                throw new PacketValidationException("E-CERT", 400, $"No se pudo cargar certificado.pem: {ex.Message}");
+                throw new PacketValidationException("E-CERT", 422, $"No se pudo cargar certificado.pem: {ex.Message}");
             }
 
             using (cert)
@@ -465,23 +508,24 @@ public static class V2PacketZipService
                 if (!V2CertificateService.ValidateCertificateMetadata(cert, manifest.SourceNode, out string certErr))
                 {
                     if (enforceStrictSignature)
-                        throw new PacketValidationException("E-CERT", 400, certErr);
+                        throw new PacketValidationException("E-CERT", 422, certErr);
                 }
 
-                // PASO 11: E-CERT-THUMBPRINT
+                // PASO 11: 422 E-CERT-THUMBPRINT
                 string actualThumbprint = V2CertificateService.GetThumbprintSha256Hex(cert);
-                if (!V2CertificateService.FixedTimeEqualsHex(actualThumbprint, manifest.CertificateThumbprintSha256))
+                if (!V2FormatValidators.IsValidThumbprintUpper(manifest.CertificateThumbprintSha256) ||
+                    !V2CertificateService.FixedTimeEqualsHex(actualThumbprint, manifest.CertificateThumbprintSha256))
                 {
                     if (enforceStrictSignature)
                     {
                         throw new PacketValidationException(
                             "E-CERT-THUMBPRINT",
-                            400,
+                            422,
                             $"La huella SHA-256 real del certificado ('{actualThumbprint}') no coincide con certificateThumbprintSha256 ('{manifest.CertificateThumbprintSha256}').");
                     }
                 }
 
-                // PASO 12: E-SIGNATURE (exclusivamente RSA-PSS-SHA256 sobre los 11 campos canónicos)
+                // PASO 12: 422 E-SIGNATURE (exclusivamente RSA-PSS-SHA256 de 256 bytes sobre los 11 campos canónicos)
                 string canonical11 = manifest.BuildCanonicalSigningString();
                 bool sigValid = string.Equals(manifest.SignatureAlgorithm, "RSA-PSS-SHA256", StringComparison.Ordinal) &&
                                 V2CertificateService.VerifyWithPem(Encoding.UTF8.GetBytes(canonical11), manifest.ManifestSignatureBase64, certPem);
@@ -490,33 +534,35 @@ public static class V2PacketZipService
                 {
                     throw new PacketValidationException(
                         "E-SIGNATURE",
-                        400,
+                        422,
                         "Firma digital RSA-PSS-SHA256 inválida sobre la cadena canónica de 11 campos.");
                 }
 
-                // PASO 13: E-TIMESTAMP (ventana ±10 minutos UTC)
+                // PASO 13: 422 E-TIMESTAMP (formato exacto yyyy-MM-ddTHH:mm:ssZ y ventana ±10 minutos UTC)
                 DateTime packetTimeUtc = DateTime.UtcNow;
                 if (validateTimestamp || checkAndRecordReplay)
                 {
-                    if (!DateTime.TryParse(
+                    if (!V2FormatValidators.IsValidTimestampUtc(manifest.TimestampUtc) ||
+                        !DateTime.TryParseExact(
                             manifest.TimestampUtc,
+                            "yyyy-MM-dd'T'HH:mm:ss'Z'",
                             CultureInfo.InvariantCulture,
                             DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal,
                             out packetTimeUtc))
                     {
-                        throw new PacketValidationException("E-TIMESTAMP", 400, "Formato timestampUtc inválido (se requiere ISO-8601 UTC).");
+                        throw new PacketValidationException("E-TIMESTAMP", 422, "Formato timestampUtc inválido (se requiere yyyy-MM-ddTHH:mm:ssZ).");
                     }
 
                     if (Math.Abs((DateTime.UtcNow - packetTimeUtc).TotalMinutes) > TimestampWindow.TotalMinutes)
                     {
                         throw new PacketValidationException(
                             "E-TIMESTAMP",
-                            400,
+                            422,
                             $"El timestampUtc '{manifest.TimestampUtc}' está fuera de la ventana permitida de ±{TimestampWindow.TotalMinutes:F0} minutos.");
                     }
                 }
 
-                // PASO 14: E-DUPLICATE (tabla SeenPackets en SQLite -> 409 Conflict)
+                // PASO 14: 409 E-DUPLICATE (tabla SeenPackets en SQLite -> 409 Conflict)
                 if (checkAndRecordReplay)
                 {
                     using var db = string.IsNullOrWhiteSpace(customDbPath) ? new AppDbContext() : new AppDbContext(customDbPath);
@@ -609,11 +655,11 @@ public static class V2PacketZipService
 
             byte[] partBytes = ReadStreamBounded(entry.Open(), MaxUncompressedTotalBytes);
             if (partBytes.Length != decl.SizeBytes)
-                throw new PacketValidationException("E-HASH", 400, $"El tamaño de '{expectedName}' no coincide con manifest.parts.");
+                throw new PacketValidationException("E-HASH", 422, $"El tamaño de '{expectedName}' no coincide con manifest.parts.");
 
             string actualSha = Convert.ToHexString(SHA256.HashData(partBytes)).ToLowerInvariant();
             if (!V2CertificateService.FixedTimeEqualsHex(actualSha, decl.Sha256))
-                throw new PacketValidationException("E-HASH", 400, $"El SHA-256 de '{expectedName}' no coincide con manifest.parts.");
+                throw new PacketValidationException("E-HASH", 422, $"El SHA-256 de '{expectedName}' no coincide con manifest.parts.");
         }
     }
 
