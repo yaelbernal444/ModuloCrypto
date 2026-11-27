@@ -70,7 +70,7 @@ public static class V2PacketZipService
         CcHybridEnvelope? resultEnvelope = null,
         long? originalSizeBytesOverride = null)
     {
-        string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
+        string outDir = Core.Data.AppDbContext.OutgoingPacketsDirectory;
         Directory.CreateDirectory(outDir);
 
         bool isResult = string.Equals(packetType, "result", StringComparison.OrdinalIgnoreCase);
@@ -219,7 +219,7 @@ public static class V2PacketZipService
             : $"EQ{NodeRuntimeState.TeamNumber:D2}";
         string cleanAlg = orig.AlgorithmCode.Trim().ToUpperInvariant();
 
-        string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
+        string outDir = Core.Data.AppDbContext.OutgoingPacketsDirectory;
         Directory.CreateDirectory(outDir);
         string zipPath = destinationPath ?? Path.Combine(outDir, $"{sourceNode}_{cleanAlg}_{timestampFile}_{sha8Upper}.zip");
 

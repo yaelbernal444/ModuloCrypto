@@ -132,9 +132,15 @@ public sealed class V1ApiHostService : IAsyncDisposable
 
     private static async Task<IResult> ProcessIncomingZipAsync(HttpRequest request, bool returnAccepted202)
     {
+        string remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
+        string endpointPath = request.Path.HasValue ? request.Path.Value! : "/api/packets/receive";
+        string nodeHeader = request.Headers.TryGetValue("X-CC-Node-Id", out var hNode) && !string.IsNullOrWhiteSpace(hNode)
+            ? hNode.ToString()
+            : "NODO-??";
+
         try
         {
-            string incomingDir = Path.Combine(AppContext.BaseDirectory, "IncomingPackets");
+            string incomingDir = AppDbContext.IncomingPacketsDirectory;
             Directory.CreateDirectory(incomingDir);
 
             string fileName = $"packet_{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.zip";
@@ -182,6 +188,13 @@ public sealed class V1ApiHostService : IAsyncDisposable
                 await db.SaveChangesAsync();
             }
 
+            NodeRuntimeState.AddNetworkLog(
+                ipOrigen,
+                solicitud.NodoOrigen,
+                endpointPath,
+                returnAccepted202 ? 202 : 200,
+                $"accepted ({solicitud.AlgoritmoCodigo}, zip={fileName})");
+
             NodeRuntimeState.NotifyPacketReceived(solicitud);
 
             if (returnAccepted202)
@@ -210,6 +223,7 @@ public sealed class V1ApiHostService : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 400, $"E-BAD-REQUEST: {ex.Message}");
             return Results.BadRequest(new { Success = false, Error = ex.Message });
         }
     }

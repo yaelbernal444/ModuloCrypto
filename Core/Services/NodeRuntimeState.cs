@@ -50,9 +50,14 @@ public static class NodeRuntimeState
 
     public static List<PeerNode> NetworkPeers { get; } = new();
 
+    private static readonly object NetworkLogLock = new();
+    private static readonly List<string> NetworkLogBuffer = new();
+    private const int MaxNetworkLogEntries = 200;
+
     public static event Action<SolicitudEntrante>? OnPacketReceived;
     public static event Action<PeerNode>? OnPeerDiscoveredOrChanged;
     public static event Action<LocalNetworkEndpoint>? OnActiveEndpointUpdated;
+    public static event Action<string>? OnNetworkLogAdded;
 
     static NodeRuntimeState()
     {
@@ -188,6 +193,39 @@ public static class NodeRuntimeState
     public static void NotifyPeerChanged(PeerNode peer)
     {
         OnPeerDiscoveredOrChanged?.Invoke(peer);
+    }
+
+    public static void AddNetworkLog(string ip, string nodeId, string endpoint, int httpStatus, string codeOrDetail)
+    {
+        string cleanIp = string.IsNullOrWhiteSpace(ip) ? "127.0.0.1" : ip.Trim();
+        string cleanNode = string.IsNullOrWhiteSpace(nodeId) ? "??" : nodeId.Trim();
+        string cleanEp = string.IsNullOrWhiteSpace(endpoint) ? "/" : endpoint.Trim();
+        string line = $"[{DateTime.Now:HH:mm:ss}] {cleanIp} {cleanNode} {cleanEp} -> HTTP {httpStatus} {codeOrDetail}";
+
+        lock (NetworkLogLock)
+        {
+            NetworkLogBuffer.Add(line);
+            if (NetworkLogBuffer.Count > MaxNetworkLogEntries)
+                NetworkLogBuffer.RemoveAt(0);
+        }
+
+        OnNetworkLogAdded?.Invoke(line);
+    }
+
+    public static IReadOnlyList<string> GetNetworkLogsSnapshot()
+    {
+        lock (NetworkLogLock)
+        {
+            return NetworkLogBuffer.ToList();
+        }
+    }
+
+    public static void ClearNetworkLogs()
+    {
+        lock (NetworkLogLock)
+        {
+            NetworkLogBuffer.Clear();
+        }
     }
 
     public static IReadOnlyList<string> GetOwnedAlgorithmsForTeam(int team) => team switch

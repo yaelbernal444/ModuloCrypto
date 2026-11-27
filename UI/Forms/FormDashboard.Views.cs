@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
@@ -16,8 +17,9 @@ namespace ModuloCrypto.UI.Forms;
 
 public partial class FormDashboard
 {
-    // Solicitudes (Bandeja)
+    // Solicitudes (Bandeja + Bitácora de Red)
     private DataGridView _gridSolicitudes = null!;
+    private TextBox _txtNetworkEventLog = null!;
 
     // Consultas (Historial)
     private DataGridView _gridConsultas = null!;
@@ -234,14 +236,16 @@ public partial class FormDashboard
 
     private void HandleNetworkEndpointsChangedEvent(LocalNetworkEndpoint ep)
     {
-        if (IsDisposed) return;
-        BeginInvoke(async () =>
+        if (IsHandleCreated && !IsDisposed)
         {
-            RefreshActiveIpCardUi();
-            RefreshNetworkGrid();
-            RefreshTargetPeerCombo();
-            await _runtime.AnnouncePresenceAsync();
-        });
+            BeginInvoke(async () =>
+            {
+                RefreshActiveIpCardUi();
+                RefreshNetworkGrid();
+                RefreshTargetPeerCombo();
+                await _runtime.AnnouncePresenceAsync();
+            });
+        }
     }
 
     private void BuildSolicitudesView()
@@ -307,7 +311,7 @@ public partial class FormDashboard
         };
 
         var btnAccept = new NeonButton { Text = "✓ Aceptar y Descifrar", Variant = NeonButtonVariant.Success, Margin = new Padding(0, 2, 8, 2) };
-        btnAccept.FitToText(minWidth: 165, height: 38);
+        btnAccept.FitToText(minWidth: 165, height: 36);
         btnAccept.Click += async (_, _) =>
         {
             btnAccept.Enabled = false;
@@ -316,7 +320,7 @@ public partial class FormDashboard
         };
 
         var btnReject = new NeonButton { Text = "✕ Rechazar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
-        btnReject.FitToText(minWidth: 110, height: 38);
+        btnReject.FitToText(minWidth: 105, height: 36);
         btnReject.Click += (_, _) => HandleUpdateSolicitudEstado("Rechazada");
 
         var btnForward = new NeonButton
@@ -325,7 +329,7 @@ public partial class FormDashboard
             Variant = NeonButtonVariant.Primary,
             Margin = new Padding(0, 2, 8, 2)
         };
-        btnForward.FitToText(minWidth: 140, height: 38);
+        btnForward.FitToText(minWidth: 136, height: 36);
         btnForward.Click += async (_, _) =>
         {
             btnForward.Enabled = false;
@@ -334,17 +338,99 @@ public partial class FormDashboard
         };
 
         var btnImportZip = new NeonButton { Text = "📥 Importar .ZIP", Variant = NeonButtonVariant.Cyan, Margin = new Padding(0, 2, 8, 2) };
-        btnImportZip.FitToText(minWidth: 135, height: 38);
+        btnImportZip.FitToText(minWidth: 132, height: 36);
         btnImportZip.Click += (_, _) => HandleImportZipToInbox();
 
-        var btnRefresh = new NeonButton { Text = "↻ Actualizar", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
-        btnRefresh.FitToText(minWidth: 112, height: 38);
-        btnRefresh.Click += (_, _) => { RefreshSolicitudesGrid(); RefreshPendingSolicitudesBadge(); };
+        var btnCleanOrphans = new NeonButton { Text = "🧹 Limpiar Huérfanas", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
+        btnCleanOrphans.FitToText(minWidth: 158, height: 36);
+        btnCleanOrphans.Click += (_, _) => HandleCleanOrphanSolicitudes();
 
-        btnFlow.Controls.AddRange(new Control[] { btnAccept, btnReject, btnForward, btnImportZip, btnRefresh });
+        var btnDeleteSolicitud = new NeonButton { Text = "🗑 Eliminar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
+        btnDeleteSolicitud.FitToText(minWidth: 108, height: 36);
+        btnDeleteSolicitud.Click += (_, _) => HandleDeleteSelectedSolicitud();
+
+        var btnRefresh = new NeonButton { Text = "↻ Actualizar", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
+        btnRefresh.FitToText(minWidth: 110, height: 36);
+        btnRefresh.Click += (_, _) =>
+        {
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+            RefreshConsultasGrid();
+            RefreshNetworkLogBox();
+        };
+
+        btnFlow.Controls.AddRange(new Control[]
+        {
+            btnAccept,
+            btnReject,
+            btnForward,
+            btnImportZip,
+            btnCleanOrphans,
+            btnDeleteSolicitud,
+            btnRefresh
+        });
 
         header.Controls.Add(titleStack, 0, 0);
         header.Controls.Add(btnFlow, 0, 1);
+
+        // Panel compacto inferior (95 px) con Bitácora en tiempo real de peticiones aceptadas y rechazadas
+        var logPanel = new GlassPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 96,
+            CornerRadius = 12,
+            BorderColor = HologramTheme.BorderSubtle,
+            FillColorTop = Color.FromArgb(16, 14, 30),
+            FillColorBottom = Color.FromArgb(12, 10, 24),
+            Padding = new Padding(10, 6, 10, 6)
+        };
+
+        var logTopBar = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 20,
+            BackColor = Color.Transparent
+        };
+
+        var lblLogCaption = new Label
+        {
+            Text = "📡 Registro de Red (Últimos Eventos / Rechazos):",
+            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
+            ForeColor = HologramTheme.HologramCyan,
+            Dock = DockStyle.Left,
+            AutoSize = true,
+            BackColor = Color.Transparent
+        };
+
+        var lblClearLog = new Label
+        {
+            Text = "[Limpiar log]",
+            Font = new Font("Cascadia Mono", 8f, FontStyle.Underline),
+            ForeColor = HologramTheme.TextSecondary,
+            Dock = DockStyle.Right,
+            AutoSize = true,
+            Cursor = Cursors.Hand,
+            BackColor = Color.Transparent
+        };
+        lblClearLog.Click += (_, _) =>
+        {
+            NodeRuntimeState.ClearNetworkLogs();
+            RefreshNetworkLogBox();
+        };
+
+        logTopBar.Controls.Add(lblClearLog);
+        logTopBar.Controls.Add(lblLogCaption);
+
+        _txtNetworkEventLog = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: true, mono: true);
+        _txtNetworkEventLog.Dock = DockStyle.Fill;
+        _txtNetworkEventLog.Font = new Font("Cascadia Mono", 8.4f);
+        _txtNetworkEventLog.ScrollBars = ScrollBars.Vertical;
+        _txtNetworkEventLog.WordWrap = false;
+        _txtNetworkEventLog.BackColor = Color.FromArgb(12, 10, 24);
+        _txtNetworkEventLog.ForeColor = HologramTheme.TextPrimary;
+
+        logPanel.Controls.Add(_txtNetworkEventLog);
+        logPanel.Controls.Add(logTopBar);
 
         _gridSolicitudes = new DataGridView { Dock = DockStyle.Fill };
         HologramTheme.StyleDataGrid(_gridSolicitudes);
@@ -357,20 +443,48 @@ public partial class FormDashboard
                                          st == "Rechazada" ? HologramTheme.Danger : HologramTheme.Warning;
         };
 
-        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 0, 0), BackColor = HologramTheme.PanelGlass };
+        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 8), BackColor = HologramTheme.PanelGlass };
         gridWrap.Controls.Add(_gridSolicitudes);
 
         card.Controls.Add(gridWrap);
+        card.Controls.Add(logPanel);
         card.Controls.Add(header);
         panel.Controls.Add(card);
+
+        RefreshNetworkLogBox();
+    }
+
+    private void RefreshNetworkLogBox()
+    {
+        if (_txtNetworkEventLog == null || _txtNetworkEventLog.IsDisposed) return;
+        var logs = NodeRuntimeState.GetNetworkLogsSnapshot();
+        if (logs.Count == 0)
+        {
+            _txtNetworkEventLog.Text = $"[{DateTime.Now:HH:mm:ss}] Escuchando peticiones en {NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort} (/api/requests/receive, /api/crypto/forward, /api/crypto/inverse)...";
+            return;
+        }
+        _txtNetworkEventLog.Text = string.Join(Environment.NewLine, logs);
+        _txtNetworkEventLog.SelectionStart = _txtNetworkEventLog.TextLength;
+        _txtNetworkEventLog.ScrollToCaret();
+    }
+
+    private void AppendOrRefreshNetworkLogLine(string logLine)
+    {
+        if (_txtNetworkEventLog == null || _txtNetworkEventLog.IsDisposed) return;
+        RefreshNetworkLogBox();
     }
 
     private void RefreshSolicitudesGrid()
     {
         if (_gridSolicitudes == null) return;
         using var db = new AppDbContext();
-        var rows = db.SolicitudesEntrantes
+        var list = db.SolicitudesEntrantes
+            .AsNoTracking()
             .OrderByDescending(s => s.FechaRecepcion)
+            .ThenByDescending(s => s.Id)
+            .ToList();
+
+        var rows = list
             .Select(s => new
             {
                 s.Id,
@@ -384,7 +498,102 @@ public partial class FormDashboard
                 Recibido = s.FechaRecepcion.ToString("yyyy-MM-dd HH:mm:ss")
             })
             .ToList();
+
+        _gridSolicitudes.DataSource = null;
         _gridSolicitudes.DataSource = rows;
+    }
+
+    private void HandleCleanOrphanSolicitudes()
+    {
+        try
+        {
+            using var db = new AppDbContext();
+            var pendingList = db.SolicitudesEntrantes
+                .Where(s => s.Estado == "Pendiente")
+                .ToList();
+
+            var orphans = pendingList
+                .Where(s => string.IsNullOrWhiteSpace(s.RutaZipTemporal) || !File.Exists(s.RutaZipTemporal))
+                .ToList();
+
+            if (orphans.Count == 0)
+            {
+                MessageBox.Show(this,
+                    "No se encontraron solicitudes pendientes huérfanas (todos los paquetes .zip pendientes existen en disco).",
+                    "Limpiar Solicitudes Huérfanas",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var choice = MessageBox.Show(this,
+                $"Se detectaron {orphans.Count} solicitud(es) en estado 'Pendiente' cuyo archivo .zip temporal ya no existe en disco.\n\n" +
+                $"• Pulsa [Sí] para ELIMINARLAS permanentemente de SolicitudesEntrantes.\n" +
+                $"• Pulsa [No] para marcarlas como 'Rechazada'.\n" +
+                $"• Pulsa [Cancelar] para no hacer cambios.",
+                "Limpiar Solicitudes Huérfanas",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question);
+
+            if (choice == DialogResult.Cancel) return;
+
+            if (choice == DialogResult.Yes)
+            {
+                db.SolicitudesEntrantes.RemoveRange(orphans);
+            }
+            else
+            {
+                foreach (var o in orphans)
+                    o.Estado = "Rechazada";
+            }
+
+            db.SaveChanges();
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+
+            MessageBox.Show(this,
+                choice == DialogResult.Yes
+                    ? $"Se eliminaron {orphans.Count} solicitud(es) huérfana(s)."
+                    : $"Se marcaron {orphans.Count} solicitud(es) huérfana(s) como 'Rechazada'.",
+                "Limpieza Completada",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Error de SQLite al limpiar solicitudes huérfanas:\n{ex.Message}", "Error SQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void HandleDeleteSelectedSolicitud()
+    {
+        if (_gridSolicitudes.SelectedRows.Count == 0) return;
+        int id = Convert.ToInt32(_gridSolicitudes.SelectedRows[0].Cells["Id"].Value);
+
+        try
+        {
+            using var db = new AppDbContext();
+            var sol = db.SolicitudesEntrantes.Find(id);
+            if (sol == null) return;
+
+            if (MessageBox.Show(this,
+                $"¿Eliminar la solicitud #{sol.Id} ({sol.NombreZip} de {sol.NodoOrigen})?",
+                "Eliminar Solicitud",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            db.SolicitudesEntrantes.Remove(sol);
+            db.SaveChanges();
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Error de SQLite al eliminar la solicitud:\n{ex.Message}", "Error SQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void HandleImportZipToInbox()
@@ -394,7 +603,7 @@ public partial class FormDashboard
 
         try
         {
-            string dir = Path.Combine(AppContext.BaseDirectory, "IncomingPackets");
+            string dir = AppDbContext.IncomingPacketsDirectory;
             Directory.CreateDirectory(dir);
             string dest = Path.Combine(dir, $"{Guid.NewGuid().ToString("N")[..6]}_{Path.GetFileName(ofd.FileName)}");
 
@@ -404,7 +613,7 @@ public partial class FormDashboard
                 File.Copy(ofd.FileName, dest, true);
 
                 using var db = new AppDbContext();
-                db.SolicitudesEntrantes.Add(new SolicitudEntrante
+                var nueva = new SolicitudEntrante
                 {
                     PacketId = parsed.Manifest.PacketId,
                     NodoOrigen = parsed.Manifest.SourceNode,
@@ -415,8 +624,10 @@ public partial class FormDashboard
                     RutaZipTemporal = dest,
                     Estado = "Pendiente",
                     FechaRecepcion = DateTime.Now
-                });
+                };
+                db.SolicitudesEntrantes.Add(nueva);
                 db.SaveChanges();
+                NodeRuntimeState.AddNetworkLog("LOCAL", parsed.Manifest.SourceNode, "Importar .ZIP", 202, $"accepted ({parsed.Manifest.AlgorithmCode}, packetId={parsed.Manifest.PacketId})");
             }
             else
             {
@@ -424,7 +635,7 @@ public partial class FormDashboard
                 File.Copy(ofd.FileName, dest, true);
 
                 using var db = new AppDbContext();
-                db.SolicitudesEntrantes.Add(new SolicitudEntrante
+                var nueva = new SolicitudEntrante
                 {
                     PacketId = parsed.Manifest.PacketId,
                     NodoOrigen = parsed.Manifest.NodoRaiz,
@@ -435,8 +646,10 @@ public partial class FormDashboard
                     RutaZipTemporal = dest,
                     Estado = "Pendiente",
                     FechaRecepcion = DateTime.Now
-                });
+                };
+                db.SolicitudesEntrantes.Add(nueva);
                 db.SaveChanges();
+                NodeRuntimeState.AddNetworkLog("LOCAL", parsed.Manifest.NodoRaiz, "Importar .ZIP v1.0", 200, $"accepted ({parsed.Manifest.AlgoritmoCodigo})");
             }
 
             RefreshSolicitudesGrid();
@@ -444,6 +657,7 @@ public partial class FormDashboard
         }
         catch (PacketValidationException pve)
         {
+            NodeRuntimeState.AddNetworkLog("LOCAL", "IMPORT", "Importar .ZIP", pve.HttpStatusCode, $"{pve.ErrorCode}: {pve.Message}");
             MessageBox.Show(this,
                 $"Paquete .zip rechazado por validación de seguridad v2.0:\n\n" +
                 $"• Código de Error : {pve.ErrorCode} (HTTP {pve.HttpStatusCode})\n" +
@@ -527,10 +741,53 @@ public partial class FormDashboard
 
         using var db = new AppDbContext();
         var sol = db.SolicitudesEntrantes.Find(id);
-        if (sol == null || !File.Exists(sol.RutaZipTemporal))
+        if (sol == null)
         {
-            MessageBox.Show(this, "No se encontró el archivo .zip temporal de esta solicitud.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
             return;
+        }
+
+        // Si el archivo .zip temporal ya no existe en disco, intentar repararlo desde IncomingPacketsDirectory
+        if (string.IsNullOrWhiteSpace(sol.RutaZipTemporal) || !File.Exists(sol.RutaZipTemporal))
+        {
+            string fileName = Path.GetFileName(sol.RutaZipTemporal ?? sol.NombreZip ?? "");
+            string candidate = !string.IsNullOrWhiteSpace(fileName)
+                ? Path.Combine(AppDbContext.IncomingPacketsDirectory, fileName)
+                : string.Empty;
+
+            if (!string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate))
+            {
+                sol.RutaZipTemporal = candidate;
+                db.SaveChanges();
+            }
+            else
+            {
+                var action = MessageBox.Show(this,
+                    $"No se encontró en disco el archivo .zip temporal de la solicitud #{sol.Id} ({sol.NombreZip} de {sol.NodoOrigen}):\n" +
+                    $"Ruta esperada: {sol.RutaZipTemporal}\n\n" +
+                    $"• Pulsa [Sí] para ELIMINAR esta solicitud huérfana de SolicitudesEntrantes.\n" +
+                    $"• Pulsa [No] para marcarla como 'Rechazada'.\n" +
+                    $"• Pulsa [Cancelar] para conservarla sin cambios.",
+                    "Archivo .ZIP Temporal No Encontrado",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Warning);
+
+                if (action == DialogResult.Yes)
+                {
+                    db.SolicitudesEntrantes.Remove(sol);
+                    db.SaveChanges();
+                }
+                else if (action == DialogResult.No)
+                {
+                    sol.Estado = "Rechazada";
+                    db.SaveChanges();
+                }
+
+                RefreshSolicitudesGrid();
+                RefreshPendingSolicitudesBadge();
+                return;
+            }
         }
 
         if (NodeRuntimeState.IsV2)
@@ -743,56 +1000,126 @@ public partial class FormDashboard
         _relaySourceZipPath = sol.RutaZipTemporal;
         _isFromNetworkUntrusted = true;
 
-        var registroRecibido = new RegistroCifrado
+        var ctx = new DecryptionContext(
+            PacketId: packetId,
+            RequestId: requestId,
+            OriginalFileName: fileName,
+            OriginalExtension: extension);
+
+        bool decryptSucceeded = preDecryptedBytes != null;
+        string currentKeyAttempt = secretKey;
+
+        // Si aún no viene pre-descifrado por inverse remoto, probar descifrar con posibilidad de reintentar clave o conservar el paquete recibido en Consultas
+        while (!decryptSucceeded)
         {
-            UsuarioId = _currentUser.Id,
-            PacketId = packetId,
-            NombreArchivo = fileName,
-            Extension = extension,
-            BytesCifrados = Convert.ToBase64String(cipherBytes),
-            AlgoritmoCodigo = algCode,
-            ParametrosPublicosJson = pubJson,
-            LlaveSecretaBase64 = secretKey,
-            LinkDescifradoRemoto = keyLink,
-            NodoRaiz = rootNode,
-            FirmaRaizBase64 = rootSig,
-            RutaSaltosJson = JsonSerializer.Serialize(hops),
-            Origen = "Recibido",
-            FechaOperacion = DateTime.Now
-        };
+            decryptSucceeded = ExecuteDecryption(
+                algCode,
+                cipherBytes,
+                currentKeyAttempt,
+                pubJson,
+                ctx,
+                showErrorMessageBox: false,
+                out string? decErr);
 
-        db.RegistrosCifrados.Add(registroRecibido);
-        sol.Estado = "Aceptada";
-        db.SaveChanges();
+            if (decryptSucceeded)
+                break;
 
-        _activeRecord = registroRecibido;
-        _currentFileName = registroRecibido.NombreArchivo;
-        _currentExtension = registroRecibido.Extension;
-        _currentBytes = cipherBytes;
-        SelectAlgorithmInCombo(registroRecibido.AlgoritmoCodigo);
-        UpdateMetadataPanel(registroRecibido, sigValid, hasSignature);
+            var retryChoice = MessageBox.Show(this,
+                $"No fue posible descifrar el paquete {packetId} ({algCode}) con la clave ingresada:\n\n" +
+                $"Detalle criptográfico:\n{decErr}\n\n" +
+                $"• Pulsa [Sí] para REINTENTAR ingresando otra clave/llave.\n" +
+                $"• Pulsa [No] para GUARDAR el paquete cifrado en Consultas (como 'Recibido') y marcar la solicitud como 'Aceptada'.\n" +
+                $"• Pulsa [Cancelar] para dejar la solicitud en estado 'Pendiente'.",
+                "Fallo de Descifrado — Reintentar o Guardar en Consultas",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Warning);
 
-        RefreshSolicitudesGrid();
-        RefreshPendingSolicitudesBadge();
-        RefreshConsultasGrid();
+            if (retryChoice == DialogResult.Cancel)
+            {
+                RefreshSolicitudesGrid();
+                RefreshPendingSolicitudesBadge();
+                return;
+            }
 
-        SwitchView("dashboard");
+            if (retryChoice == DialogResult.No)
+            {
+                break;
+            }
 
-        if (preDecryptedBytes != null)
-        {
-            _currentBytes = preDecryptedBytes;
-            _isShowingEncrypted = false;
-            _hologram.TriggerDecryptAnimation(algCode);
-            RenderCurrentBytesInViewer();
+            string? newManualKey = PromptExternalPassphraseModal(
+                algCode,
+                rootNode,
+                sol.NodoOrigen,
+                sigValid);
+
+            if (newManualKey == null)
+            {
+                RefreshSolicitudesGrid();
+                RefreshPendingSolicitudesBadge();
+                return;
+            }
+
+            currentKeyAttempt = newManualKey;
         }
-        else
+
+        try
         {
-            var ctx = new DecryptionContext(
-                PacketId: packetId,
-                RequestId: requestId,
-                OriginalFileName: fileName,
-                OriginalExtension: extension);
-            ExecuteDecryption(registroRecibido.AlgoritmoCodigo, cipherBytes, secretKey, pubJson, ctx);
+            var registroRecibido = new RegistroCifrado
+            {
+                UsuarioId = _currentUser.Id,
+                PacketId = packetId,
+                NombreArchivo = fileName,
+                Extension = extension,
+                BytesCifrados = Convert.ToBase64String(cipherBytes),
+                AlgoritmoCodigo = algCode,
+                ParametrosPublicosJson = pubJson,
+                LlaveSecretaBase64 = currentKeyAttempt,
+                LinkDescifradoRemoto = keyLink,
+                NodoRaiz = rootNode,
+                FirmaRaizBase64 = rootSig,
+                RutaSaltosJson = JsonSerializer.Serialize(hops),
+                Origen = "Recibido",
+                FechaOperacion = DateTime.Now
+            };
+
+            db.RegistrosCifrados.Add(registroRecibido);
+            sol.Estado = "Aceptada";
+            db.SaveChanges();
+
+            _activeRecord = registroRecibido;
+            _currentFileName = registroRecibido.NombreArchivo;
+            _currentExtension = registroRecibido.Extension;
+            SelectAlgorithmInCombo(registroRecibido.AlgoritmoCodigo);
+            UpdateMetadataPanel(registroRecibido, sigValid, hasSignature);
+
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+            RefreshConsultasGrid();
+
+            SwitchView("dashboard");
+
+            if (preDecryptedBytes != null)
+            {
+                _currentBytes = preDecryptedBytes;
+                _isShowingEncrypted = false;
+                _hologram.TriggerDecryptAnimation(algCode);
+                RenderCurrentBytesInViewer();
+            }
+            else if (!decryptSucceeded)
+            {
+                _currentBytes = cipherBytes;
+                _isShowingEncrypted = true;
+                _hologram.TriggerEncryptAnimation(algCode);
+                RenderCurrentBytesInViewer();
+            }
+        }
+        catch (Exception sqlEx)
+        {
+            MessageBox.Show(this,
+                $"Error exacto de SQLite al guardar el registro recibido en Consultas:\n{sqlEx.Message}",
+                "Error SQLite",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
         }
     }
 
@@ -972,7 +1299,7 @@ public partial class FormDashboard
             Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
         HologramTheme.StyleComboBox(_cmbFilterOrigin);
-        _cmbFilterOrigin.Items.AddRange(new object[] { "Todos", "Local", "Relay", "Recibido", "Resultado" });
+        _cmbFilterOrigin.Items.AddRange(new object[] { "Todos", "Local", "Relay", "Recibido", "Resultado", "API-v2.0" });
         _cmbFilterOrigin.SelectedIndex = 0;
         _cmbFilterOrigin.SelectedIndexChanged += (_, _) => RefreshConsultasGrid();
 
@@ -1027,13 +1354,14 @@ public partial class FormDashboard
         string origin = _cmbFilterOrigin?.SelectedItem?.ToString() ?? "Todos";
 
         using var db = new AppDbContext();
-        var query = db.RegistrosCifrados.AsQueryable();
+        var query = db.RegistrosCifrados.AsNoTracking().AsQueryable();
 
         if (origin != "Todos")
             query = query.Where(r => r.Origen == origin);
 
         var list = query
             .OrderByDescending(r => r.FechaOperacion)
+            .ThenByDescending(r => r.Id)
             .ToList()
             .Where(r => string.IsNullOrEmpty(q) ||
                         r.NombreArchivo.ToLowerInvariant().Contains(q) ||
@@ -1053,6 +1381,7 @@ public partial class FormDashboard
             })
             .ToList();
 
+        _gridConsultas.DataSource = null;
         _gridConsultas.DataSource = list;
     }
 
@@ -1061,7 +1390,7 @@ public partial class FormDashboard
         if (_gridConsultas.SelectedRows.Count == 0) return null;
         int id = Convert.ToInt32(_gridConsultas.SelectedRows[0].Cells["Id"].Value);
         using var db = new AppDbContext();
-        return db.RegistrosCifrados.Find(id);
+        return db.RegistrosCifrados.AsNoTracking().FirstOrDefault(r => r.Id == id);
     }
 
     private void LoadSelectedHistoryRecord()

@@ -1,3 +1,5 @@
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
@@ -55,49 +57,60 @@ internal static class Program
         int currentTeam = teamNumber;
 
         bool keepRunning = true;
-        while (keepRunning)
+        try
         {
-            ProtocolVersionMode chosenVersion;
-            int chosenTeam;
-            Usuario authenticatedUser;
-
-            using (var loginForm = new FormLogin(currentVersion, currentTeam))
+            while (keepRunning)
             {
-                if (loginForm.ShowDialog() != DialogResult.OK || loginForm.AuthenticatedUser == null)
-                    break;
+                ProtocolVersionMode chosenVersion;
+                int chosenTeam;
+                Usuario authenticatedUser;
 
-                authenticatedUser = loginForm.AuthenticatedUser;
-                chosenVersion = loginForm.SelectedProtocolVersion;
-                chosenTeam = loginForm.SelectedTeamNumber;
+                using (var loginForm = new FormLogin(currentVersion, currentTeam))
+                {
+                    if (loginForm.ShowDialog() != DialogResult.OK || loginForm.AuthenticatedUser == null)
+                        break;
+
+                    authenticatedUser = loginForm.AuthenticatedUser;
+                    chosenVersion = loginForm.SelectedProtocolVersion;
+                    chosenTeam = loginForm.SelectedTeamNumber;
+                }
+
+                currentVersion = chosenVersion;
+                currentTeam = chosenTeam;
+
+                // Configurar identidad, puerto y directorio de pares según la versión seleccionada en el Login
+                NodeRuntimeState.ConfigureForMode(chosenVersion, chosenTeam, explicitPort);
+                NetworkAddressService.RefreshRuntimePrimaryEndpoint();
+
+                INodeProtocolRuntime runtime = chosenVersion == ProtocolVersionMode.V2
+                    ? new V2ProtocolRuntime()
+                    : new V1ProtocolRuntime();
+
+                NodeRuntimeState.ActiveRuntime = runtime;
+
+                try
+                {
+                    runtime.StartAsync(NodeRuntimeState.ApiPort).GetAwaiter().GetResult();
+
+                    using var dashboard = new FormDashboard(authenticatedUser, runtime);
+                    Application.Run(dashboard);
+                    keepRunning = dashboard.SignOutRequested;
+                }
+                finally
+                {
+                    // Detener y liberar completamente Kestrel y el socket UDP 5099 al cerrar sesión o salir
+                    runtime.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    NodeRuntimeState.ActiveRuntime = null;
+                }
             }
-
-            currentVersion = chosenVersion;
-            currentTeam = chosenTeam;
-
-            // Configurar identidad, puerto y directorio de pares según la versión seleccionada en el Login
-            NodeRuntimeState.ConfigureForMode(chosenVersion, chosenTeam, explicitPort);
-            NetworkAddressService.RefreshRuntimePrimaryEndpoint();
-
-            INodeProtocolRuntime runtime = chosenVersion == ProtocolVersionMode.V2
-                ? new V2ProtocolRuntime()
-                : new V1ProtocolRuntime();
-
-            NodeRuntimeState.ActiveRuntime = runtime;
-
+        }
+        finally
+        {
             try
             {
-                runtime.StartAsync(NodeRuntimeState.ApiPort).GetAwaiter().GetResult();
-
-                using var dashboard = new FormDashboard(authenticatedUser, runtime);
-                Application.Run(dashboard);
-                keepRunning = dashboard.SignOutRequested;
+                AppDbContext.CheckpointWalTruncate();
             }
-            finally
-            {
-                // Detener y liberar completamente Kestrel y el socket UDP 5099 al cerrar sesión o salir
-                runtime.DisposeAsync().AsTask().GetAwaiter().GetResult();
-                NodeRuntimeState.ActiveRuntime = null;
-            }
+            catch { }
         }
 
         return 0;
@@ -612,8 +625,133 @@ internal static class Program
                     409);
             }
 
+            // =========================================================================
+            // BLOQUE 3: MIGRACIÓN DE BD ANTIGUA CON 4 SOLICITUDES PENDIENTES -> 5.ª SOLICITUD -> ACEPTACIÓN + CHECKPOINT WAL
+            // =========================================================================
+            string legacyDbPath = Path.Combine(Path.GetTempPath(), $"ModuloCrypto_Legacy4Pending_{Guid.NewGuid():N}.db");
+            tempFiles.Add(legacyDbPath);
+            tempFiles.Add(legacyDbPath + "-shm");
+            tempFiles.Add(legacyDbPath + "-wal");
+
+            // 1. Crear una base SQLite antigua (faltando columnas v2.0 y tablas nuevas) con 4 solicitudes en estado "Pendiente"
+            using (var rawConn = new SqliteConnection(AppDbContext.BuildSqliteConnectionString(legacyDbPath)))
+            {
+                rawConn.Open();
+                using var cmd = rawConn.CreateCommand();
+                cmd.CommandText = @"
+                    CREATE TABLE Usuarios (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        NombreUsuario TEXT NOT NULL UNIQUE,
+                        PasswordHash TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE RegistrosCifrados (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        UsuarioId INTEGER NOT NULL DEFAULT 0,
+                        PacketId TEXT NOT NULL DEFAULT '',
+                        NombreArchivo TEXT NOT NULL DEFAULT '',
+                        BytesCifrados TEXT NOT NULL DEFAULT '',
+                        AlgoritmoCodigo TEXT NOT NULL DEFAULT 'AESGCM'
+                    );
+                    CREATE TABLE SolicitudesEntrantes (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        PacketId TEXT NOT NULL DEFAULT '',
+                        NodoOrigen TEXT NOT NULL DEFAULT '',
+                        NombreZip TEXT NOT NULL DEFAULT '',
+                        Estado TEXT NOT NULL DEFAULT 'Pendiente'
+                    );
+                    INSERT INTO Usuarios (NombreUsuario, PasswordHash) VALUES ('legacy_admin', 'PBKDF2$100000$AA==$AA==');
+                    INSERT INTO SolicitudesEntrantes (PacketId, NodoOrigen, NombreZip, Estado) VALUES ('old-pkt-1', 'NODO-02', 'old1.zip', 'Pendiente');
+                    INSERT INTO SolicitudesEntrantes (PacketId, NodoOrigen, NombreZip, Estado) VALUES ('old-pkt-2', 'NODO-03', 'old2.zip', 'Pendiente');
+                    INSERT INTO SolicitudesEntrantes (PacketId, NodoOrigen, NombreZip, Estado) VALUES ('old-pkt-3', 'NODO-04', 'old3.zip', 'Pendiente');
+                    INSERT INTO SolicitudesEntrantes (PacketId, NodoOrigen, NombreZip, Estado) VALUES ('old-pkt-4', 'NODO-05', 'old4.zip', 'Pendiente');
+                ";
+                cmd.ExecuteNonQuery();
+            }
+
+            // 2. Ejecutar AppDbContext.InitializeDatabase(legacyDbPath) para migrar todas las tablas y columnas faltantes
+            AppDbContext.InitializeDatabase(legacyDbPath);
+
+            // 3. Insertar una 5.ª solicitud con todos los campos v2.0 completos
+            string fifthPacketId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+            int fifthSolicitudId;
+            using (var migratedDb = new AppDbContext(legacyDbPath))
+            {
+                int initialPending = migratedDb.SolicitudesEntrantes.AsNoTracking().Count(s => s.Estado == "Pendiente");
+                if (initialPending != 4)
+                    throw new Exception($"Se esperaban 4 solicitudes pendientes iniciales tras migrar BD antigua, pero hay {initialPending}.");
+
+                var fifthSol = new SolicitudEntrante
+                {
+                    PacketId = fifthPacketId,
+                    NodoOrigen = "EQ06",
+                    IpOrigen = "192.168.1.106",
+                    NombreZip = $"EQ06_AESGCM_{DateTime.UtcNow:yyyyMMdd_HHmmss}_ABCD1234.zip",
+                    AlgoritmoCodigo = "AESGCM",
+                    FirmaX509Valida = true,
+                    RutaZipTemporal = Path.Combine(AppDbContext.IncomingPacketsDirectory, "eq06_test.zip"),
+                    Estado = "Pendiente",
+                    FechaRecepcion = DateTime.Now
+                };
+                migratedDb.SolicitudesEntrantes.Add(fifthSol);
+                await migratedDb.SaveChangesAsync();
+                fifthSolicitudId = fifthSol.Id;
+            }
+
+            // 4. Verificar con nuevo AppDbContext (AsNoTracking) que ahora hay 5 pendientes, y aceptar la 5.ª solicitud insertando en RegistrosCifrados
+            using (var acceptDb = new AppDbContext(legacyDbPath))
+            {
+                int pendingAfterInsert = acceptDb.SolicitudesEntrantes.AsNoTracking().Count(s => s.Estado == "Pendiente");
+                if (pendingAfterInsert != 5)
+                    throw new Exception($"Se esperaban 5 solicitudes pendientes tras insertar la 5.ª solicitud, pero hay {pendingAfterInsert}.");
+
+                var solToAccept = acceptDb.SolicitudesEntrantes.Find(fifthSolicitudId)
+                    ?? throw new Exception("No se encontró la 5.ª solicitud recién insertada.");
+
+                var userEntity = acceptDb.Usuarios.First();
+                solToAccept.Estado = "Aceptada";
+
+                acceptDb.RegistrosCifrados.Add(new RegistroCifrado
+                {
+                    UsuarioId = userEntity.Id,
+                    PacketId = fifthPacketId,
+                    NombreArchivo = "prueba_eq06.txt",
+                    Extension = ".txt",
+                    BytesCifrados = Convert.ToBase64String(Encoding.UTF8.GetBytes("EQ06OK")),
+                    AlgoritmoCodigo = "AESGCM",
+                    ParametrosPublicosJson = "{\"keySizeBits\":\"256\"}",
+                    LlaveSecretaBase64 = Convert.ToBase64String(new byte[32]),
+                    LinkDescifradoRemoto = V2FormatValidators.BuildKeyId("EQ06", fifthPacketId),
+                    NodoRaiz = "EQ06",
+                    FirmaRaizBase64 = "SIG_OK",
+                    RutaSaltosJson = "[\"EQ06\",\"EQ01\"]",
+                    Origen = "Recibido",
+                    FechaOperacion = DateTime.Now
+                });
+
+                await acceptDb.SaveChangesAsync();
+            }
+
+            // 5. Verificar con un nuevo AppDbContext fresco que el conteo de pendientes bajó de 5 a 4 y que el registro aparece en Consultas
+            using (var verifyFreshDb = new AppDbContext(legacyDbPath))
+            {
+                int finalPending = verifyFreshDb.SolicitudesEntrantes.AsNoTracking().Count(s => s.Estado == "Pendiente");
+                int acceptedCount = verifyFreshDb.SolicitudesEntrantes.AsNoTracking().Count(s => s.Estado == "Aceptada");
+                var consultaRecord = verifyFreshDb.RegistrosCifrados.AsNoTracking().FirstOrDefault(r => r.PacketId == fifthPacketId);
+
+                if (finalPending != 4 || acceptedCount != 1 || consultaRecord == null || consultaRecord.NodoRaiz != "EQ06")
+                {
+                    throw new Exception($"Fallo de verificación fresca en Solicitudes/Consultas: pending={finalPending}, accepted={acceptedCount}, recordFound={consultaRecord != null}");
+                }
+            }
+
+            // 6. Ejecutar PRAGMA wal_checkpoint(TRUNCATE); sin error sobre ambas bases de prueba y la BD única consolidada
+            AppDbContext.CheckpointWalTruncate(legacyDbPath);
+            AppDbContext.CheckpointWalTruncate(tempDbPath);
+            AppDbContext.CheckpointWalTruncate();
+
             Console.WriteLine(
-                $"SELFTEST_OK: DualArchitecture=v1.0+v2.0, SQLiteWAL=OK, IPv4={primaryEp.Ipv4Address}({primaryEp.InterfaceName}), " +
+                $"SELFTEST_OK: DualArchitecture=v1.0+v2.0, SinglePersistentDB={AppDbContext.DatabasePath}, Consolidation={AppDbContext.LastConsolidationReport}, " +
+                $"SQLiteWAL_CheckpointTruncate=OK, Legacy4PendingMigrationTo5thAndConsultas=OK, IPv4={primaryEp.Ipv4Address}({primaryEp.InterfaceName}), " +
                 $"Algorithms={passedAlgorithms}/21, V1_5FileZIP_DualAPI_RemoteKey=OK, " +
                 $"V2_StrictEmission_EQ01_Table4_2(AESGCM,DES)=OK, V2_CC_ENV_1_ExactByteSizes(32B,12B,16B,256B,NoCiphertextInResultEnvelope)=OK, " +
                 $"V2_EQ06_6ByteAliasTolerance(ivBase64,opt.keySizeBits,AAD_PacketId_or_Null,Base64_Hex_Passphrase)=OK, " +

@@ -24,8 +24,8 @@ public static class V2CertificateService
         ? "v2"
         : $"v2_EQ{NodeRuntimeState.TeamNumber:D2}";
 
-    private static string CertPath => Path.Combine(AppContext.BaseDirectory, $"node_identity_{CertFileSuffix}.pfx");
-    private static string KeyPath => Path.Combine(AppContext.BaseDirectory, $"node_identity_{CertFileSuffix}.key");
+    private static string CertPath => Path.Combine(Core.Data.AppDbContext.AppDataDirectory, $"node_identity_{CertFileSuffix}.pfx");
+    private static string KeyPath => Path.Combine(Core.Data.AppDbContext.AppDataDirectory, $"node_identity_{CertFileSuffix}.key");
 
     public static X509Certificate2 CurrentCertificate => _currentCert ?? Initialize();
 

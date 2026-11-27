@@ -33,7 +33,7 @@ public static class V1PacketZipService
         string? rootCertBase64Override = null,
         string? destinationPath = null)
     {
-        string outDir = Path.Combine(AppContext.BaseDirectory, "OutgoingPackets");
+        string outDir = Core.Data.AppDbContext.OutgoingPacketsDirectory;
         Directory.CreateDirectory(outDir);
 
         string sha256Upper = Convert.ToHexString(SHA256.HashData(cipherBytes));

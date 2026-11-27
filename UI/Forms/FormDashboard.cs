@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
@@ -133,6 +134,7 @@ public partial class FormDashboard : Form
 
         NodeRuntimeState.OnPacketReceived += HandleIncomingPacketEvent;
         NodeRuntimeState.OnPeerDiscoveredOrChanged += HandlePeerChangedEvent;
+        NodeRuntimeState.OnNetworkLogAdded += HandleNetworkLogAddedEvent;
         NetworkAddressService.OnNetworkEndpointsChanged += HandleNetworkEndpointsChangedEvent;
 
         Shown += (_, _) =>
@@ -153,6 +155,7 @@ public partial class FormDashboard : Form
         {
             NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
             NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
+            NodeRuntimeState.OnNetworkLogAdded -= HandleNetworkLogAddedEvent;
             NetworkAddressService.OnNetworkEndpointsChanged -= HandleNetworkEndpointsChangedEvent;
             _dashboardToolTip.Dispose();
             _logoGlyphFont.Dispose();
@@ -530,10 +533,27 @@ public partial class FormDashboard : Form
         foreach (var kv in _views)
             kv.Value.Visible = kv.Key == key;
 
-        if (key == "inbox") RefreshSolicitudesGrid();
-        else if (key == "history") RefreshConsultasGrid();
-        else if (key == "network") RefreshNetworkGrid();
-        else if (key == "settings") RefreshSettingsStats();
+        if (key == "inbox")
+        {
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+            RefreshConsultasGrid();
+            RefreshNetworkLogBox();
+        }
+        else if (key == "history")
+        {
+            RefreshSolicitudesGrid();
+            RefreshPendingSolicitudesBadge();
+            RefreshConsultasGrid();
+        }
+        else if (key == "network")
+        {
+            RefreshNetworkGrid();
+        }
+        else if (key == "settings")
+        {
+            RefreshSettingsStats();
+        }
     }
 
     private void BuildDashboardCryptoView()
@@ -1524,13 +1544,16 @@ public partial class FormDashboard : Form
         };
     }
 
-    private void ExecuteDecryption(
+    private bool ExecuteDecryption(
         string algCode,
         byte[] cipherBytes,
         string secretKeyBase64,
         string pubJson,
-        DecryptionContext? context = null)
+        DecryptionContext? context,
+        bool showErrorMessageBox,
+        out string? errorDetail)
     {
+        errorDetail = null;
         try
         {
             var effectiveContext = context ?? new DecryptionContext(
@@ -1604,12 +1627,29 @@ public partial class FormDashboard : Form
             {
                 SetViewerMode("TEXT");
             }
+
+            return true;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error al descifrar ({algCode}):\n{ex.Message}",
-                "ModuloCrypto — Error de Descifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            errorDetail = ex.Message;
+            if (showErrorMessageBox)
+            {
+                MessageBox.Show(this, $"Error al descifrar ({algCode}):\n{ex.Message}",
+                    "ModuloCrypto — Error de Descifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            return false;
         }
+    }
+
+    private void ExecuteDecryption(
+        string algCode,
+        byte[] cipherBytes,
+        string secretKeyBase64,
+        string pubJson,
+        DecryptionContext? context = null)
+    {
+        ExecuteDecryption(algCode, cipherBytes, secretKeyBase64, pubJson, context, showErrorMessageBox: true, out _);
     }
 
     public static string SaveDecryptedBinaryAutomatically(byte[] bytes, string fileName, string extension)
@@ -1786,22 +1826,35 @@ public partial class FormDashboard : Form
 
     private void HandleIncomingPacketEvent(SolicitudEntrante solicitud)
     {
-        if (IsDisposed) return;
-        BeginInvoke(() =>
+        if (IsHandleCreated && !IsDisposed)
         {
-            RefreshPendingSolicitudesBadge();
-            RefreshSolicitudesGrid();
-        });
+            BeginInvoke(() =>
+            {
+                RefreshPendingSolicitudesBadge();
+                RefreshSolicitudesGrid();
+                RefreshConsultasGrid();
+            });
+        }
     }
 
     private void HandlePeerChangedEvent(PeerNode peer)
     {
-        if (IsDisposed) return;
-        BeginInvoke(() =>
+        if (IsHandleCreated && !IsDisposed)
         {
-            RefreshNetworkGrid();
-            RefreshTargetPeerCombo();
-        });
+            BeginInvoke(() =>
+            {
+                RefreshNetworkGrid();
+                RefreshTargetPeerCombo();
+            });
+        }
+    }
+
+    private void HandleNetworkLogAddedEvent(string logLine)
+    {
+        if (IsHandleCreated && !IsDisposed)
+        {
+            BeginInvoke(() => AppendOrRefreshNetworkLogLine(logLine));
+        }
     }
 
     private void RefreshPendingSolicitudesBadge()
@@ -1809,7 +1862,9 @@ public partial class FormDashboard : Form
         try
         {
             using var db = new AppDbContext();
-            int pending = db.SolicitudesEntrantes.Count(s => s.Estado == "Pendiente");
+            int pending = db.SolicitudesEntrantes
+                .AsNoTracking()
+                .Count(s => s.Estado == "Pendiente");
             _navSolicitudes.BadgeCount = pending;
         }
         catch

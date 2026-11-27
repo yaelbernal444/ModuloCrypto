@@ -14,8 +14,8 @@ public static class V1CertificateService
     private static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("ModuloCrypto.X509.DPAPI.v1");
     private static X509Certificate2? _currentCert;
 
-    private static string CertPath => Path.Combine(AppContext.BaseDirectory, "node_identity_v1.pfx");
-    private static string KeyPath => Path.Combine(AppContext.BaseDirectory, "node_identity_v1.key");
+    private static string CertPath => Path.Combine(Core.Data.AppDbContext.AppDataDirectory, "node_identity_v1.pfx");
+    private static string KeyPath => Path.Combine(Core.Data.AppDbContext.AppDataDirectory, "node_identity_v1.key");
 
     public static X509Certificate2 CurrentCertificate => _currentCert ?? Initialize();
 

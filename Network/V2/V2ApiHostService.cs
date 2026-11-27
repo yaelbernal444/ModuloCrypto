@@ -194,13 +194,20 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
     private static async Task<IResult> ProcessIncomingZipAsync(HttpRequest request, string expectedPacketType)
     {
+        string remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
+        string endpointPath = request.Path.HasValue ? request.Path.Value! : "/api/requests/receive";
+        string nodeHeader = request.Headers.TryGetValue("X-CC-Node-Id", out var hNode) && !string.IsNullOrWhiteSpace(hNode)
+            ? hNode.ToString()
+            : "EQ??";
+
         if (request.ContentLength.HasValue && request.ContentLength.Value > MaxRequestSizeBytes)
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 413, "E-SIZE: El paquete .zip excede el límite de 50 MB.");
             return V2ProblemDetails.ToResult("E-SIZE", StatusCodes.Status413PayloadTooLarge,
                 "El paquete .zip excede el límite máximo de 50 MB.", request.Path);
         }
 
-        string incomingDir = Path.Combine(AppContext.BaseDirectory, "IncomingPackets");
+        string incomingDir = AppDbContext.IncomingPacketsDirectory;
         Directory.CreateDirectory(incomingDir);
 
         string fileName = $"incoming_{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.zip";
@@ -216,6 +223,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
                 if (file.Length > MaxRequestSizeBytes)
                 {
+                    NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 413, "E-SIZE: El archivo adjunto excede el límite de 50 MB.");
                     return V2ProblemDetails.ToResult("E-SIZE", StatusCodes.Status413PayloadTooLarge,
                         "El archivo adjunto excede el límite de 50 MB.", request.Path);
                 }
@@ -235,6 +243,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 {
                     fs.Close();
                     TryDeleteFile(zipPath);
+                    NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 413, "E-SIZE: El flujo recibido excede el límite de 50 MB.");
                     return V2ProblemDetails.ToResult("E-SIZE", StatusCodes.Status413PayloadTooLarge,
                         "El flujo recibido excede el límite de 50 MB.", request.Path);
                 }
@@ -248,12 +257,14 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 checkAndRecordReplay: false);
 
             var manifest = parsed.Manifest;
+            nodeHeader = string.IsNullOrWhiteSpace(manifest.SourceNode) ? nodeHeader : manifest.SourceNode;
 
             if (!string.Equals(manifest.PacketType, expectedPacketType, StringComparison.OrdinalIgnoreCase))
             {
                 TryDeleteFile(zipPath);
-                return V2ProblemDetails.ToResult("E-ZIP-STRUCTURE", StatusCodes.Status400BadRequest,
-                    $"Este endpoint requiere packetType='{expectedPacketType}', recibido '{manifest.PacketType}'.", request.Path);
+                string msg = $"Este endpoint requiere packetType='{expectedPacketType}', recibido '{manifest.PacketType}'.";
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 400, $"E-ZIP-STRUCTURE: {msg}");
+                return V2ProblemDetails.ToResult("E-ZIP-STRUCTURE", StatusCodes.Status400BadRequest, msg, request.Path);
             }
 
             // Validación TOFU contra TrustedPeers -> 403 E-CERT-UNTRUSTED si la huella cambió
@@ -268,8 +279,9 @@ public sealed class V2ApiHostService : IAsyncDisposable
                     AppDbContext.UpsertTrustedPeer(knownPeer);
                     NodeRuntimeState.NotifyPeerChanged(knownPeer);
                     TryDeleteFile(zipPath);
-                    return V2ProblemDetails.ToResult("E-CERT-UNTRUSTED", StatusCodes.Status403Forbidden,
-                        $"Huella X.509 de {manifest.SourceNode} no coincide con la huella fijada (TOFU).", request.Path);
+                    string msg = $"Huella X.509 de {manifest.SourceNode} no coincide con la huella fijada (TOFU).";
+                    NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 403, $"E-CERT-UNTRUSTED: {msg}");
+                    return V2ProblemDetails.ToResult("E-CERT-UNTRUSTED", StatusCodes.Status403Forbidden, msg, request.Path);
                 }
             }
 
@@ -280,8 +292,9 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 if (db.SeenPackets.Any(sp => sp.PacketId == normPacketId))
                 {
                     TryDeleteFile(zipPath);
-                    return V2ProblemDetails.ToResult("E-DUPLICATE", StatusCodes.Status409Conflict,
-                        $"El packetId '{normPacketId}' ya fue procesado anteriormente (Anti-Replay).", request.Path);
+                    string msg = $"El packetId '{normPacketId}' ya fue procesado anteriormente (Anti-Replay).";
+                    NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 409, $"E-DUPLICATE: {msg}");
+                    return V2ProblemDetails.ToResult("E-DUPLICATE", StatusCodes.Status409Conflict, msg, request.Path);
                 }
 
                 db.SeenPackets.Add(new SeenPacketEntity
@@ -310,6 +323,13 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 db.SolicitudesEntrantes.Add(solicitud);
                 await db.SaveChangesAsync();
 
+                NodeRuntimeState.AddNetworkLog(
+                    ipOrigen,
+                    manifest.SourceNode,
+                    endpointPath,
+                    202,
+                    $"accepted ({manifest.AlgorithmCode}, zip={fileName}, packetId={normPacketId})");
+
                 NodeRuntimeState.NotifyPacketReceived(solicitud);
 
                 string receivedIso = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
@@ -331,19 +351,28 @@ public sealed class V2ApiHostService : IAsyncDisposable
         catch (PacketValidationException pvEx)
         {
             TryDeleteFile(zipPath);
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, pvEx.HttpStatusCode, $"{pvEx.ErrorCode}: {pvEx.Message}");
             return V2ProblemDetails.ToResult(pvEx.ErrorCode, pvEx.HttpStatusCode, pvEx.Message, request.Path);
         }
         catch (Exception ex)
         {
             TryDeleteFile(zipPath);
-            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status400BadRequest, ex.Message, request.Path);
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 500, $"E-INTERNAL: {ex.Message}");
+            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status500InternalServerError, ex.Message, request.Path);
         }
     }
 
     private static async Task<IResult> HandleCryptoForwardEndpointAsync(HttpRequest request)
     {
+        string remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
+        string endpointPath = request.Path.HasValue ? request.Path.Value! : "/api/crypto/forward";
+        string nodeHeader = request.Headers.TryGetValue("X-CC-Node-Id", out var hNode) && !string.IsNullOrWhiteSpace(hNode)
+            ? hNode.ToString()
+            : "EQ??";
+
         if (!await CryptoConcurrencyGate.WaitAsync(0))
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 503, "E-BUSY: Límite de 10 operaciones simultáneas.");
             return V2ProblemDetails.ToResult("E-BUSY", StatusCodes.Status503ServiceUnavailable,
                 "Se alcanzó el límite máximo de 10 operaciones criptográficas simultáneas.", request.Path);
         }
@@ -356,12 +385,15 @@ public sealed class V2ApiHostService : IAsyncDisposable
             // Verificar firma RSA-PSS-SHA256 sobre los bytes crudos exactos de la parte 'request' -> 422 E-SIGNATURE
             if (!V2CertificateService.VerifyWithPem(rawRequestBytes, signatureBase64, requesterCertPem))
             {
-                return V2ProblemDetails.ToResult("E-SIGNATURE", StatusCodes.Status422UnprocessableEntity,
-                    "La firma RSA-PSS-SHA256 de 'requestSignature' sobre los bytes crudos de 'request' es inválida.", request.Path);
+                string msg = "La firma RSA-PSS-SHA256 de 'requestSignature' sobre los bytes crudos de 'request' es inválida.";
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 422, $"E-SIGNATURE: {msg}");
+                return V2ProblemDetails.ToResult("E-SIGNATURE", StatusCodes.Status422UnprocessableEntity, msg, request.Path);
             }
 
             var fwdReq = JsonSerializer.Deserialize<V2CryptoForwardRequest>(rawRequestBytes, JsonOpts)
                 ?? throw new PacketValidationException("E-MANIFEST", 400, "No se pudo deserializar la parte 'request'.");
+
+            nodeHeader = string.IsNullOrWhiteSpace(fwdReq.RequesterNode) ? nodeHeader : fwdReq.RequesterNode;
 
             ValidateCommonCryptoRequestMetadata(
                 fwdReq.RequestId,
@@ -383,6 +415,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
             if (fwdReq.ForceAsync)
             {
                 var job = V2CryptoJobManager.EnqueueJob(fwdReq.RequestId, fwdReq.RequesterNode, "forward", algCode, work);
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 202, $"jobId={job.JobId} ({algCode} async forward)");
                 return BuildJobAcceptedResult(job);
             }
 
@@ -391,19 +424,23 @@ public sealed class V2ApiHostService : IAsyncDisposable
             if (completed != workTask)
             {
                 var job = V2CryptoJobManager.EnqueueJob(fwdReq.RequestId, fwdReq.RequesterNode, "forward", algCode, () => workTask);
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 202, $"jobId={job.JobId} ({algCode} timeout -> async)");
                 return BuildJobAcceptedResult(job);
             }
 
             var (forwardResponse, _) = await workTask;
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 200, $"OK ({algCode}, packetId={forwardResponse?.PacketId})");
             return Results.Ok(forwardResponse);
         }
         catch (PacketValidationException pve)
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, pve.HttpStatusCode, $"{pve.ErrorCode}: {pve.Message}");
             return V2ProblemDetails.ToResult(pve.ErrorCode, pve.HttpStatusCode, pve.Message, request.Path);
         }
         catch (Exception ex)
         {
-            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status400BadRequest, ex.Message, request.Path);
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 500, $"E-INTERNAL: {ex.Message}");
+            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status500InternalServerError, ex.Message, request.Path);
         }
         finally
         {
@@ -413,8 +450,15 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
     private static async Task<IResult> HandleCryptoInverseEndpointAsync(HttpRequest request)
     {
+        string remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
+        string endpointPath = request.Path.HasValue ? request.Path.Value! : "/api/crypto/inverse";
+        string nodeHeader = request.Headers.TryGetValue("X-CC-Node-Id", out var hNode) && !string.IsNullOrWhiteSpace(hNode)
+            ? hNode.ToString()
+            : "EQ??";
+
         if (!await CryptoConcurrencyGate.WaitAsync(0))
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 503, "E-BUSY: Límite de 10 operaciones simultáneas.");
             return V2ProblemDetails.ToResult("E-BUSY", StatusCodes.Status503ServiceUnavailable,
                 "Se alcanzó el límite máximo de 10 operaciones criptográficas simultáneas.", request.Path);
         }
@@ -426,12 +470,15 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
             if (!V2CertificateService.VerifyWithPem(rawRequestBytes, signatureBase64, requesterCertPem))
             {
-                return V2ProblemDetails.ToResult("E-SIGNATURE", StatusCodes.Status422UnprocessableEntity,
-                    "La firma RSA-PSS-SHA256 de 'requestSignature' sobre los bytes crudos de 'request' es inválida.", request.Path);
+                string msg = "La firma RSA-PSS-SHA256 de 'requestSignature' sobre los bytes crudos de 'request' es inválida.";
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 422, $"E-SIGNATURE: {msg}");
+                return V2ProblemDetails.ToResult("E-SIGNATURE", StatusCodes.Status422UnprocessableEntity, msg, request.Path);
             }
 
             var invReq = JsonSerializer.Deserialize<V2CryptoInverseRequest>(rawRequestBytes, JsonOpts)
                 ?? throw new PacketValidationException("E-MANIFEST", 400, "No se pudo deserializar la parte 'request'.");
+
+            nodeHeader = string.IsNullOrWhiteSpace(invReq.RequesterNode) ? nodeHeader : invReq.RequesterNode;
 
             ValidateCommonCryptoRequestMetadata(
                 invReq.RequestId,
@@ -453,6 +500,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
             if (invReq.ForceAsync)
             {
                 var job = V2CryptoJobManager.EnqueueJob(invReq.RequestId, invReq.RequesterNode, "inverse", algCode, work);
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 202, $"jobId={job.JobId} ({algCode} async inverse)");
                 return BuildJobAcceptedResult(job);
             }
 
@@ -461,20 +509,24 @@ public sealed class V2ApiHostService : IAsyncDisposable
             if (completed != workTask)
             {
                 var job = V2CryptoJobManager.EnqueueJob(invReq.RequestId, invReq.RequesterNode, "inverse", algCode, () => workTask);
+                NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 202, $"jobId={job.JobId} ({algCode} timeout -> async)");
                 return BuildJobAcceptedResult(job);
             }
 
             var (_, resultZipPath) = await workTask;
             byte[] zipBytes = await File.ReadAllBytesAsync(resultZipPath!);
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 200, $"OK ({algCode}, resultZip={Path.GetFileName(resultZipPath)})");
             return Results.File(zipBytes, "application/zip", Path.GetFileName(resultZipPath));
         }
         catch (PacketValidationException pve)
         {
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, pve.HttpStatusCode, $"{pve.ErrorCode}: {pve.Message}");
             return V2ProblemDetails.ToResult(pve.ErrorCode, pve.HttpStatusCode, pve.Message, request.Path);
         }
         catch (Exception ex)
         {
-            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status400BadRequest, ex.Message, request.Path);
+            NodeRuntimeState.AddNetworkLog(remoteIp, nodeHeader, endpointPath, 500, $"E-INTERNAL: {ex.Message}");
+            return V2ProblemDetails.ToResult("E-INTERNAL", StatusCodes.Status500InternalServerError, ex.Message, request.Path);
         }
         finally
         {
@@ -695,17 +747,24 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 FechaOperacion = DateTime.Now
             };
 
-            try
+            using (var db = new AppDbContext())
             {
-                using var db = new AppDbContext();
-                if (db.Usuarios.Any())
+                var firstUser = db.Usuarios.FirstOrDefault();
+                if (firstUser != null)
                 {
-                    registro.UsuarioId = db.Usuarios.First().Id;
+                    registro.UsuarioId = firstUser.Id;
                     db.RegistrosCifrados.Add(registro);
                     db.SaveChanges();
                 }
             }
-            catch { }
+
+            NodeRuntimeState.NotifyPacketReceived(new SolicitudEntrante
+            {
+                PacketId = packetId,
+                NodoOrigen = req.RequesterNode,
+                AlgoritmoCodigo = algCode,
+                Estado = "Aceptada"
+            });
 
             string zipPath = V2PacketZipService.CreatePacketZip(
                 registro,
@@ -856,16 +915,33 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
             var resultRec = new RegistroCifrado
             {
+                UsuarioId = 0,
                 PacketId = resultPacketId,
                 AlgoritmoCodigo = algCode,
                 NombreArchivo = origFileName,
                 Extension = origExtension,
+                BytesCifrados = Convert.ToBase64String(plainBytes),
                 NodoRaiz = NodeRuntimeState.CurrentNodeId,
+                FirmaRaizBase64 = V2CertificateService.SignDataPss(resultadoEncBytes),
+                RutaSaltosJson = JsonSerializer.Serialize(new[] { req.RequesterNode, NodeRuntimeState.CurrentNodeId }),
                 LinkDescifradoRemoto = V2FormatValidators.BuildKeyId(NodeRuntimeState.CurrentNodeId, resultPacketId),
-                ParametrosPublicosJson = JsonSerializer.Serialize(pubParams)
+                ParametrosPublicosJson = JsonSerializer.Serialize(pubParams),
+                Origen = "API-v2.0",
+                FechaOperacion = DateTime.Now
             };
 
-            return V2PacketZipService.CreatePacketZip(
+            using (var db = new AppDbContext())
+            {
+                var firstUser = db.Usuarios.FirstOrDefault();
+                if (firstUser != null)
+                {
+                    resultRec.UsuarioId = firstUser.Id;
+                    db.RegistrosCifrados.Add(resultRec);
+                    db.SaveChanges();
+                }
+            }
+
+            string resultZipPath = V2PacketZipService.CreatePacketZip(
                 resultRec,
                 resultadoEncBytes,
                 packetType: "result",
@@ -875,6 +951,16 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 explicitPublicParameters: pubParams,
                 resultEnvelope: resultEnvelopeForManifest,
                 originalSizeBytesOverride: plainBytes.Length);
+
+            NodeRuntimeState.NotifyPacketReceived(new SolicitudEntrante
+            {
+                PacketId = resultPacketId,
+                NodoOrigen = req.RequesterNode,
+                AlgoritmoCodigo = algCode,
+                Estado = "Aceptada"
+            });
+
+            return resultZipPath;
         }
         finally
         {
