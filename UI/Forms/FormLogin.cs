@@ -47,6 +47,9 @@ public sealed class FormLogin : Form
     private readonly Label _lblTeamCaption;
     private readonly ComboBox _cmbTeamNumber;
     private readonly Label _lblFeedback;
+    private readonly NeonButton _btnLogin;
+    private readonly NeonButton _btnRegister;
+    private bool _isAuthenticating;
 
     public FormLogin(ProtocolVersionMode initialVersion = ProtocolVersionMode.V2, int initialTeam = 1)
     {
@@ -172,6 +175,9 @@ public sealed class FormLogin : Form
             PlaceholderText = "Ingresa tu contraseña"
         };
 
+        _txtUsername.TextChanged += (_, _) => ResetDeniedHologramOnInput();
+        _txtPassword.TextChanged += (_, _) => ResetDeniedHologramOnInput();
+
         var lblProto = CreateFieldLabel("VERSIÓN DE PROTOCOLO", 44, 268, 255);
         _cmbProtocolVersion = new ComboBox
         {
@@ -210,7 +216,7 @@ public sealed class FormLogin : Form
             Size = new Size(395, 34)
         };
 
-        var btnLogin = new NeonButton
+        _btnLogin = new NeonButton
         {
             Text = "Iniciar Sesión",
             Variant = NeonButtonVariant.Primary,
@@ -219,9 +225,9 @@ public sealed class FormLogin : Form
             Size = new Size(395, 48),
             Font = new Font("Segoe UI", 10.2f, FontStyle.Bold)
         };
-        btnLogin.Click += (_, _) => HandleLogin();
+        _btnLogin.Click += async (_, _) => await HandleLoginAsync();
 
-        var btnRegister = new NeonButton
+        _btnRegister = new NeonButton
         {
             Text = "Registrar Nuevo Integrante",
             Variant = NeonButtonVariant.Secondary,
@@ -230,7 +236,7 @@ public sealed class FormLogin : Form
             Size = new Size(395, 46),
             Font = new Font("Segoe UI", 9.8f, FontStyle.Bold)
         };
-        btnRegister.Click += (_, _) => OpenRegisterModal();
+        _btnRegister.Click += (_, _) => OpenRegisterModal();
 
         rightPanel.Controls.AddRange(new Control[]
         {
@@ -240,7 +246,7 @@ public sealed class FormLogin : Form
             lblProto, _cmbProtocolVersion,
             _lblTeamCaption, _cmbTeamNumber,
             _lblFeedback,
-            btnLogin, btnRegister
+            _btnLogin, _btnRegister
         });
 
         _mainCard.Controls.Add(rightPanel);
@@ -259,12 +265,12 @@ public sealed class FormLogin : Form
             EnsureCascadeColumns();
         };
 
-        KeyDown += (_, e) =>
+        KeyDown += async (_, e) =>
         {
             if (e.KeyCode == Keys.Enter)
             {
                 e.SuppressKeyPress = true;
-                HandleLogin();
+                await HandleLoginAsync();
             }
         };
     }
@@ -352,28 +358,69 @@ public sealed class FormLogin : Form
         Invalidate();
     }
 
-    private void HandleLogin()
+    private void ResetDeniedHologramOnInput()
     {
-        SyncProtocolSelectionUi();
-        string user = _txtUsername.Text.Trim();
-        string pass = _txtPassword.Text;
-
-        var auth = AuthService.Authenticate(user, pass);
-        if (auth == null)
+        if (_isAuthenticating) return;
+        _lblFeedback.Text = string.Empty;
+        _previewHologram.ClearHologramMessage();
+        if (_previewHologram.CurrentState != HologramState.Idle)
         {
-            _lblFeedback.ForeColor = HologramTheme.Danger;
-            _lblFeedback.Text = "Credenciales inválidas. Verifica usuario y contraseña.";
-            _previewHologram.TriggerEncryptAnimation("DENIED");
-            return;
+            _previewHologram.SetIdle();
         }
+    }
 
-        AuthenticatedUser = auth;
-        DialogResult = DialogResult.OK;
-        Close();
+    private async Task HandleLoginAsync()
+    {
+        if (_isAuthenticating) return;
+        _isAuthenticating = true;
+
+        try
+        {
+            SyncProtocolSelectionUi();
+            string user = _txtUsername.Text.Trim();
+            string pass = _txtPassword.Text;
+
+            var auth = AuthService.Authenticate(user, pass);
+            if (auth == null)
+            {
+                _lblFeedback.ForeColor = HologramTheme.Danger;
+                _lblFeedback.Text = "Credenciales inválidas. Verifica usuario y contraseña.";
+                _previewHologram.TriggerEncryptAnimation("DENIED");
+                _previewHologram.ShowHologramMessage("ACCESO DENEGADO", HologramTheme.Danger);
+                return;
+            }
+
+            _lblFeedback.Text = string.Empty;
+            _btnLogin.Enabled = false;
+            _btnRegister.Enabled = false;
+            _txtUsername.Enabled = false;
+            _txtPassword.Enabled = false;
+            _cmbProtocolVersion.Enabled = false;
+            _cmbTeamNumber.Enabled = false;
+
+            _previewHologram.TriggerDecryptAnimation("OK");
+            _previewHologram.ShowHologramMessage("ACCESO CORRECTO", HologramTheme.Success);
+
+            await Task.Delay(1250);
+
+            if (IsDisposed) return;
+
+            AuthenticatedUser = auth;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+        finally
+        {
+            if (AuthenticatedUser == null && !IsDisposed)
+            {
+                _isAuthenticating = false;
+            }
+        }
     }
 
     private void OpenRegisterModal()
     {
+        if (_isAuthenticating) return;
         SyncProtocolSelectionUi();
         NodeRuntimeState.ConfigureForMode(SelectedProtocolVersion, SelectedTeamNumber);
 

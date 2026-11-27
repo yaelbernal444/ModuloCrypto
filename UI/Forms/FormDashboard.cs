@@ -134,7 +134,6 @@ public partial class FormDashboard : Form
 
         NodeRuntimeState.OnPacketReceived += HandleIncomingPacketEvent;
         NodeRuntimeState.OnPeerDiscoveredOrChanged += HandlePeerChangedEvent;
-        NodeRuntimeState.OnNetworkLogAdded += HandleNetworkLogAddedEvent;
         NetworkAddressService.OnNetworkEndpointsChanged += HandleNetworkEndpointsChangedEvent;
 
         Shown += (_, _) =>
@@ -155,7 +154,6 @@ public partial class FormDashboard : Form
         {
             NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
             NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
-            NodeRuntimeState.OnNetworkLogAdded -= HandleNetworkLogAddedEvent;
             NetworkAddressService.OnNetworkEndpointsChanged -= HandleNetworkEndpointsChangedEvent;
             _dashboardToolTip.Dispose();
             _logoGlyphFont.Dispose();
@@ -538,7 +536,6 @@ public partial class FormDashboard : Form
             RefreshSolicitudesGrid();
             RefreshPendingSolicitudesBadge();
             RefreshConsultasGrid();
-            RefreshNetworkLogBox();
         }
         else if (key == "history")
         {
@@ -1334,189 +1331,400 @@ public partial class FormDashboard : Form
             return;
         }
 
-        string url = _activeRecord.LinkDescifradoRemoto;
-        if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        var candidateUrls = BuildSilentKeyRecoveryUrls(_activeRecord, ResolveOriginPeersForActiveRecord());
+        string lastError = "El nodo emisor no expuso endpoint de recuperación de llave.";
+
+        foreach (string url in candidateUrls)
         {
-            url = $"http://{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}/api/crypto/decrypt/{_activeRecord.PacketId}";
+            var remote = await V1NetworkClient.RequestRemoteKeyAsync(url);
+            if (remote.Success && !string.IsNullOrWhiteSpace(remote.LlaveSecretaBase64))
+            {
+                string effPubJson = !string.IsNullOrWhiteSpace(remote.ParametrosPublicosJson) && remote.ParametrosPublicosJson != "{}"
+                    ? remote.ParametrosPublicosJson
+                    : _activeRecord.ParametrosPublicosJson;
+
+                string effAlg = !string.IsNullOrWhiteSpace(remote.AlgoritmoCodigo)
+                    ? remote.AlgoritmoCodigo
+                    : _activeRecord.AlgoritmoCodigo;
+
+                var ctx = new DecryptionContext(
+                    PacketId: _activeRecord.PacketId,
+                    OriginalFileName: _activeRecord.NombreArchivo,
+                    OriginalExtension: _activeRecord.Extension);
+
+                if (ExecuteDecryption(effAlg, _currentBytes, remote.LlaveSecretaBase64, effPubJson, ctx, showErrorMessageBox: false, out string? decErr))
+                    return;
+
+                lastError = $"Llave recibida desde {url}, pero el descifrado falló: {decErr}";
+            }
+            else if (!string.IsNullOrWhiteSpace(remote.Message))
+            {
+                lastError = $"{url} -> {remote.Message}";
+            }
         }
 
-        var remote = await V1NetworkClient.RequestRemoteKeyAsync(url);
-        if (!remote.Success)
-        {
-            MessageBox.Show(this, $"Fallo en Descifrado Remoto v1.0 ({url}):\n{remote.Message}",
-                "Descifrado Remoto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        // Respaldo adicional: si el emisor tiene activo /api/crypto/inverse v2.0, intentarlo silenciosamente
+        var (v2Ok, v2Err) = await TrySilentV2InverseOnCandidatePeersAsync();
+        if (v2Ok)
             return;
-        }
 
-        var ctx = new DecryptionContext(
-            PacketId: _activeRecord.PacketId,
-            OriginalFileName: _activeRecord.NombreArchivo,
-            OriginalExtension: _activeRecord.Extension);
-
-        ExecuteDecryption(remote.AlgoritmoCodigo, _currentBytes, remote.LlaveSecretaBase64, remote.ParametrosPublicosJson, ctx);
+        MessageBox.Show(this,
+            $"No fue posible completar el Descifrado Remoto automático del paquete {_activeRecord.PacketId}:\n\n" +
+            $"• Recuperación de llave: {lastError}\n" +
+            $"• Servicio inverse: {v2Err}",
+            "Descifrado Remoto",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
     }
 
     /// <summary>
-    /// Flujo oficial v2.0 de Descifrado Remoto (POST /api/crypto/inverse con sobre híbrido CC-ENV-1):
-    /// 1. Verifica que haya un paquete cifrado cargado (_activeRecord).
-    /// 2. Identifica el nodo dueño del algoritmo (EQ01–EQ08) en TrustedPeers con huella confirmada TOFU.
-    /// 3. Sella la clave secreta con CC-ENV-1 para el certificado del dueño (o usa keyId si es asimétrico).
-    /// 4. Recibe el .zip tipo result (o sondea GET /api/jobs/{jobId} si devuelve 202), valida firma y abre resultado.enc.
-    /// 5. Muestra el contenido descifrado en el Visor, anima el candado abierto y registra en Consultas con origen "Resultado".
+    /// Flujo silencioso v2.0 de Descifrado Remoto (respaldo automático sin diálogos de confirmación ni envío a bandeja Solicitudes):
+    /// - Paso A: Identifica automáticamente el nodo productor/emisor (y el dueño del algoritmo) y envía directamente POST /api/crypto/inverse
+    ///   con keyRef/keyId (y sobre CC-ENV-1 solo si el usuario ya escribió una clave o el registro la tiene; nunca abre un modal pidiendo clave).
+    ///   Si devuelve 202 con jobId, sondea GET /api/jobs/{jobId} y abre resultado.enc con CC-ENV-1.
+    /// - Paso B: Si el Paso A no devuelve el resultado, solicita silenciosamente GET http://&lt;ip&gt;:&lt;puerto&gt;/api/crypto/decrypt/{packetId}
+    ///   (o LinkDescifradoRemoto) y descifra localmente con alias tolerantes.
+    /// - Paso C: Si el nodo remoto está apagado o rechaza por no conservar la clave simétrica, muestra un único mensaje claro con el código HTTP/error exacto,
+    ///   conservando intacto el paquete cargado.
     /// </summary>
     private async Task HandleRemoteDecryptActionV2Async()
     {
         if (_activeRecord == null)
         {
             MessageBox.Show(this,
-                "Primero cifra un paquete o carga un paquete .zip v2.0 desde Solicitudes o Consultas.",
-                $"Descifrado Remoto v2.0 — {NodeRuntimeState.CurrentNodeId}",
+                "Primero cifra un paquete o carga un paquete .zip desde Solicitudes o Consultas.",
+                $"Descifrado Remoto — {NodeRuntimeState.CurrentNodeId}",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
         }
 
-        string algCode = _activeRecord.AlgoritmoCodigo.Trim().ToUpperInvariant();
-        string ownerNodeId = NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
-
-        var ownerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
-            string.Equals(p.NodeId, ownerNodeId, StringComparison.OrdinalIgnoreCase));
-
-        if (ownerPeer == null)
-        {
-            MessageBox.Show(this,
-                $"No se encontró el nodo dueño {ownerNodeId} (algoritmo {algCode}) en el directorio de nodos.\n" +
-                $"Verifícalo en la vista 'Red de Nodos'.",
-                "Nodo Dueño No Encontrado",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
+        // Paso A: Intentar silenciosamente POST /api/crypto/inverse en el nodo emisor/productor o dueño del algoritmo
+        var (stepAOk, stepAError) = await TrySilentV2InverseOnCandidatePeersAsync();
+        if (stepAOk)
             return;
-        }
 
-        if (!ownerPeer.IsOnline || string.IsNullOrWhiteSpace(ownerPeer.CertificatePem))
-        {
-            await V2NetworkClient.PingNodeAsync(ownerPeer, customTimeoutMs: 1200);
-            RefreshNetworkGrid();
-        }
-
-        if (!ownerPeer.IsOnline || ownerPeer.HasThumbprintMismatch || !ownerPeer.IsConfirmed)
-        {
-            string reason = ownerPeer.HasThumbprintMismatch
-                ? $"presenta un cambio de huella X.509 (BLOQUEADO TOFU)"
-                : (!ownerPeer.IsOnline
-                    ? $"está OFFLINE en {ownerPeer.BaseUrl}"
-                    : $"aún no tiene su huella X.509 confirmada mediante TOFU");
-
-            MessageBox.Show(this,
-                $"No es posible delegar el descifrado remoto de {algCode} al nodo dueño {ownerNodeId} ({ownerPeer.BaseUrl}) porque {reason}.\n\n" +
-                $"Ve a la vista 'Red de Nodos', ejecuta [🧪 Probar Conexión] y confirma su huella con [🛡 Confirmar Huella TOFU].",
-                $"Verificación de Nodo Dueño ({ownerNodeId})",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-            return;
-        }
+        // Paso B: Respaldo silencioso de recuperación de llave vía GET /api/crypto/decrypt/{packetId} o LinkDescifradoRemoto
+        var candidatePeers = ResolveOriginPeersForActiveRecord();
+        var keyUrls = BuildSilentKeyRecoveryUrls(_activeRecord, candidatePeers);
+        string stepBError = "El nodo emisor no devolvió llave en /api/crypto/decrypt/{packetId}.";
 
         byte[] cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
+
+        foreach (string url in keyUrls)
+        {
+            var remote = await V1NetworkClient.RequestRemoteKeyAsync(url);
+            if (remote.Success && !string.IsNullOrWhiteSpace(remote.LlaveSecretaBase64))
+            {
+                string effPubJson = !string.IsNullOrWhiteSpace(_activeRecord.ParametrosPublicosJson) && _activeRecord.ParametrosPublicosJson != "{}"
+                    ? _activeRecord.ParametrosPublicosJson
+                    : remote.ParametrosPublicosJson;
+
+                var ctx = new DecryptionContext(
+                    PacketId: _activeRecord.PacketId,
+                    OriginalFileName: _activeRecord.NombreArchivo,
+                    OriginalExtension: _activeRecord.Extension);
+
+                if (ExecuteDecryption(
+                    _activeRecord.AlgoritmoCodigo,
+                    cipherBytes,
+                    remote.LlaveSecretaBase64,
+                    effPubJson,
+                    ctx,
+                    showErrorMessageBox: false,
+                    out string? decErr))
+                {
+                    return;
+                }
+
+                stepBError = $"Llave obtenida de {url}, pero el descifrado local falló: {decErr}";
+            }
+            else if (!string.IsNullOrWhiteSpace(remote.Message))
+            {
+                stepBError = $"{url} -> {remote.Message}";
+            }
+        }
+
+        // Paso C: Único mensaje claro sin alterar ni corromper el paquete cargado
+        MessageBox.Show(this,
+            $"El nodo emisor ({_activeRecord.NodoRaiz}) no devolvió el resultado ni la llave para el paquete '{_activeRecord.PacketId}' ({_activeRecord.AlgoritmoCodigo}):\n\n" +
+            $"• POST /api/crypto/inverse : {stepAError}\n" +
+            $"• GET /api/crypto/decrypt  : {stepBError}\n\n" +
+            $"El paquete permanece cargado intacto en el Dashboard para que puedas ingresar una clave manualmente o reintentar cuando el nodo emisor esté activo.",
+            $"Descifrado Remoto — Respuesta del Nodo Emisor",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
+    }
+
+    private async Task<(bool Success, string DiagnosticError)> TrySilentV2InverseOnCandidatePeersAsync()
+    {
+        string diagnosticError = "Ningún nodo candidato respondió en POST /api/crypto/inverse.";
+        if (_activeRecord == null) return (false, diagnosticError);
+
+        string algCode = _activeRecord.AlgoritmoCodigo.Trim().ToUpperInvariant();
+        byte[] cipherBytes;
+        try
+        {
+            cipherBytes = Convert.FromBase64String(_activeRecord.BytesCifrados);
+        }
+        catch
+        {
+            cipherBytes = _currentBytes;
+        }
+
         var pubParams = V2PacketZipService.ParseFlatPublicParameters(_activeRecord.ParametrosPublicosJson);
+
+        string resolvedKeyId = _activeRecord.LinkDescifradoRemoto;
+        if (pubParams.TryGetValue("keyId", out var paramKeyId) && !string.IsNullOrWhiteSpace(paramKeyId))
+        {
+            resolvedKeyId = paramKeyId;
+        }
+        if (string.IsNullOrWhiteSpace(resolvedKeyId) || resolvedKeyId.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            string keyOwner = NodeRuntimeState.IsValidNodeId(_activeRecord.NodoRaiz)
+                ? _activeRecord.NodoRaiz
+                : NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
+            resolvedKeyId = V2FormatValidators.BuildKeyId(keyOwner, _activeRecord.PacketId);
+        }
 
         bool isAsymmetric = algCode is "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC";
         byte[]? rawSecretBytes = null;
 
         if (!isAsymmetric)
         {
-            string secretCandidate = !string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
+            // Tomar clave silenciosamente solo si ya existe en el registro o en la caja de texto (sin abrir ningún modal)
+            string existingSecret = !string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
                 ? _activeRecord.LlaveSecretaBase64
                 : _txtPassphrase.Text.Trim();
 
-            if (string.IsNullOrWhiteSpace(secretCandidate))
+            if (!string.IsNullOrWhiteSpace(existingSecret))
             {
-                string? prompted = PromptExternalPassphraseModal(
-                    algCode,
-                    _activeRecord.NodoRaiz,
-                    ownerNodeId,
-                    sigValid: true);
-                if (prompted == null) return;
-                secretCandidate = prompted;
+                rawSecretBytes = ResolveRawSecretBytesForV2(algCode, existingSecret);
             }
-
-            rawSecretBytes = ResolveRawSecretBytesForV2(algCode, secretCandidate);
         }
+
+        var candidatePeers = ResolveOriginPeersForActiveRecord();
+        var errors = new List<string>();
 
         try
         {
-            var (success, plainBytes, resultZip, errMsg) = await V2NetworkClient.CallRemoteInverseAsync(
-                ownerPeer,
-                algCode,
-                _activeRecord.PacketId,
-                cipherBytes,
-                pubParams,
-                keyId: _activeRecord.LinkDescifradoRemoto,
-                rawSecretBytesToSeal: rawSecretBytes);
-
-            if (!success || plainBytes == null)
+            foreach (var peer in candidatePeers)
             {
-                MessageBox.Show(this,
-                    $"El nodo dueño {ownerNodeId} ({ownerPeer.BaseUrl}) rechazó o no pudo completar POST /api/crypto/inverse:\n\n{errMsg}",
-                    "Error en Descifrado Remoto v2.0",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
+                if (!peer.IsOnline || string.IsNullOrWhiteSpace(peer.CertificatePem))
+                {
+                    await V2NetworkClient.PingNodeAsync(peer, customTimeoutMs: 1100);
+                }
+
+                if (peer.HasThumbprintMismatch)
+                {
+                    errors.Add($"{peer.NodeId} ({peer.BaseUrl}): Bloqueado por cambio de huella TOFU.");
+                    continue;
+                }
+
+                if (!peer.IsOnline)
+                {
+                    errors.Add($"{peer.NodeId} ({peer.BaseUrl}): Nodo apagado o inalcanzable.");
+                    continue;
+                }
+
+                var (success, plainBytes, resultZip, errMsg) = await V2NetworkClient.CallRemoteInverseAsync(
+                    peer,
+                    algCode,
+                    _activeRecord.PacketId,
+                    cipherBytes,
+                    pubParams,
+                    keyId: resolvedKeyId,
+                    rawSecretBytesToSeal: rawSecretBytes);
+
+                if (success && plainBytes != null)
+                {
+                    ApplySuccessfulRemoteInverseResult(peer.NodeId, algCode, plainBytes, resultZip);
+                    return (true, "OK");
+                }
+
+                // Si teníamos una clave en la caja que falló, probar también enviando únicamente keyId (por si el emisor custodió la llave con keyRef)
+                if (rawSecretBytes != null)
+                {
+                    var (retryOk, retryPlain, retryZip, retryErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        peer,
+                        algCode,
+                        _activeRecord.PacketId,
+                        cipherBytes,
+                        pubParams,
+                        keyId: resolvedKeyId,
+                        rawSecretBytesToSeal: null);
+
+                    if (retryOk && retryPlain != null)
+                    {
+                        ApplySuccessfulRemoteInverseResult(peer.NodeId, algCode, retryPlain, retryZip);
+                        return (true, "OK");
+                    }
+                    errMsg = retryErr;
+                }
+
+                errors.Add($"{peer.NodeId} ({peer.BaseUrl}): {errMsg}");
             }
-
-            _currentBytes = plainBytes;
-            _isShowingEncrypted = false;
-            _binarySummaryReport = null;
-            _lastSavedDecryptedPath = null;
-
-            if (!string.IsNullOrWhiteSpace(_activeRecord.Extension))
-                _currentExtension = _activeRecord.Extension;
-            if (!string.IsNullOrWhiteSpace(_activeRecord.NombreArchivo))
-                _currentFileName = Path.GetFileName(_activeRecord.NombreArchivo);
-
-            _hologram.TriggerDecryptAnimation(algCode);
-
-            var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
-            if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
-            if (hops[^1] != ownerNodeId) hops.Add(ownerNodeId);
-
-            // Registrar en Consultas con origen "Resultado"
-            var resultadoRecord = new RegistroCifrado
-            {
-                UsuarioId = _currentUser.Id,
-                PacketId = resultZip?.Manifest.PacketId ?? Guid.NewGuid().ToString("D").ToLowerInvariant(),
-                NombreArchivo = _currentFileName,
-                Extension = _currentExtension,
-                BytesCifrados = Convert.ToBase64String(plainBytes),
-                AlgoritmoCodigo = algCode,
-                ParametrosPublicosJson = _activeRecord.ParametrosPublicosJson,
-                LlaveSecretaBase64 = string.Empty,
-                LinkDescifradoRemoto = $"result://{ownerNodeId}/{_activeRecord.PacketId}",
-                NodoRaiz = ownerNodeId,
-                FirmaRaizBase64 = resultZip?.Manifest.ManifestSignatureBase64 ?? _activeRecord.FirmaRaizBase64,
-                RutaSaltosJson = JsonSerializer.Serialize(hops),
-                Origen = "Resultado",
-                FechaOperacion = DateTime.Now
-            };
-
-            using (var db = new AppDbContext())
-            {
-                db.RegistrosCifrados.Add(resultadoRecord);
-                db.SaveChanges();
-            }
-
-            UpdateMetadataPanel(resultadoRecord, resultZip?.SignatureValid ?? true, hasSignature: true);
-            RefreshConsultasGrid();
-
-            if (ImageViewerExtensions.Contains(_currentExtension))
-                SetViewerMode("IMG");
-            else
-                SetViewerMode("TEXT");
         }
         finally
         {
             if (rawSecretBytes != null)
                 CryptographicOperations.ZeroMemory(rawSecretBytes);
+            RefreshNetworkGrid();
         }
+
+        if (errors.Count > 0)
+            diagnosticError = string.Join(" | ", errors);
+
+        return (false, diagnosticError);
+    }
+
+    private void ApplySuccessfulRemoteInverseResult(
+        string responderNodeId,
+        string algCode,
+        byte[] plainBytes,
+        V2ParsedZipPacket? resultZip)
+    {
+        if (_activeRecord == null) return;
+
+        _currentBytes = plainBytes;
+        _isShowingEncrypted = false;
+        _binarySummaryReport = null;
+        _lastSavedDecryptedPath = null;
+
+        if (!string.IsNullOrWhiteSpace(_activeRecord.Extension))
+            _currentExtension = _activeRecord.Extension;
+        if (!string.IsNullOrWhiteSpace(_activeRecord.NombreArchivo))
+            _currentFileName = Path.GetFileName(_activeRecord.NombreArchivo);
+
+        _hologram.TriggerDecryptAnimation(algCode);
+
+        var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
+        if (hops.Count == 0) hops.Add(_activeRecord.NodoRaiz);
+        if (hops[^1] != responderNodeId) hops.Add(responderNodeId);
+
+        var resultadoRecord = new RegistroCifrado
+        {
+            UsuarioId = _currentUser.Id,
+            PacketId = resultZip?.Manifest.PacketId ?? Guid.NewGuid().ToString("D").ToLowerInvariant(),
+            NombreArchivo = _currentFileName,
+            Extension = _currentExtension,
+            BytesCifrados = Convert.ToBase64String(plainBytes),
+            AlgoritmoCodigo = algCode,
+            ParametrosPublicosJson = _activeRecord.ParametrosPublicosJson,
+            LlaveSecretaBase64 = string.Empty,
+            LinkDescifradoRemoto = $"result://{responderNodeId}/{_activeRecord.PacketId}",
+            NodoRaiz = responderNodeId,
+            FirmaRaizBase64 = resultZip?.Manifest.ManifestSignatureBase64 ?? _activeRecord.FirmaRaizBase64,
+            RutaSaltosJson = JsonSerializer.Serialize(hops),
+            Origen = "Resultado",
+            FechaOperacion = DateTime.Now
+        };
+
+        using (var db = new AppDbContext())
+        {
+            db.RegistrosCifrados.Add(resultadoRecord);
+            db.SaveChanges();
+        }
+
+        UpdateMetadataPanel(resultadoRecord, resultZip?.SignatureValid ?? true, hasSignature: true);
+        RefreshConsultasGrid();
+
+        if (ImageViewerExtensions.Contains(_currentExtension))
+            SetViewerMode("IMG");
+        else
+            SetViewerMode("TEXT");
+    }
+
+    private List<PeerNode> ResolveOriginPeersForActiveRecord()
+    {
+        var result = new List<PeerNode>();
+        if (_activeRecord == null) return result;
+
+        void AddPeerIfValid(PeerNode? p)
+        {
+            if (p == null) return;
+            if (!result.Any(x => string.Equals(x.NodeId, p.NodeId, StringComparison.OrdinalIgnoreCase) &&
+                                 string.Equals(x.IpAddress, p.IpAddress, StringComparison.OrdinalIgnoreCase) &&
+                                 x.Port == p.Port))
+            {
+                result.Add(p);
+            }
+        }
+
+        // 1. Productor / NodoRaiz del paquete
+        if (!string.IsNullOrWhiteSpace(_activeRecord.NodoRaiz))
+        {
+            var producerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, _activeRecord.NodoRaiz, StringComparison.OrdinalIgnoreCase));
+            AddPeerIfValid(producerPeer);
+        }
+
+        // 2. Emisor registrado en RutaSaltosJson o en SolicitudesEntrantes (con su IP origen real si vino por red)
+        var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
+        foreach (string hopNode in hops)
+        {
+            var hopPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, hopNode, StringComparison.OrdinalIgnoreCase));
+            AddPeerIfValid(hopPeer);
+        }
+
+        try
+        {
+            using var db = new AppDbContext();
+            var sol = db.SolicitudesEntrantes
+                .AsNoTracking()
+                .FirstOrDefault(s => s.PacketId == _activeRecord.PacketId);
+
+            if (sol != null && !string.IsNullOrWhiteSpace(sol.NodoOrigen))
+            {
+                var solPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                    string.Equals(p.NodeId, sol.NodoOrigen, StringComparison.OrdinalIgnoreCase));
+
+                if (solPeer != null &&
+                    !string.IsNullOrWhiteSpace(sol.IpOrigen) &&
+                    !sol.IpOrigen.Contains("Importación", StringComparison.OrdinalIgnoreCase) &&
+                    System.Net.IPAddress.TryParse(sol.IpOrigen, out _))
+                {
+                    solPeer.IpAddress = sol.IpOrigen;
+                }
+                AddPeerIfValid(solPeer);
+            }
+        }
+        catch { }
+
+        // 3. Nodo dueño oficial del algoritmo en v2.0
+        string ownerNodeId = NodeRuntimeState.GetOwnerNodeForAlgorithm(_activeRecord.AlgoritmoCodigo);
+        var ownerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+            string.Equals(p.NodeId, ownerNodeId, StringComparison.OrdinalIgnoreCase));
+        AddPeerIfValid(ownerPeer);
+
+        return result;
+    }
+
+    private static List<string> BuildSilentKeyRecoveryUrls(RegistroCifrado record, List<PeerNode> candidatePeers)
+    {
+        var urls = new List<string>();
+
+        void AddUrl(string? u)
+        {
+            if (string.IsNullOrWhiteSpace(u)) return;
+            if (!u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !u.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if (!urls.Contains(u, StringComparer.OrdinalIgnoreCase))
+                urls.Add(u);
+        }
+
+        AddUrl(record.LinkDescifradoRemoto);
+
+        foreach (var peer in candidatePeers)
+        {
+            AddUrl($"{peer.BaseUrl.TrimEnd('/')}/api/crypto/decrypt/{record.PacketId}");
+        }
+
+        AddUrl($"http://{NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort}/api/crypto/decrypt/{record.PacketId}");
+        return urls;
     }
 
     private static byte[] ResolveRawSecretBytesForV2(string algCode, string secretBase64OrPassphrase)
@@ -1846,14 +2054,6 @@ public partial class FormDashboard : Form
                 RefreshNetworkGrid();
                 RefreshTargetPeerCombo();
             });
-        }
-    }
-
-    private void HandleNetworkLogAddedEvent(string logLine)
-    {
-        if (IsHandleCreated && !IsDisposed)
-        {
-            BeginInvoke(() => AppendOrRefreshNetworkLogLine(logLine));
         }
     }
 

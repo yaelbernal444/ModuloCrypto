@@ -64,7 +64,13 @@ public sealed class HologramLockControl : Control
     private ProjectedPoint[] _projected = Array.Empty<ProjectedPoint>();
     private readonly Font[] _bitFonts;
     private readonly Font _hudBadgeFont = new("Cascadia Mono", 9.2f, FontStyle.Bold);
+    private readonly Font _bannerFontLarge = new("Cascadia Mono", 16f, FontStyle.Bold);
+    private readonly Font _bannerFontMedium = new("Cascadia Mono", 13.5f, FontStyle.Bold);
+    private readonly Font _bannerFontCompact = new("Cascadia Mono", 11.2f, FontStyle.Bold);
     private readonly Random _rng = new(2026);
+
+    private string _hologramMessage = string.Empty;
+    private Color _hologramMessageColor = HologramTheme.HologramCyan;
 
     private static readonly Color IdleCyan = Color.FromArgb(0, 210, 255);      // #00D2FF
     private static readonly Color IdleBlue = Color.FromArgb(30, 144, 255);     // #1E90FF
@@ -154,6 +160,20 @@ public sealed class HologramLockControl : Control
         _pulseRadius = 0.05f;
         _pulseAlpha = 1f;
         StatusSubtitle = $"Descifrando con {algorithmCode}...";
+    }
+
+    public void ShowHologramMessage(string message, Color accentColor)
+    {
+        _hologramMessage = (message ?? string.Empty).Trim().ToUpperInvariant();
+        _hologramMessageColor = accentColor;
+        Invalidate();
+    }
+
+    public void ClearHologramMessage()
+    {
+        if (string.IsNullOrEmpty(_hologramMessage)) return;
+        _hologramMessage = string.Empty;
+        Invalidate();
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
@@ -627,6 +647,94 @@ public sealed class HologramLockControl : Control
         {
             DrawHologramHud(g);
         }
+
+        // 7. Banner holográfico grande (independiente de ShowHud para funcionar también en el Login)
+        if (!string.IsNullOrWhiteSpace(_hologramMessage))
+        {
+            DrawHologramMessageBanner(g, cx, baseY);
+        }
+    }
+
+    private void DrawHologramMessageBanner(Graphics g, float cx, float baseY)
+    {
+        string text = _hologramMessage;
+        Color accent = _hologramMessageColor;
+
+        int maxBannerW = Math.Max(160, Width - 28);
+        Font activeFont = _bannerFontLarge;
+        Size measured = TextRenderer.MeasureText(g, text, activeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        if (measured.Width + 36 > maxBannerW)
+        {
+            activeFont = _bannerFontMedium;
+            measured = TextRenderer.MeasureText(g, text, activeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        }
+        if (measured.Width + 32 > maxBannerW)
+        {
+            activeFont = _bannerFontCompact;
+            measured = TextRenderer.MeasureText(g, text, activeFont, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        }
+
+        int bannerW = Math.Clamp(measured.Width + 44, 210, maxBannerW);
+        int bannerH = 44;
+        int bannerX = (int)(cx - bannerW / 2f);
+        int targetY = (int)Math.Min(Height - bannerH - 14, Math.Max(Height * 0.68f, baseY - bannerH * 0.65f));
+        var bannerRect = new Rectangle(bannerX, targetY, bannerW, bannerH);
+
+        // 1. Franja translúcida sutil detrás del texto con bordes superior e inferior neón
+        using (var bgBrush = new SolidBrush(Color.FromArgb(145, 11, 9, 20)))
+        using (var path = HologramTheme.CreateRoundedPath(bannerRect, 10))
+        {
+            g.FillPath(bgBrush, path);
+        }
+
+        using (var outerGlowPen = new Pen(Color.FromArgb(85, accent), 3f))
+        {
+            g.DrawLine(outerGlowPen, bannerRect.Left + 8, bannerRect.Top, bannerRect.Right - 8, bannerRect.Top);
+            g.DrawLine(outerGlowPen, bannerRect.Left + 8, bannerRect.Bottom, bannerRect.Right - 8, bannerRect.Bottom);
+        }
+
+        using (var neonBorderPen = new Pen(Color.FromArgb(235, accent), 1.6f))
+        {
+            g.DrawLine(neonBorderPen, bannerRect.Left + 4, bannerRect.Top, bannerRect.Right - 4, bannerRect.Top);
+            g.DrawLine(neonBorderPen, bannerRect.Left + 4, bannerRect.Bottom, bannerRect.Right - 4, bannerRect.Bottom);
+        }
+
+        // Líneas de escaneo horizontales sutiles dentro de la franja holográfica
+        using (var scanPen = new Pen(Color.FromArgb(28, accent), 1f))
+        {
+            for (int sy = bannerRect.Top + 4; sy < bannerRect.Bottom - 2; sy += 4)
+            {
+                g.DrawLine(scanPen, bannerRect.Left + 6, sy, bannerRect.Right - 6, sy);
+            }
+        }
+
+        // 2. Doble capa de resplandor difuso (alpha 70-110 en accentColor) + texto nítido principal
+        TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+        Color outerGlowColor = Color.FromArgb(75, accent);
+        Color innerGlowColor = Color.FromArgb(110, accent);
+
+        int[] offsetsOuter = { -2, 2 };
+        foreach (int dx in offsetsOuter)
+        {
+            foreach (int dy in offsetsOuter)
+            {
+                var rGlow = new Rectangle(bannerRect.X + dx, bannerRect.Y + dy, bannerRect.Width, bannerRect.Height);
+                TextRenderer.DrawText(g, text, activeFont, rGlow, outerGlowColor, flags);
+            }
+        }
+
+        int[] offsetsInner = { -1, 1 };
+        foreach (int dx in offsetsInner)
+        {
+            foreach (int dy in offsetsInner)
+            {
+                var rGlow = new Rectangle(bannerRect.X + dx, bannerRect.Y + dy, bannerRect.Width, bannerRect.Height);
+                TextRenderer.DrawText(g, text, activeFont, rGlow, innerGlowColor, flags);
+            }
+        }
+
+        Color brightMain = BlendColor(Color.White, accent, 0.32f, 255);
+        TextRenderer.DrawText(g, text, activeFont, bannerRect, brightMain, flags);
     }
 
     private void DrawAmbientBackdrop(Graphics g, float cx, float cy, float minDim)
@@ -836,6 +944,9 @@ public sealed class HologramLockControl : Control
             _timer.Dispose();
             foreach (var f in _bitFonts) f.Dispose();
             _hudBadgeFont.Dispose();
+            _bannerFontLarge.Dispose();
+            _bannerFontMedium.Dispose();
+            _bannerFontCompact.Dispose();
         }
         base.Dispose(disposing);
     }

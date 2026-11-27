@@ -17,9 +17,8 @@ namespace ModuloCrypto.UI.Forms;
 
 public partial class FormDashboard
 {
-    // Solicitudes (Bandeja + Bitácora de Red)
+    // Solicitudes (Bandeja)
     private DataGridView _gridSolicitudes = null!;
-    private TextBox _txtNetworkEventLog = null!;
 
     // Consultas (Historial)
     private DataGridView _gridConsultas = null!;
@@ -341,22 +340,21 @@ public partial class FormDashboard
         btnImportZip.FitToText(minWidth: 132, height: 36);
         btnImportZip.Click += (_, _) => HandleImportZipToInbox();
 
-        var btnCleanOrphans = new NeonButton { Text = "🧹 Limpiar Huérfanas", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
-        btnCleanOrphans.FitToText(minWidth: 158, height: 36);
+        var btnCleanOrphans = new NeonButton { Text = "Limpiar", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
+        btnCleanOrphans.FitToText(minWidth: 96, height: 38);
         btnCleanOrphans.Click += (_, _) => HandleCleanOrphanSolicitudes();
 
         var btnDeleteSolicitud = new NeonButton { Text = "🗑 Eliminar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
-        btnDeleteSolicitud.FitToText(minWidth: 108, height: 36);
+        btnDeleteSolicitud.FitToText(minWidth: 108, height: 38);
         btnDeleteSolicitud.Click += (_, _) => HandleDeleteSelectedSolicitud();
 
         var btnRefresh = new NeonButton { Text = "↻ Actualizar", Variant = NeonButtonVariant.Secondary, Margin = new Padding(0, 2, 8, 2) };
-        btnRefresh.FitToText(minWidth: 110, height: 36);
+        btnRefresh.FitToText(minWidth: 110, height: 38);
         btnRefresh.Click += (_, _) =>
         {
             RefreshSolicitudesGrid();
             RefreshPendingSolicitudesBadge();
             RefreshConsultasGrid();
-            RefreshNetworkLogBox();
         };
 
         btnFlow.Controls.AddRange(new Control[]
@@ -373,65 +371,6 @@ public partial class FormDashboard
         header.Controls.Add(titleStack, 0, 0);
         header.Controls.Add(btnFlow, 0, 1);
 
-        // Panel compacto inferior (95 px) con Bitácora en tiempo real de peticiones aceptadas y rechazadas
-        var logPanel = new GlassPanel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 96,
-            CornerRadius = 12,
-            BorderColor = HologramTheme.BorderSubtle,
-            FillColorTop = Color.FromArgb(16, 14, 30),
-            FillColorBottom = Color.FromArgb(12, 10, 24),
-            Padding = new Padding(10, 6, 10, 6)
-        };
-
-        var logTopBar = new Panel
-        {
-            Dock = DockStyle.Top,
-            Height = 20,
-            BackColor = Color.Transparent
-        };
-
-        var lblLogCaption = new Label
-        {
-            Text = "📡 Registro de Red (Últimos Eventos / Rechazos):",
-            Font = new Font("Segoe UI", 8.6f, FontStyle.Bold),
-            ForeColor = HologramTheme.HologramCyan,
-            Dock = DockStyle.Left,
-            AutoSize = true,
-            BackColor = Color.Transparent
-        };
-
-        var lblClearLog = new Label
-        {
-            Text = "[Limpiar log]",
-            Font = new Font("Cascadia Mono", 8f, FontStyle.Underline),
-            ForeColor = HologramTheme.TextSecondary,
-            Dock = DockStyle.Right,
-            AutoSize = true,
-            Cursor = Cursors.Hand,
-            BackColor = Color.Transparent
-        };
-        lblClearLog.Click += (_, _) =>
-        {
-            NodeRuntimeState.ClearNetworkLogs();
-            RefreshNetworkLogBox();
-        };
-
-        logTopBar.Controls.Add(lblClearLog);
-        logTopBar.Controls.Add(lblLogCaption);
-
-        _txtNetworkEventLog = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: true, mono: true);
-        _txtNetworkEventLog.Dock = DockStyle.Fill;
-        _txtNetworkEventLog.Font = new Font("Cascadia Mono", 8.4f);
-        _txtNetworkEventLog.ScrollBars = ScrollBars.Vertical;
-        _txtNetworkEventLog.WordWrap = false;
-        _txtNetworkEventLog.BackColor = Color.FromArgb(12, 10, 24);
-        _txtNetworkEventLog.ForeColor = HologramTheme.TextPrimary;
-
-        logPanel.Controls.Add(_txtNetworkEventLog);
-        logPanel.Controls.Add(logTopBar);
-
         _gridSolicitudes = new DataGridView { Dock = DockStyle.Fill };
         HologramTheme.StyleDataGrid(_gridSolicitudes);
         _gridSolicitudes.CellFormatting += (_, e) =>
@@ -443,35 +382,12 @@ public partial class FormDashboard
                                          st == "Rechazada" ? HologramTheme.Danger : HologramTheme.Warning;
         };
 
-        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 8), BackColor = HologramTheme.PanelGlass };
+        var gridWrap = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 0, 0), BackColor = HologramTheme.PanelGlass };
         gridWrap.Controls.Add(_gridSolicitudes);
 
         card.Controls.Add(gridWrap);
-        card.Controls.Add(logPanel);
         card.Controls.Add(header);
         panel.Controls.Add(card);
-
-        RefreshNetworkLogBox();
-    }
-
-    private void RefreshNetworkLogBox()
-    {
-        if (_txtNetworkEventLog == null || _txtNetworkEventLog.IsDisposed) return;
-        var logs = NodeRuntimeState.GetNetworkLogsSnapshot();
-        if (logs.Count == 0)
-        {
-            _txtNetworkEventLog.Text = $"[{DateTime.Now:HH:mm:ss}] Escuchando peticiones en {NodeRuntimeState.LocalIpAddress}:{NodeRuntimeState.ApiPort} (/api/requests/receive, /api/crypto/forward, /api/crypto/inverse)...";
-            return;
-        }
-        _txtNetworkEventLog.Text = string.Join(Environment.NewLine, logs);
-        _txtNetworkEventLog.SelectionStart = _txtNetworkEventLog.TextLength;
-        _txtNetworkEventLog.ScrollToCaret();
-    }
-
-    private void AppendOrRefreshNetworkLogLine(string logLine)
-    {
-        if (_txtNetworkEventLog == null || _txtNetworkEventLog.IsDisposed) return;
-        RefreshNetworkLogBox();
     }
 
     private void RefreshSolicitudesGrid()
