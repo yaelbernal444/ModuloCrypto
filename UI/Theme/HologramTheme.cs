@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace ModuloCrypto.UI.Theme;
@@ -143,4 +144,37 @@ public static class HologramTheme
             ScrollBars = multiline ? ScrollBars.Vertical : ScrollBars.None
         };
     }
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+    /// <summary>
+    /// Aplica barra de título y borde oscuro nativo de Windows 10/11 mediante DwmSetWindowAttribute (#0B0914).
+    /// </summary>
+    public static void ApplyDarkTitleBar(Form? form)
+    {
+        if (form == null || form.IsDisposed || !form.IsHandleCreated) return;
+
+        try
+        {
+            IntPtr hwnd = form.Handle;
+            int useDarkMode = 1;
+            if (DwmSetWindowAttribute(hwnd, 20, ref useDarkMode, sizeof(int)) != 0)
+                _ = DwmSetWindowAttribute(hwnd, 19, ref useDarkMode, sizeof(int));
+
+            int captionColorRef = ToColorRef(BackgroundBase);
+            _ = DwmSetWindowAttribute(hwnd, 35, ref captionColorRef, sizeof(int));
+
+            int textColorRef = ToColorRef(TextPrimary);
+            _ = DwmSetWindowAttribute(hwnd, 36, ref textColorRef, sizeof(int));
+
+            int borderColorRef = ToColorRef(BorderSubtle);
+            _ = DwmSetWindowAttribute(hwnd, 34, ref borderColorRef, sizeof(int));
+        }
+        catch
+        {
+        }
+    }
+
+    private static int ToColorRef(Color c) => c.R | (c.G << 8) | (c.B << 16);
 }

@@ -170,6 +170,12 @@ public sealed class FormRegisterModal : Form
         BackColor = Color.Transparent
     };
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        HologramTheme.ApplyDarkTitleBar(this);
+    }
+
     private void HandleRegister()
     {
         var (success, message, user) = AuthService.Register(

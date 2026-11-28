@@ -694,6 +694,12 @@ public class AppDbContext : DbContext
                     match.HttpsPort = saved.HttpsPort;
                     match.Source = saved.Source;
                     match.Status = saved.HasThumbprintMismatch ? "blocked" : saved.Status;
+                    if (!string.IsNullOrWhiteSpace(saved.AlgorithmsJson) && saved.AlgorithmsJson != "[]" && saved.IsConfirmed)
+                    {
+                        match.AlgorithmsJson = saved.AlgorithmsJson;
+                        if (!string.IsNullOrWhiteSpace(saved.RoleLabel) && match.TeamNumber is < 1 or > 8)
+                            match.RoleLabel = saved.RoleLabel;
+                    }
                 }
                 match.PinnedThumbprintSha256 = saved.PinnedThumbprintSha256;
                 match.CertThumbprint = saved.CertThumbprint;
@@ -701,6 +707,15 @@ public class AppDbContext : DbContext
                 match.IsConfirmed = saved.IsConfirmed;
                 match.HasThumbprintMismatch = saved.HasThumbprintMismatch;
                 match.LastSeenUtc = saved.LastSeenUtc;
+
+                // Garantizar que EQ01..EQ08 muestren siempre su Rol exacto Tabla 4.1 salvo que el peer haya anunciado algoritmos vivos distintos
+                if (match.TeamNumber is >= 1 and <= 8 &&
+                    (string.Equals(match.Source, "manual", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(match.CertThumbprint)))
+                {
+                    var owned = NodeRuntimeState.GetOwnedAlgorithmsForTeam(match.TeamNumber);
+                    match.AlgorithmsJson = System.Text.Json.JsonSerializer.Serialize(owned);
+                    match.RoleLabel = $"Equipo {match.TeamNumber:D2} ({string.Join(", ", owned)})";
+                }
             }
             else
             {

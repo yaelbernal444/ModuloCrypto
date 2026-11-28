@@ -9,7 +9,9 @@ using ModuloCrypto.Network.V1;
 using ModuloCrypto.Network.V2;
 using ModuloCrypto.Security;
 using ModuloCrypto.Security.Strategies;
+using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Forms;
+using ModuloCrypto.UI.Theme;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
@@ -48,11 +50,10 @@ internal static class Program
         {
             NodeRuntimeState.SqliteConnected = false;
             NodeRuntimeState.SqliteDiagnostic = ex.Message;
-            MessageBox.Show(
+            HologramDialog.ShowError(
+                null,
                 $"Error al inicializar la base de datos SQLite:\n{ex.Message}",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}");
         }
 
         // 2. Ciclo de vida diferido: Mostrar Login primero y levantar el servidor V1 o V2 elegido por el operador
@@ -848,6 +849,22 @@ internal static class Program
                     if (!directOpenedRes.SequenceEqual(anexoPlain))
                         throw new Exception("Anexo A.2 falló: AAD = result.packetId no abrió resultado.enc.");
 
+                    // Bloque 5: Flujo v3-local usando publicParameters["keyId"] sin secretos de usuario en /api/crypto/inverse
+                    var v3PubParams = new Dictionary<string, string>(fwdResp.PublicParameters, StringComparer.Ordinal)
+                    {
+                        ["mode"] = "v3-local",
+                        ["keyId"] = fwdResp.KeyRef.KeyId
+                    };
+                    var (v3Ok, v3Plain, v3ResZip, v3Err) = await V2NetworkClient.CallRemoteInverseAsync(
+                        eq01Peer,
+                        "AESGCM",
+                        fwdResp.PacketId,
+                        fwdCipher,
+                        v3PubParams,
+                        keyId: v3PubParams["keyId"]);
+                    if (!v3Ok || v3Plain == null || !v3Plain.SequenceEqual(anexoPlain) || v3ResZip == null)
+                        throw new Exception($"Compatibilidad v3-local con publicParameters['keyId'] falló: {v3Err}");
+
                     // ADR 0005: paquete .zip repetido y paquete .zip con timestamp > 15 min aceptados en /api/crypto/inverse con requestId distinto
                     string replayPkgZip = Path.Combine(Path.GetTempPath(), $"v2_adr0005_pkg_{Guid.NewGuid():N}.zip");
                     string expiredPkgZip = Path.Combine(Path.GetTempPath(), $"v2_adr0005_exp_{Guid.NewGuid():N}.zip");
@@ -1084,10 +1101,163 @@ internal static class Program
                 }
             }
 
+            // Bloque 5: Verificaciones obligatorias de subred /22, Tabla 4.1, HologramDialog sin fugas, ResetDashboardState y flujo EQ08 remoto (HASHSHA/HMACSHA256)
+            var plan24 = NetworkAddressService.ComputeSubnetScanPlan("192.168.10.42", "255.255.255.0", includeLocalIp: true);
+            if (plan24.PrefixLength != 24 || plan24.EffectivePrefixLength != 24 ||
+                plan24.SubnetHosts.Count != 254 ||
+                plan24.SubnetHosts.Contains("192.168.10.0") ||
+                plan24.SubnetHosts.Contains("192.168.10.255") ||
+                !plan24.SubnetHosts.Contains("192.168.10.1") ||
+                !plan24.SubnetHosts.Contains("192.168.10.254"))
+            {
+                throw new Exception($"Falló cálculo de subred /24: hosts={plan24.SubnetHosts.Count}, eff=/{plan24.EffectivePrefixLength}");
+            }
+
+            var plan20 = NetworkAddressService.ComputeSubnetScanPlan("10.10.5.42", "255.255.240.0", includeLocalIp: true);
+            if (plan20.PrefixLength != 20 || plan20.EffectivePrefixLength != 22 ||
+                plan20.NetworkAddress != "10.10.4.0" || plan20.BroadcastAddress != "10.10.7.255" ||
+                plan20.SubnetHosts.Count != 1022 ||
+                plan20.SubnetHosts.Contains("10.10.4.0") ||
+                plan20.SubnetHosts.Contains("10.10.7.255") ||
+                plan20.SubnetHosts.Contains("10.10.0.0") ||
+                plan20.SubnetHosts.Contains("10.10.15.255") ||
+                !plan20.SubnetHosts.Contains("10.10.4.1") ||
+                !plan20.SubnetHosts.Contains("10.10.5.10") ||
+                !plan20.SubnetHosts.Contains("10.10.6.10") ||
+                !plan20.SubnetHosts.Contains("10.10.7.254"))
+            {
+                throw new Exception($"Falló cálculo de subred /22 desde /20: hosts={plan20.SubnetHosts.Count}, net={plan20.NetworkAddress}, bcast={plan20.BroadcastAddress}");
+            }
+
+            // Verificar persistencia ScanHosts restaurando lista previa
+            var originalScanHosts = NetworkAddressService.LoadScanHosts();
+            try
+            {
+                var parsedScan = NetworkAddressService.ParseScanHostsCsv("192.168.1.99, 10.10.5.12:5006, invalido");
+                NetworkAddressService.SaveScanHosts(parsedScan);
+                var reloadedScan = NetworkAddressService.LoadScanHosts();
+                if (reloadedScan.Count != 2 || !reloadedScan.Contains("192.168.1.99") || !reloadedScan.Contains("10.10.5.12:5006"))
+                    throw new Exception("Falló persistencia ScanHosts.");
+            }
+            finally
+            {
+                NetworkAddressService.SaveScanHosts(originalScanHosts);
+            }
+
+            // Verificar Tabla 4.1 exacta EQ01..EQ08
+            if (!NodeRuntimeState.GetOwnedAlgorithmsForTeam(4).SequenceEqual(new[] { "DIFFIEHELLMAN", "CAESAR" }) ||
+                !NodeRuntimeState.GetOwnedAlgorithmsForTeam(6).SequenceEqual(new[] { "LSBSTEGO", "EUCLIDESAFFINE" }) ||
+                !NodeRuntimeState.GetOwnedAlgorithmsForTeam(8).SequenceEqual(new[] { "HASHSHA", "HMACSHA256" }))
+            {
+                throw new Exception("Falló verificación de Tabla 4.1 exacta para EQ01–EQ08.");
+            }
+
+            // Verificar HologramDialog (5 variantes) sin fugas y estética oscura exacta + ResetDashboardState en FormDashboard
+            foreach (HologramDialogType dlgType in Enum.GetValues<HologramDialogType>())
+            {
+                using var testDlg = new HologramDialog(dlgType, "Mensaje de diagnóstico\nLínea 2", "Título Prueba", HologramDialogButtons.YesNoCancel);
+                if (testDlg.BackColor != HologramTheme.BackgroundBase || testDlg.FormBorderStyle != FormBorderStyle.None)
+                    throw new Exception($"HologramDialog({dlgType}) no cumple tema oscuro sin bordes.");
+            }
+
+            using (var testDash = new FormDashboard(new Usuario { Id = 1, NombreUsuario = "selftest_op", NombreCompleto = "Operador SelfTest" }))
+            {
+                testDash.ResetDashboardState();
+                if (!testDash.VerifyCleanResetSnapshot())
+                    throw new Exception("ResetDashboardState() dejó estado residual en Visor, Manifiesto o Holograma.");
+            }
+
+            // Flujo HTTP v2.0 activo con nodo EQ08 simulado (HASHSHA + HMACSHA256 forward/inverse + verification.valid)
+            int eq08Port = GetFreeTcpPort();
+            string eq08CertPfx = Path.Combine(AppDbContext.AppDataDirectory, "node_identity_v2_EQ08.pfx");
+            string eq08CertKey = Path.Combine(AppDbContext.AppDataDirectory, "node_identity_v2_EQ08.key");
+            bool eq08HadPfx = File.Exists(eq08CertPfx);
+            var eq08CleanupPkts = new List<string>();
+
+            try
+            {
+                NodeRuntimeState.ConfigureForMode(ProtocolVersionMode.V2, teamNumber: 8, explicitPort: eq08Port);
+                V2CertificateService.Initialize();
+                string eq08Thumb = V2CertificateService.Thumbprint;
+                string eq08Pem = V2CertificateService.ExportPublicCertPem();
+
+                await using var eq08Runtime = new V2ProtocolRuntime();
+                if (!await eq08Runtime.StartAsync(eq08Port))
+                    throw new Exception($"No pudo iniciar eq08Runtime en puerto {eq08Port}: {eq08Runtime.LastStartupError}");
+
+                var eq08Peer = new PeerNode
+                {
+                    NodeId = "EQ08",
+                    TeamNumber = 8,
+                    IpAddress = "127.0.0.1",
+                    Port = eq08Port,
+                    CertThumbprint = eq08Thumb,
+                    PinnedThumbprintSha256 = eq08Thumb,
+                    CertificatePem = eq08Pem,
+                    IsConfirmed = true,
+                    Status = "online"
+                };
+
+                byte[] msgEq08 = Encoding.UTF8.GetBytes("Prueba Real EQ08 HASHSHA & HMACSHA256");
+
+                // HASHSHA forward -> inverse
+                var (hFwdOk, hFwdResp, hFwdErr) = await V2NetworkClient.CallRemoteForwardAsync(
+                    eq08Peer, "HASHSHA", msgEq08, "hash_eq08.txt", ".txt", keySizeBits: null,
+                    options: new Dictionary<string, string> { ["hashAlgorithm"] = "SHA-256" });
+                if (!hFwdOk || hFwdResp == null)
+                    throw new Exception($"EQ08 HASHSHA forward falló: {hFwdErr}");
+                eq08CleanupPkts.Add(hFwdResp.PacketId);
+
+                var (hInvOk, hPlain, hResZip, hInvErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                    eq08Peer, "HASHSHA", hFwdResp.PacketId, Convert.FromBase64String(hFwdResp.CiphertextBase64), hFwdResp.PublicParameters);
+                if (!hInvOk || hPlain == null || !hPlain.SequenceEqual(msgEq08) || hResZip?.Manifest.Verification?.Valid != true)
+                    throw new Exception($"EQ08 HASHSHA inverse falló: {hInvErr}");
+
+                // HMACSHA256 forward -> inverse con secreto normalizado >= 32 B
+                var (mFwdOk, mFwdResp, mFwdErr) = await V2NetworkClient.CallRemoteForwardAsync(
+                    eq08Peer, "HMACSHA256", msgEq08, "hmac_eq08.txt", ".txt", keySizeBits: null,
+                    secretsDictionary: new Dictionary<string, string> { ["key"] = "secreto-eq08-test" },
+                    options: new Dictionary<string, string> { ["macAlgorithm"] = "HMAC-SHA256" });
+                if (!mFwdOk || mFwdResp == null)
+                    throw new Exception($"EQ08 HMACSHA256 forward falló: {mFwdErr}");
+                eq08CleanupPkts.Add(mFwdResp.PacketId);
+
+                var (mInvOk, mPlain, mResZip, mInvErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                    eq08Peer, "HMACSHA256", mFwdResp.PacketId, Convert.FromBase64String(mFwdResp.CiphertextBase64), mFwdResp.PublicParameters,
+                    secretsDictionary: new Dictionary<string, string> { ["key"] = "secreto-eq08-test" });
+                if (!mInvOk || mPlain == null || !mPlain.SequenceEqual(msgEq08) || mResZip?.Manifest.Verification?.Valid != true)
+                    throw new Exception($"EQ08 HMACSHA256 inverse falló: {mInvErr}");
+            }
+            finally
+            {
+                try
+                {
+                    using var dbClean8 = new AppDbContext();
+                    var regs8 = dbClean8.RegistrosCifrados.Where(r => eq08CleanupPkts.Contains(r.PacketId)).ToList();
+                    if (regs8.Count > 0)
+                    {
+                        dbClean8.RegistrosCifrados.RemoveRange(regs8);
+                        dbClean8.SaveChanges();
+                    }
+                    AppDbContext.CheckpointWalTruncate();
+                }
+                catch { }
+
+                if (!eq08HadPfx)
+                {
+                    TryDeleteFile(eq08CertPfx);
+                    TryDeleteFile(eq08CertKey);
+                }
+
+                NodeRuntimeState.ConfigureForMode(ProtocolVersionMode.V2, teamNumber: 1);
+                V2CertificateService.Initialize();
+            }
+
             Console.WriteLine(
                 $"SELFTEST_OK: DualArchitecture=v1.0+v2.0, SinglePersistentDB={AppDbContext.DatabasePath}, Consolidation={AppDbContext.LastConsolidationReport}, " +
                 $"SQLiteWAL_CheckpointTruncate=OK, Legacy4PendingMigrationTo5thAndConsultas=OK, IPv4={primaryEp.Ipv4Address}({primaryEp.InterfaceName}), " +
-                $"Algorithms={passedAlgorithms}/21, V1_5FileZIP_DualAPI_RemoteKey=OK, " +
+                $"Algorithms={passedAlgorithms}/21, Subnet_20_22_24_ScanHosts_Table4_1=OK, DarkUI_HologramDialog_ResetDashboard=OK, " +
+                $"V1_5FileZIP_DualAPI_RemoteKey=OK, V2_v3LocalKeyId_EQ08_HASH_HMAC_Inverse=OK, " +
                 $"V2_StrictEmission_EQ01_Table4_2(AESGCM,DES)=OK, V2_CC_ENV_1_ExactByteSizes(32B,12B,16B,256B,NoCiphertextInResultEnvelope)=OK, " +
                 $"V2_EQ06_6ByteAliasTolerance(ivBase64,opt.keySizeBits,AAD_PacketId_or_Null,Base64_Hex_Passphrase)=OK, " +
                 $"V2_Interop_ADRs(0005,0006,0007,0012,NoCompression,UseProxyFalse)=OK, EQ08_HashHmac_ClassicalKeys(NoFormatException)=OK, " +

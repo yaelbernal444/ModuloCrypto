@@ -36,6 +36,7 @@ public static class NodeRuntimeState
 
     public static string ActiveInterfaceName { get; private set; } = "LAN";
     public static string LocalIpAddress { get; private set; } = "127.0.0.1";
+    public static string LocalSubnetMask { get; private set; } = "255.255.255.0";
     public static string SubnetBroadcastAddress { get; private set; } = "255.255.255.255";
     public static bool IsLoopbackFallback { get; private set; }
 
@@ -70,6 +71,7 @@ public static class NodeRuntimeState
     {
         ActiveInterfaceName = endpoint.InterfaceName;
         LocalIpAddress = endpoint.Ipv4Address;
+        LocalSubnetMask = string.IsNullOrWhiteSpace(endpoint.SubnetMask) ? "255.255.255.0" : endpoint.SubnetMask;
         SubnetBroadcastAddress = endpoint.BroadcastAddress;
         IsLoopbackFallback = endpoint.IsLoopbackFallback;
         OnActiveEndpointUpdated?.Invoke(endpoint);
@@ -228,16 +230,19 @@ public static class NodeRuntimeState
         }
     }
 
+    /// <summary>
+    /// Tabla 4.1 exacta del Estándar de Comunicación v2.0 (2 algoritmos oficiales por equipo EQ01–EQ08).
+    /// </summary>
     public static IReadOnlyList<string> GetOwnedAlgorithmsForTeam(int team) => team switch
     {
         1 => new[] { "AESGCM", "DES" },
-        2 => new[] { "TRIPLEDES", "CHACHA20", "RSA" },
-        3 => new[] { "ECC", "DIFFIEHELLMAN", "CAESAR" },
-        4 => new[] { "VIGENERE", "XORASM", "LSBSTEGO" },
-        5 => new[] { "EUCLIDESAFFINE", "MILLERRABIN", "FISHERYATES" },
-        6 => new[] { "HASHSHA", "HMACSHA256", "DIGITALSIG" },
-        7 => new[] { "QUANTUMPQC", "DFTSPECTRAL" },
-        8 => new[] { "LAGRANGESHAMIR", "LORENZSZ40" },
+        2 => new[] { "TRIPLEDES", "CHACHA20" },
+        3 => new[] { "RSA", "ECC" },
+        4 => new[] { "DIFFIEHELLMAN", "CAESAR" },
+        5 => new[] { "VIGENERE", "XORASM" },
+        6 => new[] { "LSBSTEGO", "EUCLIDESAFFINE" },
+        7 => new[] { "MILLERRABIN", "FISHERYATES" },
+        8 => new[] { "HASHSHA", "HMACSHA256" },
         _ => new[] { "AESGCM", "DES" }
     };
 
@@ -249,6 +254,14 @@ public static class NodeRuntimeState
             if (GetOwnedAlgorithmsForTeam(t).Contains(code, StringComparer.OrdinalIgnoreCase))
                 return $"EQ{t:D2}";
         }
-        return CurrentNodeId;
+
+        // Algoritmos locales adicionales (17–21) fuera de los pares base de Tabla 4.1
+        return code switch
+        {
+            "DIGITALSIG" => "EQ06",
+            "QUANTUMPQC" or "DFTSPECTRAL" => "EQ07",
+            "LAGRANGESHAMIR" or "LORENZSZ40" => "EQ08",
+            _ => CurrentNodeId
+        };
     }
 }

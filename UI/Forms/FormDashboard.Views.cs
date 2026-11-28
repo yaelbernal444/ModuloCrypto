@@ -436,22 +436,19 @@ public partial class FormDashboard
 
             if (orphans.Count == 0)
             {
-                MessageBox.Show(this,
+                HologramDialog.ShowInfo(this,
                     "No se encontraron solicitudes pendientes huérfanas (todos los paquetes .zip pendientes existen en disco).",
-                    "Limpiar Solicitudes Huérfanas",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                    "Limpiar Solicitudes Huérfanas");
                 return;
             }
 
-            var choice = MessageBox.Show(this,
+            var choice = HologramDialog.ShowQuestion(this,
                 $"Se detectaron {orphans.Count} solicitud(es) en estado 'Pendiente' cuyo archivo .zip temporal ya no existe en disco.\n\n" +
                 $"• Pulsa [Sí] para ELIMINARLAS permanentemente de SolicitudesEntrantes.\n" +
                 $"• Pulsa [No] para marcarlas como 'Rechazada'.\n" +
                 $"• Pulsa [Cancelar] para no hacer cambios.",
                 "Limpiar Solicitudes Huérfanas",
-                MessageBoxButtons.YesNoCancel,
-                MessageBoxIcon.Question);
+                includeCancel: true);
 
             if (choice == DialogResult.Cancel) return;
 
@@ -469,17 +466,15 @@ public partial class FormDashboard
             RefreshSolicitudesGrid();
             RefreshPendingSolicitudesBadge();
 
-            MessageBox.Show(this,
+            HologramDialog.ShowSuccess(this,
                 choice == DialogResult.Yes
                     ? $"Se eliminaron {orphans.Count} solicitud(es) huérfana(s)."
                     : $"Se marcaron {orphans.Count} solicitud(es) huérfana(s) como 'Rechazada'.",
-                "Limpieza Completada",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+                "Limpieza Completada");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error de SQLite al limpiar solicitudes huérfanas:\n{ex.Message}", "Error SQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error de SQLite al limpiar solicitudes huérfanas:\n{ex.Message}", "Error SQLite");
         }
     }
 
@@ -494,11 +489,10 @@ public partial class FormDashboard
             var sol = db.SolicitudesEntrantes.Find(id);
             if (sol == null) return;
 
-            if (MessageBox.Show(this,
+            if (HologramDialog.ShowQuestion(this,
                 $"¿Eliminar la solicitud #{sol.Id} ({sol.NombreZip} de {sol.NodoOrigen})?",
                 "Eliminar Solicitud",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question) != DialogResult.Yes)
+                includeCancel: false) != DialogResult.Yes)
             {
                 return;
             }
@@ -510,7 +504,7 @@ public partial class FormDashboard
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error de SQLite al eliminar la solicitud:\n{ex.Message}", "Error SQLite", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error de SQLite al eliminar la solicitud:\n{ex.Message}", "Error SQLite");
         }
     }
 
@@ -576,17 +570,15 @@ public partial class FormDashboard
         catch (PacketValidationException pve)
         {
             NodeRuntimeState.AddNetworkLog("LOCAL", "IMPORT", "Importar .ZIP", pve.HttpStatusCode, $"{pve.ErrorCode}: {pve.Message}");
-            MessageBox.Show(this,
+            HologramDialog.ShowWarning(this,
                 $"Paquete .zip rechazado por validación de seguridad v2.0:\n\n" +
                 $"• Código de Error : {pve.ErrorCode} (HTTP {pve.HttpStatusCode})\n" +
                 $"• Detalle         : {pve.Message}",
-                "Rechazo de Seguridad v2.0",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
+                "Rechazo de Seguridad v2.0");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error al leer paquete .zip:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error al leer paquete .zip:\n{ex.Message}", "Error");
         }
     }
 
@@ -599,7 +591,7 @@ public partial class FormDashboard
         var sol = db.SolicitudesEntrantes.Find(id);
         if (sol == null || !File.Exists(sol.RutaZipTemporal))
         {
-            MessageBox.Show(this, "No se encontró el archivo .zip temporal de esta solicitud.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            HologramDialog.ShowWarning(this, "No se encontró el archivo .zip temporal de esta solicitud.");
             return;
         }
 
@@ -615,27 +607,30 @@ public partial class FormDashboard
                 var parsed = V2PacketZipService.ReadPacketZip(repackagedZip, enforceStrictSignature: true);
                 var sendRes = await V2NetworkClient.SendZipPacketAsync(peer, repackagedZip, parsed.Manifest.PacketId, parsed.Manifest.PacketType);
 
-                MessageBox.Show(this,
+                string fwdMsgV2 =
                     $"{sendRes.Message}\n\n" +
                     $"• Nuevo PacketId : {parsed.Manifest.PacketId}\n" +
                     $"• ProducerNode   : {parsed.Manifest.ProducerNode} (conservado)\n" +
-                    $"• SourceNode     : {parsed.Manifest.SourceNode} (re-firmado)",
-                    sendRes.Success ? "Reenvío Estándar v2.0 (Sección 9.6) Exitoso" : "Error en Reenvío v2.0",
-                    MessageBoxButtons.OK,
-                    sendRes.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                    $"• SourceNode     : {parsed.Manifest.SourceNode} (re-firmado)";
+                string fwdTitleV2 = sendRes.Success ? "Reenvío Estándar v2.0 (Sección 9.6) Exitoso" : "Error en Reenvío v2.0";
+                if (sendRes.Success)
+                    HologramDialog.ShowSuccess(this, fwdMsgV2, fwdTitleV2);
+                else
+                    HologramDialog.ShowError(this, fwdMsgV2, fwdTitleV2);
             }
             else
             {
                 var sendRes = await V1NetworkClient.SendZipPacketAsync(peer, sol.RutaZipTemporal, sol.PacketId);
-                MessageBox.Show(this, sendRes.Message,
-                    sendRes.Success ? "Reenvío v1.0 Exitoso" : "Error en Reenvío v1.0",
-                    MessageBoxButtons.OK,
-                    sendRes.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                string fwdTitleV1 = sendRes.Success ? "Reenvío v1.0 Exitoso" : "Error en Reenvío v1.0";
+                if (sendRes.Success)
+                    HologramDialog.ShowSuccess(this, sendRes.Message, fwdTitleV1);
+                else
+                    HologramDialog.ShowError(this, sendRes.Message, fwdTitleV1);
             }
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error al reenviar paquete:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error al reenviar paquete:\n{ex.Message}", "Error");
         }
     }
 
@@ -681,15 +676,15 @@ public partial class FormDashboard
             }
             else
             {
-                var action = MessageBox.Show(this,
+                var action = HologramDialog.ShowQuestion(this,
                     $"No se encontró en disco el archivo .zip temporal de la solicitud #{sol.Id} ({sol.NombreZip} de {sol.NodoOrigen}):\n" +
                     $"Ruta esperada: {sol.RutaZipTemporal}\n\n" +
                     $"• Pulsa [Sí] para ELIMINAR esta solicitud huérfana de SolicitudesEntrantes.\n" +
                     $"• Pulsa [No] para marcarla como 'Rechazada'.\n" +
                     $"• Pulsa [Cancelar] para conservarla sin cambios.",
                     "Archivo .ZIP Temporal No Encontrado",
-                    MessageBoxButtons.YesNoCancel,
-                    MessageBoxIcon.Warning);
+                    includeCancel: true,
+                    iconType: HologramDialogType.Warning);
 
                 if (action == DialogResult.Yes)
                 {
@@ -724,17 +719,23 @@ public partial class FormDashboard
         {
             var parsed = V2PacketZipService.ReadPacketZip(sol.RutaZipTemporal, enforceStrictSignature: true);
             string algCode = parsed.Manifest.AlgorithmCode.Trim().ToUpperInvariant();
-            string? secretKey = null;
-            string pubJson = JsonSerializer.Serialize(parsed.Manifest.PublicParameters);
+            var pubParams = parsed.Manifest.PublicParameters;
+            string pubJson = JsonSerializer.Serialize(pubParams);
+
             var hops = new List<string> { parsed.Manifest.ProducerNode };
             if (!hops.Contains(parsed.Manifest.SourceNode))
                 hops.Add(parsed.Manifest.SourceNode);
             if (!hops.Contains(NodeRuntimeState.CurrentNodeId))
                 hops.Add(NodeRuntimeState.CurrentNodeId);
 
+            bool isV3Local = pubParams.TryGetValue("mode", out var modeStr) &&
+                             string.Equals(modeStr.Trim(), "v3-local", StringComparison.OrdinalIgnoreCase);
+
             string? lookupKeyId = !string.IsNullOrWhiteSpace(parsed.Manifest.KeyRef?.KeyId)
                 ? parsed.Manifest.KeyRef.KeyId.Trim()
-                : null;
+                : (pubParams.TryGetValue("keyId", out var pubKid) && !string.IsNullOrWhiteSpace(pubKid)
+                    ? pubKid.Trim()
+                    : null);
             string keyRefDisplay = lookupKeyId ?? $"owner={parsed.Manifest.ProducerNode}";
 
             // Caso 1: Nuestro nodo tiene registro/llave guardada localmente
@@ -743,36 +744,27 @@ public partial class FormDashboard
 
             if (localMatch != null && !string.IsNullOrWhiteSpace(localMatch.LlaveSecretaBase64))
             {
-                secretKey = localMatch.LlaveSecretaBase64;
+                string secretKey = localMatch.LlaveSecretaBase64;
                 if (string.IsNullOrWhiteSpace(pubJson) || pubJson == "{}")
                     pubJson = localMatch.ParametrosPublicosJson;
 
                 FinalizeAcceptedSolicitud(
-                    db,
-                    sol,
-                    parsed.Manifest.PacketId,
-                    parsed.Manifest.OriginalFileName,
-                    parsed.Manifest.OriginalExtension,
-                    parsed.PayloadBytes,
-                    algCode,
-                    pubJson,
-                    secretKey,
-                    keyRefDisplay,
-                    parsed.Manifest.ProducerNode,
-                    parsed.Manifest.ManifestSignatureBase64,
-                    hops,
-                    parsed.SignatureValid && parsed.IntegrityValid,
-                    hasSignature: true,
+                    db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                    parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                    secretKey, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                    hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
                     requestId: parsed.Manifest.RequestId);
                 return;
             }
 
-            // Caso 2: Algoritmo de otro equipo / paquete externo — resolver dueño por KeyRef, pares que anuncian algoritmo (ej. EQ08), ProducerNode o Tabla 4.1
-            string? preferredOwner = !string.IsNullOrWhiteSpace(parsed.Manifest.KeyRef?.OwnerNode)
-                ? parsed.Manifest.KeyRef.OwnerNode
-                : parsed.Manifest.ProducerNode;
+            // Resolver nodo responsable real (v3-local -> producerNode; v2.0 -> KeyRef.OwnerNode / peer que anuncia algCode / producerNode / Tabla 4.1)
+            string? preferredOwner = isV3Local
+                ? parsed.Manifest.ProducerNode
+                : (!string.IsNullOrWhiteSpace(parsed.Manifest.KeyRef?.OwnerNode)
+                    ? parsed.Manifest.KeyRef.OwnerNode
+                    : parsed.Manifest.ProducerNode);
 
-            var ownerPeer = ResolveBestPeerForAlgorithm(algCode, preferredOwner);
+            var ownerPeer = ResolveBestPeerForAlgorithm(algCode, preferredOwner, forceProducerFirst: isV3Local);
             if (ownerPeer != null && !ownerPeer.HasThumbprintMismatch &&
                 (!ownerPeer.IsOnline || string.IsNullOrWhiteSpace(ownerPeer.CertificatePem)))
             {
@@ -788,247 +780,281 @@ public partial class FormDashboard
                 algCode is "HASHSHA" or "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC" or "LAGRANGESHAMIR" or "MILLERRABIN" ||
                 (profile?.RequiresSecretOnInverse == false && (profile.ResolveSecretFieldNames().Count == 0));
 
-            if (ownerAvailable)
+            async Task<(bool Ok, byte[]? PlainBytes, V2ParsedZipPacket? ResultZip, string Err)> TryDirectRemoteInverseAndDecryptEndpointAsync(
+                PeerNode? targetPeer,
+                Dictionary<string, string>? explicitOptions = null)
             {
-                // 2A. Sin modal si el algoritmo es sin secreto o custodiado con keyId en el proveedor
-                if (isNaturallySecretlessOnInverse || !string.IsNullOrWhiteSpace(lookupKeyId))
+                string lastRemoteErr = "Nodo responsable no disponible.";
+                if (targetPeer != null && targetPeer.IsOnline && !targetPeer.HasThumbprintMismatch)
                 {
-                    var (_, autoOpts) = BuildV2SecretsAndOptionsFromInput(algCode, null, parsed.Manifest.PublicParameters);
-                    var (invOk, plainFromRemote, resultZip, invErr) = await V2NetworkClient.CallRemoteInverseAsync(
-                        ownerPeer!,
+                    var (_, defaultOpts) = BuildV2SecretsAndOptionsFromInput(algCode, null, pubParams);
+                    var optsToSend = explicitOptions ?? defaultOpts;
+
+                    var (invOk, plainRemote, resZip, invErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        targetPeer,
                         algCode,
                         parsed.Manifest.PacketId,
                         parsed.PayloadBytes,
-                        parsed.Manifest.PublicParameters,
+                        pubParams,
                         keyId: lookupKeyId,
-                        options: autoOpts);
+                        options: optsToSend);
 
-                    if (invOk && plainFromRemote != null)
+                    if (invOk && plainRemote != null)
+                        return (true, plainRemote, resZip, "OK");
+
+                    // Respaldo: si el peer esperaba el paquete .zip completo en el campo 'package' (ej. algunos nodos v3)
+                    if (File.Exists(sol.RutaZipTemporal) &&
+                        invErr.Contains("package", StringComparison.OrdinalIgnoreCase))
                     {
-                        FinalizeAcceptedSolicitud(
-                            db,
-                            sol,
-                            parsed.Manifest.PacketId,
-                            parsed.Manifest.OriginalFileName,
-                            parsed.Manifest.OriginalExtension,
-                            parsed.PayloadBytes,
+                        byte[] zipBytes = await File.ReadAllBytesAsync(sol.RutaZipTemporal);
+                        var (zipInvOk, zipPlain, zipRes, zipErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                            targetPeer,
                             algCode,
-                            pubJson,
-                            string.Empty,
-                            lookupKeyId != null ? $"keyRef://{ownerPeer!.NodeId}/{lookupKeyId}" : $"remote://{ownerPeer!.NodeId}/{parsed.Manifest.PacketId}",
-                            parsed.Manifest.ProducerNode,
-                            parsed.Manifest.ManifestSignatureBase64,
-                            hops,
-                            parsed.SignatureValid && parsed.IntegrityValid,
-                            hasSignature: true,
-                            preDecryptedBytes: plainFromRemote,
-                            requestId: parsed.Manifest.RequestId,
-                            remoteVerification: resultZip?.Manifest.Verification);
-                        return;
+                            parsed.Manifest.PacketId,
+                            zipBytes,
+                            pubParams,
+                            keyId: lookupKeyId,
+                            options: optsToSend);
+                        if (zipInvOk && zipPlain != null)
+                            return (true, zipPlain, zipRes, "OK");
+                        invErr = zipErr;
                     }
 
-                    // Si era sin secreto (p. ej. HASHSHA o asimétrico custodiado) y el dueño falló, ofrecer fallback local / guardar
-                    if (isNaturallySecretlessOnInverse)
+                    lastRemoteErr = invErr;
+                }
+
+                // Respaldo automático GET /api/crypto/decrypt/{packetId} para emisores compatibles
+                var fallbackUrls = new List<string>();
+                if (targetPeer != null)
+                    fallbackUrls.Add($"{targetPeer.BaseUrl.TrimEnd('/')}/api/crypto/decrypt/{parsed.Manifest.PacketId}");
+                if (!string.IsNullOrWhiteSpace(sol.IpOrigen) && System.Net.IPAddress.TryParse(sol.IpOrigen, out _))
+                {
+                    var srcPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                        string.Equals(p.NodeId, sol.NodoOrigen, StringComparison.OrdinalIgnoreCase));
+                    int srcPort = srcPeer?.Port ?? 5000;
+                    fallbackUrls.Add($"http://{sol.IpOrigen}:{srcPort}/api/crypto/decrypt/{parsed.Manifest.PacketId}");
+                }
+
+                foreach (string keyUrl in fallbackUrls.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var remoteKey = await V1NetworkClient.RequestRemoteKeyAsync(keyUrl);
+                    if (remoteKey.Success && !string.IsNullOrWhiteSpace(remoteKey.LlaveSecretaBase64))
                     {
-                        if (algCode == "HASHSHA")
+                        try
                         {
-                            FinalizeAcceptedSolicitud(
-                                db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
-                                parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
-                                string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
-                                hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
-                                requestId: parsed.Manifest.RequestId);
-                            return;
+                            string effPub = !string.IsNullOrWhiteSpace(pubJson) && pubJson != "{}"
+                                ? pubJson
+                                : remoteKey.ParametrosPublicosJson;
+                            var decCtx = new DecryptionContext(
+                                PacketId: parsed.Manifest.PacketId,
+                                RequestId: parsed.Manifest.RequestId,
+                                OriginalFileName: parsed.Manifest.OriginalFileName,
+                                OriginalExtension: parsed.Manifest.OriginalExtension);
+                            var decRes = CryptoCatalog.GetStrategy(algCode).Decrypt(parsed.PayloadBytes, remoteKey.LlaveSecretaBase64, effPub, decCtx);
+                            return (true, decRes.OutputBytes, null, "OK");
                         }
-
-                        var choice = MessageBox.Show(this,
-                            $"El nodo dueño ({ownerPeer!.NodeId}) devolvió error en /api/crypto/inverse ({algCode}):\n{invErr}\n\n" +
-                            $"• Pulsa [Sí] para intentar descifrado/llave manual en LOCAL.\n" +
-                            $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido'.\n" +
-                            $"• Pulsa [Cancelar] para mantener la solicitud en 'Pendiente'.",
-                            $"Delegación Remota v2.0 — {ownerPeer.NodeId}",
-                            MessageBoxButtons.YesNoCancel,
-                            MessageBoxIcon.Warning);
-
-                        if (choice == DialogResult.Cancel) return;
-                        if (choice == DialogResult.No)
+                        catch (Exception localDecEx)
                         {
-                            FinalizeAcceptedSolicitud(
-                                db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
-                                parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
-                                string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
-                                hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
-                                skipDecryptAndStoreReceived: true,
-                                requestId: parsed.Manifest.RequestId);
-                            return;
+                            lastRemoteErr = $"Llave recuperada desde {keyUrl}, pero falló al descifrar: {localDecEx.Message}";
                         }
                     }
                 }
 
-                // 2B. Pedir secretos dinámicos según /api/algorithms + Tabla 4.2 UNA sola vez y delegar al dueño
-                var modalRes = PromptV2SecretsModal(
-                    algCode,
-                    operation: "inverse",
-                    producerNode: parsed.Manifest.ProducerNode,
-                    sourceNode: parsed.Manifest.SourceNode,
-                    sigValid: parsed.SignatureValid,
-                    profile: profile,
-                    pubParams: parsed.Manifest.PublicParameters,
-                    targetPeer: ownerPeer);
+                return (false, null, null, lastRemoteErr);
+            }
 
-                if (modalRes == null)
-                    return;
-
-                var (invSecretOk, plainSecretRemote, resultSecretZip, invSecretErr) = await V2NetworkClient.CallRemoteInverseAsync(
-                    ownerPeer!,
-                    algCode,
-                    parsed.Manifest.PacketId,
-                    parsed.PayloadBytes,
-                    parsed.Manifest.PublicParameters,
-                    keyId: lookupKeyId,
-                    secretsDictionary: modalRes.SecretsDictionary,
-                    options: modalRes.Options);
-
-                if (invSecretOk && plainSecretRemote != null)
+            // PRIORIDAD 1: Sin secreto del usuario o con keyId explícito (manifest.keyRef.keyId o publicParameters["keyId"] / v3-local)
+            if (isNaturallySecretlessOnInverse || !string.IsNullOrWhiteSpace(lookupKeyId))
+            {
+                var (autoOk, autoPlain, autoResZip, autoErr) = await TryDirectRemoteInverseAndDecryptEndpointAsync(ownerPeer);
+                if (autoOk && autoPlain != null)
                 {
                     FinalizeAcceptedSolicitud(
-                        db,
-                        sol,
-                        parsed.Manifest.PacketId,
-                        parsed.Manifest.OriginalFileName,
-                        parsed.Manifest.OriginalExtension,
-                        parsed.PayloadBytes,
-                        algCode,
-                        pubJson,
-                        modalRes.LocalSecretKeyString,
-                        lookupKeyId != null ? $"keyRef://{ownerPeer!.NodeId}/{lookupKeyId}" : $"remote://{ownerPeer!.NodeId}/{parsed.Manifest.PacketId}",
-                        parsed.Manifest.ProducerNode,
-                        parsed.Manifest.ManifestSignatureBase64,
-                        hops,
-                        parsed.SignatureValid && parsed.IntegrityValid,
-                        hasSignature: true,
-                        preDecryptedBytes: plainSecretRemote,
+                        db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                        string.Empty,
+                        lookupKeyId != null && ownerPeer != null
+                            ? $"keyRef://{ownerPeer.NodeId}/{lookupKeyId}"
+                            : (ownerPeer != null ? $"remote://{ownerPeer.NodeId}/{parsed.Manifest.PacketId}" : keyRefDisplay),
+                        parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                        hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                        preDecryptedBytes: autoPlain,
                         requestId: parsed.Manifest.RequestId,
-                        remoteVerification: resultSecretZip?.Manifest.Verification);
+                        remoteVerification: autoResZip?.Manifest.Verification);
                     return;
                 }
 
-                var fallbackChoice = MessageBox.Show(this,
-                    $"El nodo {ownerPeer!.NodeId} no pudo completar el descifrado remoto ({algCode}):\n{invSecretErr}\n\n" +
-                    $"• Pulsa [Sí] para intentar descifrado LOCAL con la clave/parámetros ingresados.\n" +
-                    $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido'.\n" +
-                    $"• Pulsa [Cancelar] para dejar la solicitud en 'Pendiente'.",
-                    $"Fallback Local v2.0 — {algCode}",
-                    MessageBoxButtons.YesNoCancel,
-                    MessageBoxIcon.Warning);
-
-                if (fallbackChoice == DialogResult.Cancel) return;
-
-                string effectivePubForLocal = MergeLocalOptionsIntoPubParams(pubJson, modalRes.Options);
-                FinalizeAcceptedSolicitud(
-                    db,
-                    sol,
-                    parsed.Manifest.PacketId,
-                    parsed.Manifest.OriginalFileName,
-                    parsed.Manifest.OriginalExtension,
-                    parsed.PayloadBytes,
-                    algCode,
-                    effectivePubForLocal,
-                    modalRes.LocalSecretKeyString,
-                    keyRefDisplay,
-                    parsed.Manifest.ProducerNode,
-                    parsed.Manifest.ManifestSignatureBase64,
-                    hops,
-                    parsed.SignatureValid && parsed.IntegrityValid,
-                    hasSignature: true,
-                    skipDecryptAndStoreReceived: fallbackChoice == DialogResult.No,
-                    requestId: parsed.Manifest.RequestId);
-                return;
-            }
-
-            // Caso 3: Nodo dueño offline, bloqueado o desconocido -> verificar HASHSHA directo o pedir clave local
-            if (algCode == "HASHSHA")
-            {
-                FinalizeAcceptedSolicitud(
-                    db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
-                    parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
-                    string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
-                    hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
-                    requestId: parsed.Manifest.RequestId);
-                return;
-            }
-
-            string? manualOrModalKey = string.Empty;
-            string effectiveLocalPub = pubJson;
-            if (!isNaturallySecretlessOnInverse)
-            {
-                var localModal = PromptV2SecretsModal(
-                    algCode,
-                    operation: "inverse",
-                    producerNode: parsed.Manifest.ProducerNode,
-                    sourceNode: parsed.Manifest.SourceNode,
-                    sigValid: parsed.SignatureValid,
-                    profile: null,
-                    pubParams: parsed.Manifest.PublicParameters,
-                    targetPeer: null);
-
-                if (localModal == null)
-                    return;
-
-                manualOrModalKey = localModal.LocalSecretKeyString;
-                effectiveLocalPub = MergeLocalOptionsIntoPubParams(pubJson, localModal.Options);
-            }
-            else
-            {
-                string ownerExpected = preferredOwner ?? NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
-                var offlineChoice = MessageBox.Show(this,
-                    $"El algoritmo {algCode} requiere la llave custodiada por {ownerExpected}, pero ese nodo está OFFLINE o sin confirmar en Red de Nodos.\n\n" +
-                    $"• Pulsa [Sí] para intentar ingresar una llave manual en LOCAL.\n" +
-                    $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido' y reintentar después.\n" +
-                    $"• Pulsa [Cancelar] para dejar la solicitud en 'Pendiente'.",
-                    $"Nodo Dueño {ownerExpected} Offline",
-                    MessageBoxButtons.YesNoCancel,
-                    MessageBoxIcon.Information);
-
-                if (offlineChoice == DialogResult.Cancel) return;
-                if (offlineChoice == DialogResult.No)
+                if (algCode == "HASHSHA")
                 {
                     FinalizeAcceptedSolicitud(
                         db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
                         parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
                         string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
                         hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
-                        skipDecryptAndStoreReceived: true,
                         requestId: parsed.Manifest.RequestId);
                     return;
                 }
 
-                string? manualAsym = PromptExternalPassphraseModal(algCode, parsed.Manifest.ProducerNode, parsed.Manifest.SourceNode, parsed.SignatureValid);
-                if (manualAsym == null) return;
-                manualOrModalKey = manualAsym;
+                if (isNaturallySecretlessOnInverse)
+                {
+                    string ownerLabel = ownerPeer?.NodeId ?? preferredOwner ?? NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
+                    var choice = HologramDialog.ShowQuestion(this,
+                        $"No se pudo completar el descifrado remoto automático en {ownerLabel} ({algCode}):\n{autoErr}\n\n" +
+                        $"• Pulsa [Sí] para intentar ingresar una llave o secreto manual en LOCAL.\n" +
+                        $"• Pulsa [No] para GUARDAR el paquete cifrado en Consultas como 'Recibido'.\n" +
+                        $"• Pulsa [Cancelar] para mantener la solicitud en 'Pendiente'.",
+                        $"Descifrado Remoto — {ownerLabel}",
+                        includeCancel: true,
+                        iconType: HologramDialogType.Warning);
+
+                    if (choice == DialogResult.Cancel) return;
+                    if (choice == DialogResult.No)
+                    {
+                        FinalizeAcceptedSolicitud(
+                            db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                            parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                            string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                            hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                            skipDecryptAndStoreReceived: true,
+                            requestId: parsed.Manifest.RequestId);
+                        return;
+                    }
+
+                    string? manualAsym = PromptExternalPassphraseModal(algCode, parsed.Manifest.ProducerNode, parsed.Manifest.SourceNode, parsed.SignatureValid);
+                    if (manualAsym == null) return;
+
+                    FinalizeAcceptedSolicitud(
+                        db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                        manualAsym, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                        hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                        requestId: parsed.Manifest.RequestId);
+                    return;
+                }
             }
 
-            FinalizeAcceptedSolicitud(
-                db,
-                sol,
-                parsed.Manifest.PacketId,
-                parsed.Manifest.OriginalFileName,
-                parsed.Manifest.OriginalExtension,
-                parsed.PayloadBytes,
+            // PRIORIDAD 2: Algoritmo con secreto compartido (o falló resolución directa con keyId) -> Modal oscuro con botón [🌐 Pedir descifrado directo al nodo]
+            var modalRes = PromptV2SecretsModal(
                 algCode,
-                effectiveLocalPub,
-                manualOrModalKey,
-                keyRefDisplay,
-                parsed.Manifest.ProducerNode,
-                parsed.Manifest.ManifestSignatureBase64,
-                hops,
-                parsed.SignatureValid && parsed.IntegrityValid,
-                hasSignature: true,
+                operation: "inverse",
+                producerNode: parsed.Manifest.ProducerNode,
+                sourceNode: parsed.Manifest.SourceNode,
+                sigValid: parsed.SignatureValid,
+                profile: profile,
+                pubParams: pubParams,
+                targetPeer: ownerPeer);
+
+            if (modalRes == null)
+                return;
+
+            if (modalRes.RequestDirectRemote)
+            {
+                var (directOk, directPlain, directZip, directErr) = await TryDirectRemoteInverseAndDecryptEndpointAsync(ownerPeer, modalRes.Options);
+                if (directOk && directPlain != null)
+                {
+                    FinalizeAcceptedSolicitud(
+                        db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                        string.Empty,
+                        ownerPeer != null ? $"remote://{ownerPeer.NodeId}/{parsed.Manifest.PacketId}" : keyRefDisplay,
+                        parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                        hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                        preDecryptedBytes: directPlain,
+                        requestId: parsed.Manifest.RequestId,
+                        remoteVerification: directZip?.Manifest.Verification);
+                    return;
+                }
+
+                string failNode = ownerPeer?.NodeId ?? preferredOwner ?? parsed.Manifest.ProducerNode;
+                HologramDialog.ShowError(this,
+                    $"El nodo {failNode} no devolvió el descifrado ni la llave directa para {parsed.Manifest.PacketId} ({algCode}):\n{directErr}\n\n" +
+                    $"La solicitud permanece intacta; vuelve a intentar ingresando la clave o guárdala en Consultas.",
+                    $"Descifrado Directo — {failNode}");
+                return;
+            }
+
+            if (ownerAvailable)
+            {
+                bool allowRemoteSend = ownerPeer!.IsConfirmed;
+                if (!allowRemoteSend)
+                {
+                    var confirmTofu = HologramDialog.ShowQuestion(this,
+                        $"El nodo dueño {ownerPeer.NodeId} ({ownerPeer.BaseUrl}) está Online pero su huella X.509 aún está 'Pendiente Confirmar':\n{ownerPeer.CertThumbprint}\n\n" +
+                        $"• [Sí] Fijar huella TOFU y delegar descifrado sellado CC-ENV-1 a {ownerPeer.NodeId}\n" +
+                        $"• [No] Descifrar en LOCAL sin enviar al nodo remoto",
+                        $"Confirmar TOFU para Descifrado Remoto — {ownerPeer.NodeId}",
+                        includeCancel: false);
+
+                    if (confirmTofu == DialogResult.Yes)
+                    {
+                        V2NetworkClient.ConfirmPeerTofu(ownerPeer);
+                        RefreshNetworkGrid();
+                        allowRemoteSend = true;
+                    }
+                }
+
+                if (allowRemoteSend)
+                {
+                    var (invSecretOk, plainSecretRemote, resultSecretZip, invSecretErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        ownerPeer,
+                        algCode,
+                        parsed.Manifest.PacketId,
+                        parsed.PayloadBytes,
+                        pubParams,
+                        keyId: lookupKeyId,
+                        secretsDictionary: modalRes.SecretsDictionary,
+                        options: modalRes.Options);
+
+                    if (invSecretOk && plainSecretRemote != null)
+                    {
+                        FinalizeAcceptedSolicitud(
+                            db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                            parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                            modalRes.LocalSecretKeyString,
+                            lookupKeyId != null ? $"keyRef://{ownerPeer.NodeId}/{lookupKeyId}" : $"remote://{ownerPeer.NodeId}/{parsed.Manifest.PacketId}",
+                            parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                            hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                            preDecryptedBytes: plainSecretRemote,
+                            requestId: parsed.Manifest.RequestId,
+                            remoteVerification: resultSecretZip?.Manifest.Verification);
+                        return;
+                    }
+
+                    var fallbackChoice = HologramDialog.ShowQuestion(this,
+                        $"El nodo {ownerPeer.NodeId} no pudo completar el descifrado remoto ({algCode}):\n{invSecretErr}\n\n" +
+                        $"• Pulsa [Sí] para intentar descifrado LOCAL con la clave/parámetros ingresados.\n" +
+                        $"• Pulsa [No] para GUARDAR el paquete cifrado en Consultas como 'Recibido'.\n" +
+                        $"• Pulsa [Cancelar] para dejar la solicitud en 'Pendiente'.",
+                        $"Fallback Local v2.0 — {algCode}",
+                        includeCancel: true,
+                        iconType: HologramDialogType.Warning);
+
+                    if (fallbackChoice == DialogResult.Cancel) return;
+
+                    string effectivePub = MergeLocalOptionsIntoPubParams(pubJson, modalRes.Options);
+                    FinalizeAcceptedSolicitud(
+                        db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, effectivePub,
+                        modalRes.LocalSecretKeyString, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                        hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                        skipDecryptAndStoreReceived: fallbackChoice == DialogResult.No,
+                        requestId: parsed.Manifest.RequestId);
+                    return;
+                }
+            }
+
+            // Nodo dueño offline o usuario prefirió local -> respaldo local automático con KeyInputParser + alias tolerantes
+            string effectiveLocalPub = MergeLocalOptionsIntoPubParams(pubJson, modalRes.Options);
+            FinalizeAcceptedSolicitud(
+                db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, effectiveLocalPub,
+                modalRes.LocalSecretKeyString, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
                 requestId: parsed.Manifest.RequestId);
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error al procesar solicitud v2.0:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error al procesar solicitud v2.0:\n{ex.Message}", "Error");
         }
     }
 
@@ -1125,7 +1151,7 @@ public partial class FormDashboard
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error al procesar solicitud v1.0:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error al procesar solicitud v1.0:\n{ex.Message}", "Error");
         }
     }
 
@@ -1179,15 +1205,15 @@ public partial class FormDashboard
             if (decryptSucceeded)
                 break;
 
-            var retryChoice = MessageBox.Show(this,
+            var retryChoice = HologramDialog.ShowQuestion(this,
                 $"No fue posible descifrar el paquete {packetId} ({algCode}) con la clave ingresada:\n\n" +
                 $"Detalle criptográfico:\n{decErr}\n\n" +
                 $"• Pulsa [Sí] para REINTENTAR ingresando otra clave/llave.\n" +
                 $"• Pulsa [No] para GUARDAR el paquete cifrado en Consultas (como 'Recibido') y marcar la solicitud como 'Aceptada'.\n" +
                 $"• Pulsa [Cancelar] para dejar la solicitud en estado 'Pendiente'.",
                 "Fallo de Descifrado — Reintentar o Guardar en Consultas",
-                MessageBoxButtons.YesNoCancel,
-                MessageBoxIcon.Warning);
+                includeCancel: true,
+                iconType: HologramDialogType.Warning);
 
             if (retryChoice == DialogResult.Cancel)
             {
@@ -1278,18 +1304,17 @@ public partial class FormDashboard
         }
         catch (Exception sqlEx)
         {
-            MessageBox.Show(this,
+            HologramDialog.ShowError(this,
                 $"Error exacto de SQLite al guardar el registro recibido en Consultas:\n{sqlEx.Message}",
-                "Error SQLite",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                "Error SQLite");
         }
     }
 
     private sealed record V2SecretsModalResult(
         Dictionary<string, string>? SecretsDictionary,
         Dictionary<string, string>? Options,
-        string LocalSecretKeyString);
+        string LocalSecretKeyString,
+        bool RequestDirectRemote = false);
 
     private V2SecretsModalResult? PromptV2SecretsModal(
         string algCode,
@@ -1630,7 +1655,7 @@ public partial class FormDashboard
 
             if (secDict.Count == 0 && !isOptionalSecret)
             {
-                MessageBox.Show(dlg, "Ingresa el parámetro secreto requerido.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                HologramDialog.ShowWarning(dlg, "Ingresa el parámetro secreto requerido.");
                 return;
             }
 
@@ -1652,9 +1677,34 @@ public partial class FormDashboard
             modalResult = new V2SecretsModalResult(
                 secDict.Count > 0 ? secDict : null,
                 optsDict,
-                localStr);
+                localStr,
+                RequestDirectRemote: false);
             dlg.DialogResult = DialogResult.OK;
             dlg.Close();
+        }
+
+        if (!isForward)
+        {
+            string targetLabel = targetPeer != null ? targetPeer.NodeId : producerNode;
+            var btnAskNodeDirect = new NeonButton
+            {
+                Text = $"🌐 Pedir descifrado directo al nodo ({targetLabel})",
+                Variant = NeonButtonVariant.Cyan,
+                Dock = DockStyle.Top,
+                Height = 38,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            btnAskNodeDirect.Click += (_, _) =>
+            {
+                Dictionary<string, string>? optsDirect = null;
+                if (cmbOptionSelector != null && optionKeyName != null && cmbOptionSelector.SelectedItem is string optVal)
+                    optsDirect = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [optionKeyName] = optVal };
+
+                modalResult = new V2SecretsModalResult(null, optsDirect, string.Empty, RequestDirectRemote: true);
+                dlg.DialogResult = DialogResult.OK;
+                dlg.Close();
+            };
+            layout.Controls.Add(btnAskNodeDirect);
         }
 
         var btnOk = new NeonButton
@@ -1780,7 +1830,7 @@ public partial class FormDashboard
             if (r == null) return;
             string kr = string.IsNullOrWhiteSpace(r.LinkDescifradoRemoto) ? $"keyRef://{r.NodoRaiz}/{r.PacketId}" : r.LinkDescifradoRemoto;
             Clipboard.SetText(kr);
-            MessageBox.Show(this, $"Referencia copiada:\n{kr}", "Portapapeles", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowSuccess(this, $"Referencia copiada:\n{kr}", "Portapapeles");
         };
 
         var btnDelete = new NeonButton { Text = "🗑 Eliminar", Variant = NeonButtonVariant.Danger, Margin = new Padding(0, 2, 8, 2) };
@@ -1935,11 +1985,11 @@ public partial class FormDashboard
             BackColor = HologramTheme.PanelGlass
         };
         string netTitle = NodeRuntimeState.IsV2
-            ? "Directorio de Nodos v2.0 (UDP 5099 • Escaneo 5001–5020 • TOFU)"
-            : "Directorio de Nodos v1.0 (Escaneo LAN :5000 • Localhost 5000–5008)";
+            ? "Directorio de Nodos v2.0 (UDP 5099 • Escaneo /22 • Puertos 5000–5020 • TOFU)"
+            : "Directorio de Nodos v1.0 (Escaneo Subred /22 • Puertos 5000–5020 • Localhost)";
 
         string netSub = NodeRuntimeState.IsV2
-            ? "Beacons CC-BEACON cada 30s, escaneo HTTP de respaldo, fijado TOFU y diagnóstico de conectividad de 3 capas"
+            ? "Monitor automático cada 30s (/24 + ScanHosts), escaneo /22 en LAN, beacons CC-BEACON UDP 5099, fijado TOFU y diagnóstico de 3 capas"
             : "Interoperabilidad dual ModuloCrypto v1.0 / CentroCiberseguridad v1 y diagnóstico de conectividad de 3 capas";
 
         var lblTitle = new Label
@@ -2058,18 +2108,18 @@ public partial class FormDashboard
             try
             {
                 List<PeerNode> found = NodeRuntimeState.IsV2
-                    ? await V2NetworkClient.ScanLocalhostPortsAsync(5001, 5020)
-                    : await V1NetworkClient.ScanLocalhostPortsAsync(5000, 5008);
+                    ? await V2NetworkClient.ScanLocalhostPortsAsync(5000, 5020)
+                    : await V1NetworkClient.ScanLocalhostPortsAsync(5000, 5020);
 
                 int integrated = IntegrateDiscoveredPeers(found);
                 RefreshNetworkGrid();
                 RefreshTargetPeerCombo();
 
-                MessageBox.Show(this,
-                    $"Escaneo de Localhost (v{NodeRuntimeState.ProtocolVersion}) completado.\n" +
+                HologramDialog.ShowInfo(this,
+                    $"Escaneo de Localhost 5000–5020 (v{NodeRuntimeState.ProtocolVersion}) completado.\n" +
                     $"• Nodos detectados: {found.Count}\n" +
                     $"• Nodos actualizados en directorio: {integrated}",
-                    $"Descubrimiento Localhost v{NodeRuntimeState.ProtocolVersion}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    $"Descubrimiento Localhost v{NodeRuntimeState.ProtocolVersion}");
             }
             finally
             {
@@ -2092,29 +2142,41 @@ public partial class FormDashboard
         btnScanLan.Click += async (_, _) =>
         {
             btnScanLan.Enabled = false;
-            btnScanLan.Text = "Escaneando /24...";
+            var scanPlan = NetworkAddressService.ComputeSubnetScanPlan(NodeRuntimeState.LocalIpAddress, NodeRuntimeState.LocalSubnetMask);
+            btnScanLan.Text = $"Escaneando /{scanPlan.EffectivePrefixLength}...";
             try
             {
                 List<PeerNode> found;
                 if (NodeRuntimeState.IsV2)
                 {
-                    var (f, _) = await V2NetworkClient.ScanLanSubnetAsync(NodeRuntimeState.LocalIpAddress, 5001, 5020, isAutomaticTrigger: false);
+                    var (f, _) = await V2NetworkClient.ScanLanSubnetAsync(
+                        NodeRuntimeState.LocalIpAddress,
+                        NodeRuntimeState.LocalSubnetMask,
+                        startPort: 5000,
+                        endPort: 5020,
+                        isAutomaticTrigger: false);
                     found = f;
                 }
                 else
                 {
-                    found = await V1NetworkClient.ScanLanSubnetAsync(NodeRuntimeState.LocalIpAddress, 5000);
+                    found = await V1NetworkClient.ScanLanSubnetAsync(
+                        NodeRuntimeState.LocalIpAddress,
+                        NodeRuntimeState.LocalSubnetMask,
+                        startPort: 5000,
+                        endPort: 5020);
                 }
 
                 int integrated = IntegrateDiscoveredPeers(found);
                 RefreshNetworkGrid();
                 RefreshTargetPeerCombo();
 
-                MessageBox.Show(this,
-                    $"Escaneo HTTP en subred /24 de {NodeRuntimeState.LocalIpAddress} completado.\n" +
+                int scanHostsCount = NetworkAddressService.LoadScanHosts().Count;
+                HologramDialog.ShowInfo(this,
+                    $"Escaneo HTTP en subred /{scanPlan.EffectivePrefixLength} (máscara real /{scanPlan.PrefixLength}, {scanPlan.NetworkAddress} .. {scanPlan.BroadcastAddress}) completado.\n" +
+                    $"• Hosts escaneados: {scanPlan.SubnetHosts.Count} IP(s) + {scanHostsCount} ScanHost(s) fijo(s) (puertos 5000–5020)\n" +
                     $"• Nodos v{NodeRuntimeState.ProtocolVersion} detectados: {found.Count}\n" +
                     $"• Nodos integrados en directorio: {integrated}",
-                    $"Escaneo Subred LAN v{NodeRuntimeState.ProtocolVersion}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    $"Escaneo Subred LAN v{NodeRuntimeState.ProtocolVersion}");
             }
             finally
             {
@@ -2208,7 +2270,55 @@ public partial class FormDashboard
             }
         };
 
-        editBar.Controls.AddRange(new Control[] { lblIp, _txtEditPeerIp, lblPort, _txtEditPeerPort, btnSavePeer });
+        var lblScanHosts = new Label
+        {
+            Text = "IPs fijas (ScanHosts):",
+            ForeColor = HologramTheme.TextSecondary,
+            AutoSize = true,
+            Margin = new Padding(12, 9, 6, 4),
+            Font = HologramTheme.FontBody(9.0f),
+            BackColor = HologramTheme.PanelGlass
+        };
+        var txtScanHosts = HologramTheme.CreateDarkTextBox();
+        txtScanHosts.Size = new Size(215, 28);
+        txtScanHosts.Margin = new Padding(0, 5, 8, 4);
+        txtScanHosts.PlaceholderText = "192.168.1.50, 10.10.5.12:5006";
+        txtScanHosts.Text = string.Join(", ", NetworkAddressService.LoadScanHosts());
+
+        var btnSaveScanHosts = new NeonButton
+        {
+            Text = "📌 Guardar Hosts",
+            Variant = NeonButtonVariant.Secondary,
+            Margin = new Padding(0, 2, 4, 2)
+        };
+        btnSaveScanHosts.FitToText(minWidth: 138, height: 36);
+        btnSaveScanHosts.Click += async (_, _) =>
+        {
+            var parsedHosts = NetworkAddressService.ParseScanHostsCsv(txtScanHosts.Text);
+            var savedHosts = NetworkAddressService.SaveScanHosts(parsedHosts);
+            txtScanHosts.Text = string.Join(", ", savedHosts);
+
+            btnSaveScanHosts.Enabled = false;
+            try
+            {
+                await RunPeriodicNetworkMonitorTickAsync();
+                HologramDialog.ShowSuccess(this,
+                    savedHosts.Count > 0
+                        ? $"Se guardaron {savedHosts.Count} host(s) fijo(s) y se sondearon inmediatamente:\n{string.Join(", ", savedHosts)}"
+                        : "Lista de ScanHosts limpiada correctamente.",
+                    "ScanHosts Persistente");
+            }
+            finally
+            {
+                if (!btnSaveScanHosts.IsDisposed) btnSaveScanHosts.Enabled = true;
+            }
+        };
+
+        editBar.Controls.AddRange(new Control[]
+        {
+            lblIp, _txtEditPeerIp, lblPort, _txtEditPeerPort, btnSavePeer,
+            lblScanHosts, txtScanHosts, btnSaveScanHosts
+        });
 
         _gridPeers = new DataGridView { Dock = DockStyle.Fill };
         HologramTheme.StyleDataGrid(_gridPeers);
@@ -2294,16 +2404,13 @@ public partial class FormDashboard
             RefreshNetworkGrid();
         }
 
-        var icon = report.HasVersionMismatch || (!report.TcpPortOpen && report.IcmpPingSuccess)
-            ? MessageBoxIcon.Warning
-            : (report.HttpApiSuccess ? MessageBoxIcon.Information : MessageBoxIcon.Error);
-
-        MessageBox.Show(
-            this,
-            report.FullFormattedReport,
-            $"Diagnóstico de Conectividad — {report.SummaryTitle}",
-            MessageBoxButtons.OK,
-            icon);
+        string diagTitle = $"Diagnóstico de Conectividad — {report.SummaryTitle}";
+        if (report.HasVersionMismatch || (!report.TcpPortOpen && report.IcmpPingSuccess))
+            HologramDialog.ShowWarning(this, report.FullFormattedReport, diagTitle);
+        else if (report.HttpApiSuccess)
+            HologramDialog.ShowInfo(this, report.FullFormattedReport, diagTitle);
+        else
+            HologramDialog.ShowError(this, report.FullFormattedReport, diagTitle);
     }
 
     private void HandleConfirmSelectedPeerTofu()
@@ -2316,9 +2423,9 @@ public partial class FormDashboard
 
         if (string.IsNullOrWhiteSpace(peer.CertThumbprint))
         {
-            MessageBox.Show(this,
+            HologramDialog.ShowInfo(this,
                 $"El nodo {peer.NodeId} aún no ha anunciado un certificado X.509.\nEjecuta primero [🧪 Probar Conexión] o [📡 Ping 8 Nodos].",
-                "TOFU — Sin Huella", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                "TOFU — Sin Huella");
             return;
         }
 
@@ -2332,11 +2439,15 @@ public partial class FormDashboard
               $"• Huella SHA-256 (64 HEX):\n{peer.CertThumbprint}\n\n" +
               $"¿Deseas fijar esta huella como confiable en SQLite (TrustedPeers)?";
 
-        if (MessageBox.Show(this, msg, $"Confirmar TOFU — {peer.NodeId}",
-            MessageBoxButtons.YesNo,
-            peer.HasThumbprintMismatch ? MessageBoxIcon.Warning : MessageBoxIcon.Question) == DialogResult.Yes)
+        if (HologramDialog.ShowQuestion(
+            this,
+            msg,
+            $"Confirmar TOFU — {peer.NodeId}",
+            includeCancel: false,
+            iconType: peer.HasThumbprintMismatch ? HologramDialogType.Warning : HologramDialogType.Question) == DialogResult.Yes)
         {
             V2NetworkClient.ConfirmPeerTofu(peer);
+            _alertedTofuMismatches.Remove(peer.NodeId);
             RefreshNetworkGrid();
         }
     }
@@ -2353,11 +2464,16 @@ public partial class FormDashboard
             {
                 existing.IpAddress = d.IpAddress;
                 existing.Port = d.Port;
+                if (d.HttpsPort.HasValue)
+                    existing.HttpsPort = d.HttpsPort;
                 existing.Source = d.Source;
                 existing.LastLatency = d.LastLatency;
                 existing.CertThumbprint = d.CertThumbprint;
                 existing.CertificatePem = d.CertificatePem;
-                existing.AlgorithmsJson = d.AlgorithmsJson;
+                if (!string.IsNullOrWhiteSpace(d.AlgorithmsJson) && d.AlgorithmsJson != "[]")
+                    existing.AlgorithmsJson = d.AlgorithmsJson;
+                if (!string.IsNullOrWhiteSpace(d.RoleLabel))
+                    existing.RoleLabel = d.RoleLabel;
                 existing.HasThumbprintMismatch = d.HasThumbprintMismatch;
                 existing.Status = d.Status;
                 existing.LastSeenUtc = DateTime.UtcNow;
@@ -2438,11 +2554,9 @@ public partial class FormDashboard
             var newCert = _runtime.RegenerateCertificate();
             RefreshSettingsStats();
             await _runtime.AnnouncePresenceAsync();
-            MessageBox.Show(this,
+            HologramDialog.ShowSuccess(this,
                 $"Nuevo certificado X.509 RSA-2048 generado para v{NodeRuntimeState.ProtocolVersion}:\n{newCert.Subject}",
-                $"Certificado X.509 v{NodeRuntimeState.ProtocolVersion} — {NodeRuntimeState.CurrentNodeId}",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+                $"Certificado X.509 v{NodeRuntimeState.ProtocolVersion} — {NodeRuntimeState.CurrentNodeId}");
         };
 
         var certSpacer = new Panel { Dock = DockStyle.Bottom, Height = 12, BackColor = HologramTheme.PanelGlass };

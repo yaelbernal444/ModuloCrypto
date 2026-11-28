@@ -1,9 +1,21 @@
+using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Services;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Numerics;
+using System.Text.Json;
 
 namespace ModuloCrypto.Network.Shared;
+
+public sealed record SubnetScanPlan(
+    string NetworkAddress,
+    string BroadcastAddress,
+    int PrefixLength,
+    int EffectivePrefixLength,
+    IReadOnlyList<string> Immediate24Hosts,
+    IReadOnlyList<string> SubnetHosts);
 
 public sealed class LocalNetworkEndpoint
 {
@@ -203,5 +215,157 @@ public static class NetworkAddressService
         NodeRuntimeState.UpdateActiveNetworkEndpoint(primary);
         OnNetworkEndpointsChanged?.Invoke(primary);
         return primary;
+    }
+
+    /// <summary>
+    /// Calcula los hosts escaneables de la subred real usando IPv4 + IPv4Mask.
+    /// Si la máscara es mayor a /22 (ej. /20 o /16), acota un bloque /22 (hasta 1,022 IPs cubriendo
+    /// los 4 segmentos /24 contiguos alrededor de la IP local), excluyendo dirección de red y broadcast.
+    /// </summary>
+    public static SubnetScanPlan ComputeSubnetScanPlan(string? localIp, string? subnetMask = null, bool includeLocalIp = false)
+    {
+        if (!IPAddress.TryParse(localIp, out var ipObj) ||
+            ipObj.AddressFamily != AddressFamily.InterNetwork ||
+            IPAddress.IsLoopback(ipObj))
+        {
+            var fallback = new List<string>(254);
+            for (int h = 1; h <= 254; h++)
+                fallback.Add($"192.168.1.{h}");
+            return new SubnetScanPlan("192.168.1.0", "192.168.1.255", 24, 24, fallback, fallback);
+        }
+
+        if (!IPAddress.TryParse(subnetMask, out var maskObj) || maskObj.AddressFamily != AddressFamily.InterNetwork)
+            maskObj = IPAddress.Parse("255.255.255.0");
+
+        uint ipUint = BinaryPrimitives.ReadUInt32BigEndian(ipObj.GetAddressBytes());
+        uint maskUint = BinaryPrimitives.ReadUInt32BigEndian(maskObj.GetAddressBytes());
+        if (maskUint == 0)
+            maskUint = 0xFFFFFF00u;
+
+        int prefixLen = BitOperations.PopCount(maskUint);
+        if (prefixLen >= 31)
+        {
+            return new SubnetScanPlan(ipObj.ToString(), ipObj.ToString(), prefixLen, prefixLen, Array.Empty<string>(), Array.Empty<string>());
+        }
+
+        int effectivePrefix = Math.Max(prefixLen, 22);
+        uint effectiveMask = effectivePrefix == 0 ? 0u : (uint.MaxValue << (32 - effectivePrefix));
+
+        uint effNetwork = ipUint & effectiveMask;
+        uint effBroadcast = effNetwork | ~effectiveMask;
+        uint firstHost = effNetwork + 1;
+        uint lastHost = effBroadcast - 1;
+
+        uint immediate24Net = ipUint & 0xFFFFFF00u;
+        uint immediate24Bcast = immediate24Net | 0x000000FFu;
+
+        var immediate24 = new List<string>(254);
+        for (uint addr = immediate24Net + 1; addr <= immediate24Bcast - 1; addr++)
+        {
+            if (!includeLocalIp && addr == ipUint) continue;
+            if (addr <= effNetwork || addr >= effBroadcast) continue;
+            immediate24.Add(UintToIpv4String(addr));
+        }
+
+        var allHosts = new List<string>((int)Math.Min(1022, (long)lastHost - firstHost + 1));
+        allHosts.AddRange(immediate24);
+
+        for (uint addr = firstHost; addr <= lastHost; addr++)
+        {
+            if (addr > immediate24Net && addr < immediate24Bcast) continue;
+            if (!includeLocalIp && addr == ipUint) continue;
+            allHosts.Add(UintToIpv4String(addr));
+        }
+
+        return new SubnetScanPlan(
+            UintToIpv4String(effNetwork),
+            UintToIpv4String(effBroadcast),
+            prefixLen,
+            effectivePrefix,
+            immediate24,
+            allHosts);
+    }
+
+    private static string UintToIpv4String(uint ipUint)
+    {
+        Span<byte> buf = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(buf, ipUint);
+        return $"{buf[0]}.{buf[1]}.{buf[2]}.{buf[3]}";
+    }
+
+    private static string ScanHostsFilePath => Path.Combine(AppDbContext.AppDataDirectory, "scan_hosts.json");
+
+    public static List<string> LoadScanHosts()
+    {
+        try
+        {
+            if (!File.Exists(ScanHostsFilePath))
+                return new List<string>();
+
+            string json = File.ReadAllText(ScanHostsFilePath);
+            var parsed = JsonSerializer.Deserialize<List<string>>(json);
+            return NormalizeScanHostList(parsed);
+        }
+        catch
+        {
+            return new List<string>();
+        }
+    }
+
+    public static List<string> SaveScanHosts(IEnumerable<string>? hosts)
+    {
+        var normalized = NormalizeScanHostList(hosts);
+        try
+        {
+            Directory.CreateDirectory(AppDbContext.AppDataDirectory);
+            string json = JsonSerializer.Serialize(normalized, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(ScanHostsFilePath, json);
+        }
+        catch { }
+        return normalized;
+    }
+
+    public static List<string> ParseScanHostsCsv(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv))
+            return new List<string>();
+
+        var tokens = csv.Split(new[] { ',', ';', '\r', '\n', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        return NormalizeScanHostList(tokens);
+    }
+
+    public static List<string> NormalizeScanHostList(IEnumerable<string>? rawHosts)
+    {
+        var result = new List<string>();
+        if (rawHosts == null) return result;
+
+        foreach (string item in rawHosts)
+        {
+            string trimmed = (item ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(trimmed)) continue;
+
+            // Soporta tanto "10.10.5.20" como "10.10.5.20:5006"
+            int colonIdx = trimmed.IndexOf(':');
+            if (colonIdx > 0)
+            {
+                string ipPart = trimmed[..colonIdx].Trim();
+                string portPart = trimmed[(colonIdx + 1)..].Trim();
+                if (IPAddress.TryParse(ipPart, out var parsedIp) &&
+                    parsedIp.AddressFamily == AddressFamily.InterNetwork &&
+                    int.TryParse(portPart, out int p) && p is > 0 and <= 65535)
+                {
+                    string entry = $"{parsedIp}:{p}";
+                    if (!result.Contains(entry, StringComparer.OrdinalIgnoreCase))
+                        result.Add(entry);
+                }
+            }
+            else if (IPAddress.TryParse(trimmed, out var ipOnly) && ipOnly.AddressFamily == AddressFamily.InterNetwork)
+            {
+                string entry = ipOnly.ToString();
+                if (!result.Contains(entry, StringComparer.OrdinalIgnoreCase))
+                    result.Add(entry);
+            }
+        }
+        return result;
     }
 }

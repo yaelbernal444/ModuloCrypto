@@ -94,6 +94,9 @@ public partial class FormDashboard : Form
     private string? _relaySourceZipPath;
     private List<string>? _relayHopHistory;
 
+    private readonly System.Windows.Forms.Timer _networkMonitorTimer;
+    private readonly HashSet<string> _alertedTofuMismatches = new(StringComparer.OrdinalIgnoreCase);
+
     public FormDashboard(Usuario currentUser, INodeProtocolRuntime? runtime = null)
     {
         _currentUser = currentUser;
@@ -138,22 +141,29 @@ public partial class FormDashboard : Form
         NodeRuntimeState.OnPeerDiscoveredOrChanged += HandlePeerChangedEvent;
         NetworkAddressService.OnNetworkEndpointsChanged += HandleNetworkEndpointsChangedEvent;
 
-        Shown += (_, _) =>
+        _networkMonitorTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
+        _networkMonitorTimer.Tick += async (_, _) => await RunPeriodicNetworkMonitorTickAsync();
+        _networkMonitorTimer.Start();
+
+        Shown += async (_, _) =>
         {
             if (!_runtime.IsApiOnline && !string.IsNullOrWhiteSpace(_runtime.LastStartupError))
             {
-                MessageBox.Show(this,
+                HologramDialog.ShowWarning(this,
                     $"El servidor HTTP embebido no pudo escuchar en http://0.0.0.0:{NodeRuntimeState.ApiPort}.\n\n" +
                     $"Detalle: {_runtime.LastStartupError}\n\n" +
                     $"Verifica que ningún otro proceso ocupe el puerto {NodeRuntimeState.ApiPort} o los permisos del Firewall de Windows.",
-                    $"Advertencia de Puerto HTTP :{NodeRuntimeState.ApiPort}",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    $"Advertencia de Puerto HTTP :{NodeRuntimeState.ApiPort}");
             }
+
+            // Primer escaneo ligero no bloqueante tras abrir el Dashboard
+            await RunPeriodicNetworkMonitorTickAsync();
         };
 
         FormClosed += (_, _) =>
         {
+            _networkMonitorTimer.Stop();
+            _networkMonitorTimer.Dispose();
             NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
             NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
             NetworkAddressService.OnNetworkEndpointsChanged -= HandleNetworkEndpointsChangedEvent;
@@ -163,6 +173,60 @@ public partial class FormDashboard : Form
             _logoSubFont.Dispose();
             _avatarInitialsFont.Dispose();
         };
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        HologramTheme.ApplyDarkTitleBar(this);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try
+            {
+                _networkMonitorTimer.Stop();
+                _networkMonitorTimer.Dispose();
+            }
+            catch { }
+
+            NodeRuntimeState.OnPacketReceived -= HandleIncomingPacketEvent;
+            NodeRuntimeState.OnPeerDiscoveredOrChanged -= HandlePeerChangedEvent;
+            NetworkAddressService.OnNetworkEndpointsChanged -= HandleNetworkEndpointsChangedEvent;
+
+            try
+            {
+                var img = _picImageViewer?.Image;
+                if (_picImageViewer != null) _picImageViewer.Image = null;
+                img?.Dispose();
+            }
+            catch { }
+
+            _dashboardToolTip.Dispose();
+            _logoGlyphFont.Dispose();
+            _logoTitleFont.Dispose();
+            _logoSubFont.Dispose();
+            _avatarInitialsFont.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    internal bool VerifyCleanResetSnapshot()
+    {
+        return _activeRecord == null &&
+               _currentBytes.Length == 0 &&
+               !_isShowingEncrypted &&
+               _binarySummaryReport == null &&
+               _lastSavedDecryptedPath == null &&
+               _picImageViewer.Image == null &&
+               string.IsNullOrEmpty(_txtPassphrase.Text) &&
+               string.IsNullOrEmpty(_txtDataViewer.Text) &&
+               _lblFileBadge.Text == "VISOR • Listo (0 B) [PLANO]" &&
+               _txtMetaPacketId.Text == "---" &&
+               _txtMetaPublicJson.Text == "{}" &&
+               _hologram.CurrentState == HologramState.Idle;
     }
 
     private void UpdateSqlitePillState()
@@ -791,13 +855,26 @@ public partial class FormDashboard : Form
         viewerHeader.Controls.Add(_lblFileBadge, 0, 0);
         viewerHeader.Controls.Add(modeButtons, 1, 0);
 
+        var fileActionsContainer = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(0, 6, 0, 2),
+            BackColor = HologramTheme.PanelGlass
+        };
+        fileActionsContainer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        fileActionsContainer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        fileActionsContainer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
         var fileActionsBar = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
             AutoSize = true,
-            WrapContents = true,
+            WrapContents = false,
             FlowDirection = FlowDirection.LeftToRight,
-            Padding = new Padding(0, 6, 0, 4),
+            Margin = new Padding(0),
             BackColor = HologramTheme.PanelGlass
         };
 
@@ -808,7 +885,7 @@ public partial class FormDashboard : Form
             CornerRadius = 8,
             Margin = new Padding(0, 2, 8, 2)
         };
-        btnDownloadFile.FitToText(minWidth: 156, height: 32);
+        btnDownloadFile.FitToText(minWidth: 152, height: 32);
         btnDownloadFile.Click += (_, _) => HandleDownloadCurrentFile();
 
         _btnOpenFile = new NeonButton
@@ -816,23 +893,35 @@ public partial class FormDashboard : Form
             Text = "▶ Abrir Local",
             Variant = NeonButtonVariant.Success,
             CornerRadius = 8,
-            Margin = new Padding(0, 2, 10, 2)
+            Margin = new Padding(0, 2, 8, 2)
         };
-        _btnOpenFile.FitToText(minWidth: 126, height: 32);
+        _btnOpenFile.FitToText(minWidth: 120, height: 32);
         _btnOpenFile.Click += (_, _) => HandleOpenCurrentFileInWindows();
+
+        var btnClearViewer = new NeonButton
+        {
+            Text = "Limpiar",
+            Variant = NeonButtonVariant.Secondary,
+            CornerRadius = 8,
+            Margin = new Padding(0, 2, 0, 2)
+        };
+        btnClearViewer.FitToText(minWidth: 96, height: 32);
+        btnClearViewer.Click += (_, _) => ResetDashboardState();
 
         _chkAutoDownloadBinary = new CheckBox
         {
             Text = "Auto-descargar multimedia/binarios al descifrar",
             Checked = true,
             AutoSize = true,
-            Margin = new Padding(2, 8, 2, 2),
+            Margin = new Padding(2, 4, 2, 2),
             Font = new Font("Segoe UI", 8.5f),
             ForeColor = HologramTheme.HologramViolet,
             BackColor = HologramTheme.PanelGlass
         };
 
-        fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, _btnOpenFile, _chkAutoDownloadBinary });
+        fileActionsBar.Controls.AddRange(new Control[] { btnDownloadFile, _btnOpenFile, btnClearViewer });
+        fileActionsContainer.Controls.Add(fileActionsBar, 0, 0);
+        fileActionsContainer.Controls.Add(_chkAutoDownloadBinary, 0, 1);
 
         var viewerBody = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 4, 0, 0), BackColor = HologramTheme.PanelGlass };
         _txtDataViewer = HologramTheme.CreateDarkTextBox(multiline: true, readOnly: false, mono: true);
@@ -842,11 +931,13 @@ public partial class FormDashboard : Form
             if (_viewerMode == "TEXT" && !_isShowingEncrypted && _binarySummaryReport == null && _txtDataViewer.Focused)
             {
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
-                _currentFileName = "mensaje_manual.txt";
+                _currentFileName = _currentBytes.Length == 0 ? "nuevo_mensaje.txt" : "mensaje_manual.txt";
                 _currentExtension = ".txt";
                 _isFromNetworkUntrusted = false;
                 _lastSavedDecryptedPath = null;
-                _lblFileBadge.Text = $"VISOR • {_currentFileName} ({_currentBytes.Length} B)";
+                _lblFileBadge.Text = _currentBytes.Length == 0
+                    ? "VISOR • Listo (0 B) [PLANO]"
+                    : $"VISOR • {_currentFileName} ({FormatFileSize(_currentBytes.Length)}) [PLANO]";
             }
         };
 
@@ -873,7 +964,7 @@ public partial class FormDashboard : Form
         viewerBody.Controls.Add(_lblVerificationBanner);
 
         viewerCard.Controls.Add(viewerBody);
-        viewerCard.Controls.Add(fileActionsBar);
+        viewerCard.Controls.Add(fileActionsContainer);
         viewerCard.Controls.Add(viewerHeader);
 
         var metaCard = new GlassPanel
@@ -1009,8 +1100,11 @@ public partial class FormDashboard : Form
 
     private void RenderCurrentBytesInViewer()
     {
-        _lblFileBadge.Text = $"VISOR • {_currentFileName} ({FormatFileSize(_currentBytes.Length)})" +
-                             (_isShowingEncrypted ? " [CIFRADO]" : " [PLANO]");
+        if (_activeRecord == null && _currentBytes.Length == 0 && string.Equals(_currentFileName, "nuevo_mensaje.txt", StringComparison.Ordinal))
+            _lblFileBadge.Text = "VISOR • Listo (0 B) [PLANO]";
+        else
+            _lblFileBadge.Text = $"VISOR • {_currentFileName} ({FormatFileSize(_currentBytes.Length)})" +
+                                 (_isShowingEncrypted ? " [CIFRADO]" : " [PLANO]");
 
         if (_btnOpenFile != null)
             _btnOpenFile.Enabled = !_isFromNetworkUntrusted;
@@ -1138,7 +1232,7 @@ public partial class FormDashboard : Form
     {
         if (_currentBytes == null || _currentBytes.Length == 0)
         {
-            MessageBox.Show(this, "No hay bytes activos en el visor para guardar.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowInfo(this, "No hay bytes activos en el visor para guardar.");
             return;
         }
 
@@ -1158,24 +1252,24 @@ public partial class FormDashboard : Form
 
         File.WriteAllBytes(sfd.FileName, _currentBytes);
         _lastSavedDecryptedPath = sfd.FileName;
-        MessageBox.Show(this, $"Archivo guardado correctamente:\n{sfd.FileName}\nTamaño: {FormatFileSize(_currentBytes.Length)}",
-            "Archivo Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        HologramDialog.ShowSuccess(this, $"Archivo guardado correctamente:\n{sfd.FileName}\nTamaño: {FormatFileSize(_currentBytes.Length)}",
+            "Archivo Guardado");
     }
 
     private void HandleOpenCurrentFileInWindows()
     {
         if (_isFromNetworkUntrusted)
         {
-            MessageBox.Show(this,
+            HologramDialog.ShowWarning(this,
                 "Por política de seguridad, está prohibido abrir o ejecutar directamente archivos recibidos desde la red.\n\n" +
                 "Puedes guardar los bytes de forma segura usando [💾 Descargar Archivo] o inspeccionarlos en [Hex].",
-                "Política de Seguridad", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                "Política de Seguridad");
             return;
         }
 
         if (_currentBytes == null || _currentBytes.Length == 0)
         {
-            MessageBox.Show(this, "No hay ningún archivo local cargado o descifrado para abrir.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowInfo(this, "No hay ningún archivo local cargado o descifrado para abrir.");
             return;
         }
 
@@ -1198,9 +1292,66 @@ public partial class FormDashboard : Form
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"No se pudo abrir el archivo con el visor de Windows:\n{ex.Message}",
-                "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"No se pudo abrir el archivo con el visor de Windows:\n{ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Reinicia únicamente el estado de trabajo actual en el Dashboard sin borrar registros ni historial de SQLite.
+    /// </summary>
+    public void ResetDashboardState()
+    {
+        _currentBytes = Array.Empty<byte>();
+        _currentFileName = "nuevo_mensaje.txt";
+        _currentExtension = ".txt";
+        _activeRecord = null;
+        _isShowingEncrypted = false;
+        _isFromNetworkUntrusted = false;
+        _binarySummaryReport = null;
+        _lastSavedDecryptedPath = null;
+
+        ClearRelayContext();
+        HideVerificationBanner();
+
+        if (_txtPassphrase != null)
+            _txtPassphrase.Text = string.Empty;
+
+        if (_picImageViewer != null)
+        {
+            var oldImg = _picImageViewer.Image;
+            _picImageViewer.Image = null;
+            oldImg?.Dispose();
+            _picImageViewer.Visible = false;
+        }
+
+        if (_txtDataViewer != null)
+        {
+            _txtDataViewer.ReadOnly = false;
+            _txtDataViewer.Text = string.Empty;
+        }
+
+        SetViewerMode("TEXT");
+        if (_lblFileBadge != null)
+            _lblFileBadge.Text = "VISOR • Listo (0 B) [PLANO]";
+
+        if (_txtMetaPacketId != null) _txtMetaPacketId.Text = "---";
+        if (_txtMetaRootNode != null) _txtMetaRootNode.Text = NodeRuntimeState.CurrentNodeId;
+        if (_txtMetaHops != null) _txtMetaHops.Text = NodeRuntimeState.CurrentNodeId;
+        if (_txtMetaKeyRef != null)
+            _txtMetaKeyRef.Text = NodeRuntimeState.IsV2
+                ? $"owner={NodeRuntimeState.CurrentNodeId}"
+                : $"owner={NodeRuntimeState.CurrentNodeId}";
+        if (_txtMetaPublicJson != null) _txtMetaPublicJson.Text = "{}";
+        if (_lblMetaSignatureBadge != null)
+        {
+            _lblMetaSignatureBadge.Text = "● X.509 Activo";
+            _lblMetaSignatureBadge.ForeColor = HologramTheme.HologramCyan;
+        }
+
+        _hologram?.SetIdle(string.Empty);
+
+        if (_txtDataViewer != null && _txtDataViewer.CanFocus)
+            _txtDataViewer.Focus();
     }
 
     private void ShowVerificationBanner(bool valid, string? detail)
@@ -1253,13 +1404,12 @@ public partial class FormDashboard : Form
                 var ownerPeer = ResolveBestPeerForAlgorithm(algInfo.Code);
                 if (ownerPeer != null && ownerPeer.IsOnline && ownerPeer.IsConfirmed && !ownerPeer.HasThumbprintMismatch)
                 {
-                    var askDelegate = MessageBox.Show(this,
+                    var askDelegate = HologramDialog.ShowQuestion(this,
                         $"El algoritmo {algInfo.Code} pertenece al nodo remoto {ownerPeer.NodeId} ({ownerPeer.BaseUrl}), que está ONLINE y confirmado (TOFU).\n\n" +
                         $"• Pulsa [Sí] para DELEGAR el cifrado remoto a {ownerPeer.NodeId} (POST /api/crypto/forward).\n" +
                         $"• Pulsa [No] para ejecutar el cifrado localmente en {NodeRuntimeState.CurrentNodeId}.",
                         $"Delegación Criptográfica v2.0 — {algInfo.Code}",
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Question);
+                        includeCancel: false);
 
                     if (askDelegate == DialogResult.Yes)
                     {
@@ -1308,11 +1458,9 @@ public partial class FormDashboard : Form
 
                         if (!fwd.Success || fwd.Response == null)
                         {
-                            MessageBox.Show(this,
+                            HologramDialog.ShowWarning(this,
                                 $"El nodo {ownerPeer.NodeId} rechazó la delegación remota ({algInfo.Code}):\n{fwd.ErrorMessage}",
-                                "Delegación Remota v2.0",
-                                MessageBoxButtons.OK,
-                                MessageBoxIcon.Warning);
+                                "Delegación Remota v2.0");
                             return;
                         }
 
@@ -1474,8 +1622,8 @@ public partial class FormDashboard : Form
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Error durante el cifrado ({algInfo.Code}):\n{ex.Message}",
-                "ModuloCrypto — Error de Cifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"Error durante el cifrado ({algInfo.Code}):\n{ex.Message}",
+                "ModuloCrypto — Error de Cifrado");
         }
     }
 
@@ -1491,8 +1639,8 @@ public partial class FormDashboard : Form
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Primero cifra un paquete o carga un registro desde Consultas / Solicitudes.",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowInfo(this, "Primero cifra un paquete o carga un registro desde Consultas / Solicitudes.",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}");
             return;
         }
 
@@ -1512,8 +1660,8 @@ public partial class FormDashboard : Form
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Carga primero un paquete desde Consultas o Bandeja de Solicitudes.",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowInfo(this, "Carga primero un paquete desde Consultas o Bandeja de Solicitudes.",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}");
             return;
         }
 
@@ -1554,34 +1702,28 @@ public partial class FormDashboard : Form
         if (v2Ok)
             return;
 
-        MessageBox.Show(this,
+        HologramDialog.ShowWarning(this,
             $"No fue posible completar el Descifrado Remoto automático del paquete {_activeRecord.PacketId}:\n\n" +
             $"• Recuperación de llave: {lastError}\n" +
             $"• Servicio inverse: {v2Err}",
-            "Descifrado Remoto",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning);
+            "Descifrado Remoto");
     }
 
     /// <summary>
     /// Flujo silencioso v2.0 de Descifrado Remoto (respaldo automático sin diálogos de confirmación ni envío a bandeja Solicitudes):
-    /// - Paso A: Identifica automáticamente el nodo productor/emisor (y el dueño del algoritmo) y envía directamente POST /api/crypto/inverse
-    ///   con keyRef/keyId (y sobre CC-ENV-1 solo si el usuario ya escribió una clave o el registro la tiene; nunca abre un modal pidiendo clave).
-    ///   Si devuelve 202 con jobId, sondea GET /api/jobs/{jobId} y abre resultado.enc con CC-ENV-1.
+    /// - Paso A: Identifica automáticamente el nodo productor/emisor (incl. v3-local y publicParameters["keyId"]) o dueño Tabla 4.1
+    ///   y envía directamente POST /api/crypto/inverse (200 directo o 202 con polling /api/jobs/{jobId}).
     /// - Paso B: Si el Paso A no devuelve el resultado, solicita silenciosamente GET http://&lt;ip&gt;:&lt;puerto&gt;/api/crypto/decrypt/{packetId}
     ///   (o LinkDescifradoRemoto) y descifra localmente con alias tolerantes.
-    /// - Paso C: Si el nodo remoto está apagado o rechaza por no conservar la clave simétrica, muestra un único mensaje claro con el código HTTP/error exacto,
-    ///   conservando intacto el paquete cargado.
+    /// - Paso C: Si el nodo remoto está apagado o rechaza, muestra un único diálogo oscuro claro sin corromper el paquete cargado.
     /// </summary>
     private async Task HandleRemoteDecryptActionV2Async()
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this,
+            HologramDialog.ShowInfo(this,
                 "Primero cifra un paquete o carga un paquete .zip desde Solicitudes o Consultas.",
-                $"Descifrado Remoto — {NodeRuntimeState.CurrentNodeId}",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+                $"Descifrado Remoto — {NodeRuntimeState.CurrentNodeId}");
             return;
         }
 
@@ -1631,15 +1773,13 @@ public partial class FormDashboard : Form
             }
         }
 
-        // Paso C: Único mensaje claro sin alterar ni corromper el paquete cargado
-        MessageBox.Show(this,
+        // Paso C: Único diálogo oscuro claro sin alterar ni corromper el paquete cargado
+        HologramDialog.ShowWarning(this,
             $"El nodo emisor ({_activeRecord.NodoRaiz}) no devolvió el resultado ni la llave para el paquete '{_activeRecord.PacketId}' ({_activeRecord.AlgoritmoCodigo}):\n\n" +
             $"• POST /api/crypto/inverse : {stepAError}\n" +
             $"• GET /api/crypto/decrypt  : {stepBError}\n\n" +
             $"El paquete permanece cargado intacto en el Dashboard para que puedas ingresar una clave manualmente o reintentar cuando el nodo emisor esté activo.",
-            $"Descifrado Remoto — Respuesta del Nodo Emisor",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning);
+            "Descifrado Remoto — Respuesta del Nodo Emisor");
     }
 
     private async Task<(bool Success, string DiagnosticError)> TrySilentV2InverseOnCandidatePeersAsync()
@@ -1659,6 +1799,8 @@ public partial class FormDashboard : Form
         }
 
         var pubParams = V2PacketZipService.ParseFlatPublicParameters(_activeRecord.ParametrosPublicosJson);
+        bool isV3Local = pubParams.TryGetValue("mode", out var modeVal) &&
+                         string.Equals(modeVal.Trim(), "v3-local", StringComparison.OrdinalIgnoreCase);
 
         string? resolvedKeyId = null;
         if (pubParams.TryGetValue("keyId", out var paramKeyId) && !string.IsNullOrWhiteSpace(paramKeyId))
@@ -1688,7 +1830,7 @@ public partial class FormDashboard : Form
 
         var (secretsDict, optionsDict) = BuildV2SecretsAndOptionsFromInput(algCode, existingSecret, pubParams);
 
-        var candidatePeers = ResolveOriginPeersForActiveRecord();
+        var candidatePeers = ResolveOriginPeersForActiveRecord(forceProducerFirst: isV3Local);
         var errors = new List<string>();
 
         try
@@ -1728,7 +1870,7 @@ public partial class FormDashboard : Form
                     return (true, "OK");
                 }
 
-                // Si enviamos secretos locales y el emisor custodió keyId en su almacén, reintentar solo con keyId
+                // Si enviamos secretos locales y el emisor custodió keyId (p. ej. v3-local o keyRef), reintentar solo con keyId y secrets = null
                 if (secretsDict is { Count: > 0 } && !string.IsNullOrWhiteSpace(resolvedKeyId))
                 {
                     var (retryOk, retryPlain, retryZip, retryErr) = await V2NetworkClient.CallRemoteInverseAsync(
@@ -1847,9 +1989,19 @@ public partial class FormDashboard : Form
         }
     }
 
-    private PeerNode? ResolveBestPeerForAlgorithm(string algCode, string? preferredNodeId = null)
+    private PeerNode? ResolveBestPeerForAlgorithm(string algCode, string? preferredNodeId = null, bool forceProducerFirst = false)
     {
         string normAlg = algCode.Trim().ToUpperInvariant();
+
+        if (forceProducerFirst &&
+            !string.IsNullOrWhiteSpace(preferredNodeId) &&
+            !string.Equals(preferredNodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            var exactProd = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, preferredNodeId, StringComparison.OrdinalIgnoreCase) && !p.HasThumbprintMismatch);
+            if (exactProd != null)
+                return exactProd;
+        }
 
         if (!string.IsNullOrWhiteSpace(preferredNodeId) &&
             !string.Equals(preferredNodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
@@ -1893,7 +2045,7 @@ public partial class FormDashboard : Form
         return null;
     }
 
-    private List<PeerNode> ResolveOriginPeersForActiveRecord()
+    private List<PeerNode> ResolveOriginPeersForActiveRecord(bool forceProducerFirst = false)
     {
         var result = new List<PeerNode>();
         if (_activeRecord == null) return result;
@@ -1907,6 +2059,13 @@ public partial class FormDashboard : Form
             {
                 result.Add(p);
             }
+        }
+
+        if (forceProducerFirst && !string.IsNullOrWhiteSpace(_activeRecord.NodoRaiz))
+        {
+            var strictProducer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, _activeRecord.NodoRaiz, StringComparison.OrdinalIgnoreCase));
+            AddPeerIfValid(strictProducer);
         }
 
         // 1. Pares vivos que anuncian explícitamente el algoritmo (detecta EQ08 cuando EQ08 anuncia HASHSHA/HMACSHA256)
@@ -2233,8 +2392,8 @@ public partial class FormDashboard : Form
             errorDetail = ex.Message;
             if (showErrorMessageBox)
             {
-                MessageBox.Show(this, $"Error al descifrar ({algCode}):\n{ex.Message}",
-                    "ModuloCrypto — Error de Descifrado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                HologramDialog.ShowError(this, $"Error al descifrar ({algCode}):\n{ex.Message}",
+                    "ModuloCrypto — Error de Descifrado");
             }
             return false;
         }
@@ -2320,8 +2479,8 @@ public partial class FormDashboard : Form
     {
         if (_activeRecord == null)
         {
-            MessageBox.Show(this, "Primero cifra un mensaje o archivo para generar un paquete .zip.",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            HologramDialog.ShowInfo(this, "Primero cifra un mensaje o archivo para generar un paquete .zip.",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}");
             return;
         }
 
@@ -2347,14 +2506,16 @@ public partial class FormDashboard : Form
                 var sendResult = await V2NetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
                 RefreshNetworkGrid();
 
-                MessageBox.Show(this,
+                string msgV2 =
                     $"{sendResult.Message}\n\n" +
                     $"• Emisor (sourceNode): {NodeRuntimeState.CurrentNodeId}\n" +
                     $"• Productor (producerNode): {_activeRecord.NodoRaiz}\n" +
-                    $"• Ruta: {string.Join(" → ", hops)}",
-                    sendResult.Success ? "Envío v2.0 .ZIP Exitoso" : "Error de Envío .ZIP v2.0",
-                    MessageBoxButtons.OK,
-                    sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                    $"• Ruta: {string.Join(" → ", hops)}";
+                string titleV2 = sendResult.Success ? "Envío v2.0 .ZIP Exitoso" : "Error de Envío .ZIP v2.0";
+                if (sendResult.Success)
+                    HologramDialog.ShowSuccess(this, msgV2, titleV2);
+                else
+                    HologramDialog.ShowError(this, msgV2, titleV2);
             }
             else
             {
@@ -2368,19 +2529,83 @@ public partial class FormDashboard : Form
                 var sendResult = await V1NetworkClient.SendZipPacketAsync(peer, zipPath, _activeRecord.PacketId);
                 RefreshNetworkGrid();
 
-                MessageBox.Show(this,
+                string msgV1 =
                     $"{sendResult.Message}\n\n" +
                     $"• Nodo Raíz: {_activeRecord.NodoRaiz}\n" +
-                    $"• Ruta Tor: {string.Join(" → ", hops)}",
-                    sendResult.Success ? "Envío v1.0 .ZIP Exitoso" : "Error de Envío .ZIP v1.0",
-                    MessageBoxButtons.OK,
-                    sendResult.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+                    $"• Ruta Tor: {string.Join(" → ", hops)}";
+                string titleV1 = sendResult.Success ? "Envío v1.0 .ZIP Exitoso" : "Error de Envío .ZIP v1.0";
+                if (sendResult.Success)
+                    HologramDialog.ShowSuccess(this, msgV1, titleV1);
+                else
+                    HologramDialog.ShowError(this, msgV1, titleV1);
             }
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"No se pudo empaquetar/enviar el .ZIP:\n{ex.Message}",
-                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            HologramDialog.ShowError(this, $"No se pudo empaquetar/enviar el .ZIP:\n{ex.Message}",
+                $"ModuloCrypto — {NodeRuntimeState.CurrentNodeId}");
+        }
+    }
+
+    private async Task RunPeriodicNetworkMonitorTickAsync()
+    {
+        if (IsDisposed) return;
+
+        try
+        {
+            if (NodeRuntimeState.IsV2)
+            {
+                var (found, skipped) = await V2NetworkClient.ScanKnownAndImmediate24Async(
+                    NodeRuntimeState.LocalIpAddress,
+                    NodeRuntimeState.LocalSubnetMask,
+                    startPort: 5000,
+                    endPort: 5020);
+
+                if (skipped || IsDisposed) return;
+
+                IntegrateDiscoveredPeers(found);
+                RefreshNetworkGrid();
+                RefreshTargetPeerCombo();
+
+                foreach (var peer in NodeRuntimeState.NetworkPeers.ToList())
+                {
+                    if (peer.IsConfirmed &&
+                        peer.HasThumbprintMismatch &&
+                        _alertedTofuMismatches.Add(peer.NodeId))
+                    {
+                        HologramDialog.ShowWarning(this,
+                            $"🚨 ALERTA DE SEGURIDAD TOFU\n\n" +
+                            $"El nodo fijado {peer.NodeId} ({peer.BaseUrl}) cambió su huella X.509:\n" +
+                            $"• Huella fijada : {peer.PinnedThumbprintSha256}\n" +
+                            $"• Nueva huella  : {peer.CertThumbprint}\n\n" +
+                            $"El nodo fue bloqueado automáticamente. Reconfirma en 'Red de Nodos' solo si el cambio es legítimo.",
+                            $"Alerta TOFU — {peer.NodeId}");
+                    }
+                }
+            }
+            else
+            {
+                foreach (var p in NodeRuntimeState.NetworkPeers.ToList())
+                {
+                    if (!string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+                        await V1NetworkClient.PingNodeAsync(p, customTimeoutMs: 420, useScanClient: true);
+                }
+
+                var foundV1 = await V1NetworkClient.ScanLanSubnetAsync(
+                    NodeRuntimeState.LocalIpAddress,
+                    NodeRuntimeState.LocalSubnetMask,
+                    startPort: 5000,
+                    endPort: 5020,
+                    quick24Only: true);
+
+                if (IsDisposed) return;
+                IntegrateDiscoveredPeers(foundV1);
+                RefreshNetworkGrid();
+                RefreshTargetPeerCombo();
+            }
+        }
+        catch
+        {
         }
     }
 

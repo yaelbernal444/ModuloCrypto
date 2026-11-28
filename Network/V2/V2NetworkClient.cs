@@ -2,6 +2,7 @@ using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
+using ModuloCrypto.Network.Shared;
 using ModuloCrypto.Security.Strategies;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -15,7 +16,7 @@ namespace ModuloCrypto.Network.V2;
 /// <summary>
 /// Cliente HTTP/HTTPS v2.0 con SocketsHttpHandler optimizado (UseProxy=false), pinning TLS SHA-256 TOFU con fallback HTTP,
 /// cabeceras obligatorias X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id, caché de perfiles GET /api/algorithms,
-/// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1) y escaneo de subred /24.
+/// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1) y escaneo de subred hasta /22 en 5000–5020.
 /// </summary>
 public static class V2NetworkClient
 {
@@ -29,6 +30,18 @@ public static class V2NetworkClient
         Timeout = TimeSpan.FromSeconds(35)
     };
 
+    private static readonly HttpClient ScanHttp = new(new SocketsHttpHandler
+    {
+        UseProxy = false,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(1),
+        ConnectTimeout = TimeSpan.FromMilliseconds(420),
+        MaxConnectionsPerServer = 64
+    })
+    {
+        Timeout = TimeSpan.FromMilliseconds(900)
+    };
+
+    private static readonly SemaphoreSlim PeriodicScanGate = new(1, 1);
     private static readonly ConcurrentDictionary<string, HttpClient> PinnedHttpsClients = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, Dictionary<string, V2AlgorithmProfileDto>> PeerAlgorithmProfiles = new(StringComparer.OrdinalIgnoreCase);
 
@@ -224,16 +237,20 @@ public static class V2NetworkClient
 
     public static async Task<(bool Online, string Latency, PeerStatusResponse? Info)> PingNodeAsync(
         PeerNode node,
-        int? customTimeoutMs = null)
+        int? customTimeoutMs = null,
+        bool useScanClient = false)
     {
+        var client = useScanClient ? ScanHttp : Http;
+        int probeTimeoutMs = customTimeoutMs ?? (useScanClient ? 420 : 1500);
+        int metadataTimeoutMs = Math.Max(1100, probeTimeoutMs);
         var sw = Stopwatch.StartNew();
         try
         {
-            using var cts = new CancellationTokenSource(customTimeoutMs ?? 1500);
+            using var cts = new CancellationTokenSource(probeTimeoutMs);
             using var req = new HttpRequestMessage(HttpMethod.Get, $"{node.BaseUrl}/api/status");
             AddStandardV2Headers(req);
 
-            var resp = await Http.SendAsync(req, cts.Token);
+            var resp = await client.SendAsync(req, cts.Token);
             sw.Stop();
 
             if (!resp.IsSuccessStatusCode)
@@ -266,8 +283,8 @@ public static class V2NetworkClient
 
             if (!node.HasThumbprintMismatch)
             {
-                await FetchAndValidatePeerCertificateAsync(node, customTimeoutMs ?? 1500);
-                await FetchPeerAlgorithmsAsync(node, customTimeoutMs ?? 1500);
+                await FetchAndValidatePeerCertificateAsync(node, metadataTimeoutMs);
+                await FetchPeerAlgorithmsAsync(node, metadataTimeoutMs);
             }
 
             AppDbContext.UpsertTrustedPeer(node);
@@ -811,24 +828,25 @@ public static class V2NetworkClient
         return (false, null, $"Tiempo de espera agotado sondeando el trabajo asíncrono {jobId}.");
     }
 
-    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5001, int endPort = 5020)
+    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5000, int endPort = 5020)
     {
         var found = new ConcurrentBag<PeerNode>();
         var ports = Enumerable.Range(startPort, Math.Max(1, endPort - startPort + 1));
 
         await Parallel.ForEachAsync(ports, async (port, _) =>
         {
+            int approxTeam = Math.Clamp(port == 5000 ? 1 : port - 5000, 1, 99);
             var probe = new PeerNode
             {
-                NodeId = $"EQ{Math.Clamp(port - 5000, 1, 99):D2}",
-                TeamNumber = Math.Clamp(port - 5000, 1, 99),
+                NodeId = $"EQ{approxTeam:D2}",
+                TeamNumber = approxTeam,
                 IpAddress = "127.0.0.1",
                 Port = port,
                 Source = "scan",
                 ProtocolType = "v2.0"
             };
 
-            var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 500);
+            var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 420, useScanClient: true);
             if (online)
             {
                 found.Add(probe);
@@ -838,31 +856,72 @@ public static class V2NetworkClient
         return found.OrderBy(p => p.Port).ToList();
     }
 
+    public static Task<(List<PeerNode> Found, bool SkippedByCooldown)> ScanLanSubnetAsync(
+        string localIp,
+        int startPort = 5000,
+        int endPort = 5020,
+        bool isAutomaticTrigger = false) =>
+        ScanLanSubnetAsync(localIp, NodeRuntimeState.LocalSubnetMask, startPort, endPort, isAutomaticTrigger);
+
     public static async Task<(List<PeerNode> Found, bool SkippedByCooldown)> ScanLanSubnetAsync(
         string localIp,
-        int startPort = 5001,
+        string? subnetMask,
+        int startPort = 5000,
         int endPort = 5020,
-        bool isAutomaticTrigger = false)
+        bool isAutomaticTrigger = false,
+        bool quick24Only = false,
+        IEnumerable<string>? priorityHosts = null)
     {
         if (isAutomaticTrigger && (DateTime.UtcNow - _lastAutoSubnetScanUtc) < AutoScanCooldown)
         {
             return (new List<PeerNode>(), true);
         }
 
-        _lastAutoSubnetScanUtc = DateTime.UtcNow;
+        if (!isAutomaticTrigger || !quick24Only)
+            _lastAutoSubnetScanUtc = DateTime.UtcNow;
+
         var found = new ConcurrentBag<PeerNode>();
+        var plan = NetworkAddressService.ComputeSubnetScanPlan(localIp, subnetMask ?? NodeRuntimeState.LocalSubnetMask);
+        var hosts = quick24Only ? plan.Immediate24Hosts : plan.SubnetHosts;
+        var scanHosts = priorityHosts?.ToList() ?? NetworkAddressService.LoadScanHosts();
 
-        string prefix = "192.168.1.";
-        var parts = (localIp ?? "").Split('.');
-        if (parts.Length == 4 && parts[0] != "127")
-            prefix = $"{parts[0]}.{parts[1]}.{parts[2]}.";
-
+        var orderedPorts = BuildOrderedScanPorts(startPort, endPort);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var targets = new List<(string Ip, int Port)>();
-        for (int host = 1; host <= 254; host++)
+
+        void AddTarget(string ip, int port)
         {
-            string ip = $"{prefix}{host}";
-            for (int port = startPort; port <= endPort; port++)
+            if (port < 1 || port > 65535) return;
+            if ((string.Equals(ip, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase) || ip == "127.0.0.1") &&
+                port == NodeRuntimeState.ApiPort)
+            {
+                return;
+            }
+            string key = $"{ip}:{port}";
+            if (seen.Add(key))
                 targets.Add((ip, port));
+        }
+
+        // 1. IPs fijas (ScanHosts) siempre primero
+        foreach (string entry in scanHosts)
+        {
+            int colon = entry.IndexOf(':');
+            if (colon > 0 && int.TryParse(entry[(colon + 1)..], out int expPort))
+            {
+                AddTarget(entry[..colon], expPort);
+            }
+            else
+            {
+                foreach (int port in orderedPorts)
+                    AddTarget(entry, port);
+            }
+        }
+
+        // 2. Rango calculado de subred (/24 inmediato primero, seguido del bloque /22 completo si aplica)
+        foreach (string ip in hosts)
+        {
+            foreach (int port in orderedPorts)
+                AddTarget(ip, port);
         }
 
         using var sem = new SemaphoreSlim(64, 64);
@@ -871,17 +930,18 @@ public static class V2NetworkClient
             await sem.WaitAsync();
             try
             {
+                int approxTeam = Math.Clamp(target.Port == 5000 ? 1 : target.Port - 5000, 1, 99);
                 var probe = new PeerNode
                 {
-                    NodeId = $"EQ{Math.Clamp(target.Port - 5000, 1, 99):D2}",
-                    TeamNumber = Math.Clamp(target.Port - 5000, 1, 99),
+                    NodeId = $"EQ{approxTeam:D2}",
+                    TeamNumber = approxTeam,
                     IpAddress = target.Ip,
                     Port = target.Port,
                     Source = "scan",
                     ProtocolType = "v2.0"
                 };
 
-                var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 500);
+                var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 400, useScanClient: true);
                 if (online)
                 {
                     found.Add(probe);
@@ -895,5 +955,124 @@ public static class V2NetworkClient
 
         await Task.WhenAll(tasks);
         return (found.OrderBy(p => p.IpAddress).ThenBy(p => p.Port).ToList(), false);
+    }
+
+    /// <summary>
+    /// Escaneo periódico ligero cada 30 segundos:
+    /// (a) nodos conocidos del directorio, (b) ScanHosts fijos y (c) /24 inmediato en puertos 5000–5020.
+    /// Además dispara el escaneo completo /22 cuando vence el cooldown >= 5 min.
+    /// </summary>
+    public static async Task<(List<PeerNode> Found, bool SkippedBecauseBusy)> ScanKnownAndImmediate24Async(
+        string localIp,
+        string? subnetMask = null,
+        int startPort = 5000,
+        int endPort = 5020)
+    {
+        if (!await PeriodicScanGate.WaitAsync(0))
+            return (new List<PeerNode>(), true);
+
+        try
+        {
+            bool runFull22ByCooldown = (DateTime.UtcNow - _lastAutoSubnetScanUtc) >= AutoScanCooldown;
+            var found = new ConcurrentBag<PeerNode>();
+            var plan = NetworkAddressService.ComputeSubnetScanPlan(localIp, subnetMask ?? NodeRuntimeState.LocalSubnetMask);
+            var scanHosts = NetworkAddressService.LoadScanHosts();
+            var orderedPorts = BuildOrderedScanPorts(startPort, endPort);
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var targets = new List<(string Ip, int Port)>();
+
+            void AddTarget(string ip, int port)
+            {
+                if (string.IsNullOrWhiteSpace(ip) || port < 1 || port > 65535) return;
+                if ((string.Equals(ip, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase) || ip == "127.0.0.1") &&
+                    port == NodeRuntimeState.ApiPort)
+                {
+                    return;
+                }
+                string key = $"{ip}:{port}";
+                if (seen.Add(key))
+                    targets.Add((ip, port));
+            }
+
+            // (a) Nodos ya conocidos en el directorio
+            foreach (var p in NodeRuntimeState.NetworkPeers.ToList())
+            {
+                if (!string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+                    AddTarget(p.IpAddress, p.Port);
+            }
+
+            // (b) ScanHosts fijos
+            foreach (string entry in scanHosts)
+            {
+                int colon = entry.IndexOf(':');
+                if (colon > 0 && int.TryParse(entry[(colon + 1)..], out int expPort))
+                {
+                    AddTarget(entry[..colon], expPort);
+                }
+                else
+                {
+                    foreach (int port in orderedPorts)
+                        AddTarget(entry, port);
+                }
+            }
+
+            // (c) Bloque /24 inmediato (o /22 completo si ya venció el enfriamiento de 5 min)
+            var subnetList = runFull22ByCooldown ? plan.SubnetHosts : plan.Immediate24Hosts;
+            if (runFull22ByCooldown)
+                _lastAutoSubnetScanUtc = DateTime.UtcNow;
+
+            foreach (string ip in subnetList)
+            {
+                foreach (int port in orderedPorts)
+                    AddTarget(ip, port);
+            }
+
+            using var sem = new SemaphoreSlim(64, 64);
+            var tasks = targets.Select(async target =>
+            {
+                await sem.WaitAsync();
+                try
+                {
+                    int approxTeam = Math.Clamp(target.Port == 5000 ? 1 : target.Port - 5000, 1, 99);
+                    var probe = new PeerNode
+                    {
+                        NodeId = $"EQ{approxTeam:D2}",
+                        TeamNumber = approxTeam,
+                        IpAddress = target.Ip,
+                        Port = target.Port,
+                        Source = "scan",
+                        ProtocolType = "v2.0"
+                    };
+
+                    var (online, _, _) = await PingNodeAsync(probe, customTimeoutMs: 400, useScanClient: true);
+                    if (online)
+                        found.Add(probe);
+                }
+                finally
+                {
+                    sem.Release();
+                }
+            });
+
+            await Task.WhenAll(tasks);
+            return (found.OrderBy(p => p.IpAddress).ThenBy(p => p.Port).ToList(), false);
+        }
+        finally
+        {
+            PeriodicScanGate.Release();
+        }
+    }
+
+    private static List<int> BuildOrderedScanPorts(int startPort, int endPort)
+    {
+        int s = Math.Min(startPort, endPort);
+        int e = Math.Max(startPort, endPort);
+        var list = new List<int>(e - s + 1);
+        for (int p = 5001; p <= 5008; p++)
+            if (p >= s && p <= e) list.Add(p);
+        for (int p = s; p <= e; p++)
+            if (!list.Contains(p)) list.Add(p);
+        return list;
     }
 }

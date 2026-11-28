@@ -1,5 +1,6 @@
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
+using ModuloCrypto.Network.Shared;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
@@ -9,18 +10,31 @@ namespace ModuloCrypto.Network.V1;
 
 /// <summary>
 /// Cliente HTTP de la Versión 1.0 (Legado ModuloCrypto + compatibilidad CentroCiberseguridad.Web v1).
-/// Usa SocketsHttpHandler optimizado, ping dual (/api/health y /api/status), envío dual (/api/packets/receive y /api/requests/receive),
-/// escaneo LAN /24 en la subred de la IP activa, escaneo localhost 5000–5008 y RequestRemoteKeyAsync.
+/// Usa SocketsHttpHandler optimizado (UseProxy = false), ping dual (/api/health y /api/status),
+/// envío dual (/api/packets/receive y /api/requests/receive), escaneo LAN hasta /22 + ScanHosts en 5000–5020,
+/// escaneo localhost 5000–5020 y RequestRemoteKeyAsync.
 /// </summary>
 public static class V1NetworkClient
 {
     private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
+        UseProxy = false,
         PooledConnectionLifetime = TimeSpan.FromMinutes(2),
         ConnectTimeout = TimeSpan.FromSeconds(3)
     })
     {
         Timeout = TimeSpan.FromSeconds(10)
+    };
+
+    private static readonly HttpClient ScanHttp = new(new SocketsHttpHandler
+    {
+        UseProxy = false,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(1),
+        ConnectTimeout = TimeSpan.FromMilliseconds(420),
+        MaxConnectionsPerServer = 64
+    })
+    {
+        Timeout = TimeSpan.FromMilliseconds(900)
     };
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -30,13 +44,16 @@ public static class V1NetworkClient
 
     public static async Task<(bool Online, string Latency, V1NodeHealthResponse? Info)> PingNodeAsync(
         PeerNode node,
-        int? customTimeoutMs = null)
+        int? customTimeoutMs = null,
+        bool useScanClient = false)
     {
+        var client = useScanClient ? ScanHttp : Http;
+        int timeoutMs = customTimeoutMs ?? (useScanClient ? 420 : 2000);
         var sw = Stopwatch.StartNew();
         try
         {
-            using var cts = new CancellationTokenSource(customTimeoutMs ?? 2000);
-            var resp = await Http.GetAsync($"{node.BaseUrl}/api/health", cts.Token);
+            using var cts = new CancellationTokenSource(timeoutMs);
+            var resp = await client.GetAsync($"{node.BaseUrl}/api/health", cts.Token);
             if (resp.IsSuccessStatusCode)
             {
                 sw.Stop();
@@ -54,8 +71,8 @@ public static class V1NetworkClient
 
         try
         {
-            using var cts2 = new CancellationTokenSource(customTimeoutMs ?? 2000);
-            var resp2 = await Http.GetAsync($"{node.BaseUrl}/api/status", cts2.Token);
+            using var cts2 = new CancellationTokenSource(timeoutMs);
+            var resp2 = await client.GetAsync($"{node.BaseUrl}/api/status", cts2.Token);
             sw.Stop();
             if (resp2.IsSuccessStatusCode)
             {
@@ -146,7 +163,7 @@ public static class V1NetworkClient
         return (false, $"No se pudo entregar el paquete a {targetPeer.BaseUrl}.\nDetalle: {lastError}");
     }
 
-    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5000, int endPort = 5008)
+    public static async Task<List<PeerNode>> ScanLocalhostPortsAsync(int startPort = 5000, int endPort = 5020)
     {
         var found = new ConcurrentBag<PeerNode>();
         var ports = Enumerable.Range(startPort, Math.Max(1, endPort - startPort + 1));
@@ -155,14 +172,14 @@ public static class V1NetworkClient
         {
             var probe = new PeerNode
             {
-                NodeId = $"NODO-{Math.Clamp(port - 4999, 1, 99):D2}",
+                NodeId = $"NODO-{Math.Clamp(port == 5000 ? 1 : port - 4999, 1, 99):D2}",
                 IpAddress = "127.0.0.1",
                 Port = port,
                 ProtocolType = "v1.0",
                 Source = "scan"
             };
 
-            var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 700);
+            var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 420, useScanClient: true);
             if (online)
             {
                 probe.LastLatency = latency;
@@ -175,54 +192,88 @@ public static class V1NetworkClient
         return found.OrderBy(p => p.Port).ToList();
     }
 
-    public static async Task<List<PeerNode>> ScanLanSubnetAsync(string localIp, int port = 5000)
+    public static Task<List<PeerNode>> ScanLanSubnetAsync(string localIp, int port) =>
+        ScanLanSubnetAsync(localIp, NodeRuntimeState.LocalSubnetMask, port, port, quick24Only: true);
+
+    public static async Task<List<PeerNode>> ScanLanSubnetAsync(
+        string localIp,
+        string? subnetMask = null,
+        int startPort = 5000,
+        int endPort = 5020,
+        bool quick24Only = false,
+        IEnumerable<string>? priorityHosts = null)
     {
         var found = new ConcurrentBag<PeerNode>();
-        string prefix = "192.168.1.";
+        var plan = NetworkAddressService.ComputeSubnetScanPlan(localIp, subnetMask ?? NodeRuntimeState.LocalSubnetMask);
+        var hostList = quick24Only ? plan.Immediate24Hosts : plan.SubnetHosts;
+        var scanHosts = priorityHosts?.ToList() ?? NetworkAddressService.LoadScanHosts();
 
-        var parts = (localIp ?? "").Split('.');
-        if (parts.Length == 4 && parts[0] != "127")
-            prefix = $"{parts[0]}.{parts[1]}.{parts[2]}.";
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var targets = new List<(string Ip, int Port)>();
 
-        using var sem = new SemaphoreSlim(48);
-        var tasks = new List<Task>(254);
-
-        for (int host = 1; host <= 254; host++)
+        void AddTarget(string ip, int port)
         {
-            string ip = $"{prefix}{host}";
-            int capturedHost = host;
-            tasks.Add(Task.Run(async () =>
-            {
-                await sem.WaitAsync();
-                try
-                {
-                    var probe = new PeerNode
-                    {
-                        NodeId = $"LAN-{capturedHost}",
-                        IpAddress = ip,
-                        Port = port,
-                        ProtocolType = "v1.0",
-                        Source = "scan"
-                    };
-
-                    var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 600);
-                    if (online)
-                    {
-                        probe.LastLatency = latency;
-                        if (info != null && !string.IsNullOrWhiteSpace(info.NodeId))
-                            probe.NodeId = info.NodeId.Trim().ToUpperInvariant();
-                        found.Add(probe);
-                    }
-                }
-                finally
-                {
-                    sem.Release();
-                }
-            }));
+            if (port < 1 || port > 65535) return;
+            if ((string.Equals(ip, NodeRuntimeState.LocalIpAddress, StringComparison.OrdinalIgnoreCase) || ip == "127.0.0.1") &&
+                port == NodeRuntimeState.ApiPort)
+                return;
+            string key = $"{ip}:{port}";
+            if (seen.Add(key))
+                targets.Add((ip, port));
         }
 
+        foreach (string entry in scanHosts)
+        {
+            int colon = entry.IndexOf(':');
+            if (colon > 0 && int.TryParse(entry[(colon + 1)..], out int expPort))
+            {
+                AddTarget(entry[..colon], expPort);
+            }
+            else
+            {
+                for (int port = startPort; port <= endPort; port++)
+                    AddTarget(entry, port);
+            }
+        }
+
+        foreach (string ip in hostList)
+        {
+            for (int port = startPort; port <= endPort; port++)
+                AddTarget(ip, port);
+        }
+
+        using var sem = new SemaphoreSlim(64, 64);
+        var tasks = targets.Select(async target =>
+        {
+            await sem.WaitAsync();
+            try
+            {
+                var probe = new PeerNode
+                {
+                    NodeId = $"NODO-{Math.Clamp(target.Port == 5000 ? 1 : target.Port - 4999, 1, 99):D2}",
+                    IpAddress = target.Ip,
+                    Port = target.Port,
+                    ProtocolType = "v1.0",
+                    Source = "scan"
+                };
+
+                var (online, latency, info) = await PingNodeAsync(probe, customTimeoutMs: 420, useScanClient: true);
+                if (online)
+                {
+                    probe.LastLatency = latency;
+                    if (info != null && !string.IsNullOrWhiteSpace(info.NodeId))
+                        probe.NodeId = info.NodeId.Trim().ToUpperInvariant();
+                    found.Add(probe);
+                }
+            }
+            finally
+            {
+                sem.Release();
+            }
+        });
+
         await Task.WhenAll(tasks);
-        return found.OrderBy(p => p.IpAddress).ToList();
+        return found.OrderBy(p => p.IpAddress).ThenBy(p => p.Port).ToList();
     }
 
     public static async Task<V1RemoteDecryptResponse> RequestRemoteKeyAsync(string remoteDecryptUrl)

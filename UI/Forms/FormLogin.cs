@@ -433,6 +433,12 @@ public sealed class FormLogin : Form
         }
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        HologramTheme.ApplyDarkTitleBar(this);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
