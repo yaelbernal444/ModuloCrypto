@@ -35,6 +35,7 @@ public static class ConnectivityDiagnostics
 {
     private static readonly HttpClient DiagHttp = new(new SocketsHttpHandler
     {
+        UseProxy = false,
         PooledConnectionLifetime = TimeSpan.FromMinutes(2),
         ConnectTimeout = TimeSpan.FromSeconds(2)
     })

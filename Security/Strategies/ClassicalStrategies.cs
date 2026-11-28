@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -38,10 +39,43 @@ public sealed class CaesarStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte shift = Convert.FromBase64String(secretKeyBase64)[0];
+        string alphabet = "BYTE";
+        if (!string.IsNullOrWhiteSpace(publicParametersJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(publicParametersJson);
+                if (KeyInputParser.TryGetJsonString(doc.RootElement, out string parsedAlphabet, "alphabet", "space", "mode"))
+                    alphabet = parsedAlphabet.Trim();
+            }
+            catch { }
+        }
+
+        if (!KeyInputParser.TryParseIntegerKey(secretKeyBase64, out int rawShift))
+            throw new CryptographicException("Llave César inválida: se esperaba un desplazamiento entero o Base64 de 1/4 bytes.");
+
         byte[] plain = new byte[cipherBytes.Length];
-        for (int i = 0; i < cipherBytes.Length; i++)
-            plain[i] = (byte)((cipherBytes[i] - shift + 256) & 0xFF);
+        if (string.Equals(alphabet, "A-Z", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(alphabet, "AZ", StringComparison.OrdinalIgnoreCase))
+        {
+            int s = ((rawShift % 26) + 26) % 26;
+            for (int i = 0; i < cipherBytes.Length; i++)
+            {
+                byte b = cipherBytes[i];
+                if (b is >= (byte)'A' and <= (byte)'Z')
+                    plain[i] = (byte)('A' + ((b - 'A' - s + 26) % 26));
+                else if (b is >= (byte)'a' and <= (byte)'z')
+                    plain[i] = (byte)('a' + ((b - 'a' - s + 26) % 26));
+                else
+                    plain[i] = b;
+            }
+        }
+        else
+        {
+            int shift = ((rawShift % 256) + 256) % 256;
+            for (int i = 0; i < cipherBytes.Length; i++)
+                plain[i] = (byte)((cipherBytes[i] - shift + 256) & 0xFF);
+        }
 
         return new CryptoOperationResult
         {
@@ -49,7 +83,7 @@ public sealed class CaesarStrategy : ICryptoStrategy
             OutputBytes = plain,
             SecretKeyBase64 = secretKeyBase64,
             PublicParametersJson = publicParametersJson,
-            Summary = $"Cifrado César descifrado ({plain.Length} bytes)."
+            Summary = $"Cifrado César descifrado ({plain.Length} bytes, {alphabet})."
         };
     }
 }
@@ -87,18 +121,86 @@ public sealed class VigenereStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] key = Convert.FromBase64String(secretKeyBase64);
+        string alphabet = "BYTE";
+        int? keyLength = null;
+        if (!string.IsNullOrWhiteSpace(publicParametersJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(publicParametersJson);
+                if (KeyInputParser.TryGetJsonString(doc.RootElement, out string parsedAlphabet, "alphabet", "space", "mode"))
+                    alphabet = parsedAlphabet.Trim();
+                if (KeyInputParser.TryGetJsonInt(doc.RootElement, out int kl, "keyLength"))
+                {
+                    if (kl > 0) keyLength = kl;
+                }
+            }
+            catch { }
+        }
+
         byte[] plain = new byte[cipherBytes.Length];
-        for (int i = 0; i < cipherBytes.Length; i++)
-            plain[i] = (byte)((cipherBytes[i] - key[i % key.Length] + 256) & 0xFF);
+        if (string.Equals(alphabet, "A-Z", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(alphabet, "AZ", StringComparison.OrdinalIgnoreCase))
+        {
+            string trimmed = (secretKeyBase64 ?? string.Empty).Trim();
+            byte[] keySource = KeyInputParser.HasExplicitBase64Markers(trimmed) &&
+                               KeyInputParser.TryDecodeBase64Strict(trimmed, out var decodedAz)
+                ? decodedAz
+                : Encoding.UTF8.GetBytes(trimmed);
+
+            var shifts = new List<int>(keySource.Length);
+            foreach (byte kb in keySource)
+            {
+                if (kb is >= (byte)'A' and <= (byte)'Z') shifts.Add(kb - 'A');
+                else if (kb is >= (byte)'a' and <= (byte)'z') shifts.Add(kb - 'a');
+            }
+
+            if (shifts.Count == 0)
+                throw new CryptographicException("Llave Vigenère inválida para alfabeto A-Z.");
+
+            int kIdx = 0;
+            for (int i = 0; i < cipherBytes.Length; i++)
+            {
+                byte b = cipherBytes[i];
+                if (b is >= (byte)'A' and <= (byte)'Z')
+                {
+                    int s = shifts[kIdx % shifts.Count];
+                    kIdx++;
+                    plain[i] = (byte)('A' + ((b - 'A' - s + 26) % 26));
+                }
+                else if (b is >= (byte)'a' and <= (byte)'z')
+                {
+                    int s = shifts[kIdx % shifts.Count];
+                    kIdx++;
+                    plain[i] = (byte)('a' + ((b - 'a' - s + 26) % 26));
+                }
+                else
+                {
+                    plain[i] = b;
+                }
+            }
+        }
+        else
+        {
+            byte[] key = KeyInputParser.ParseRawOrTextKey(
+                secretKeyBase64,
+                expectedBytes: keyLength,
+                preferBase64WithoutPadding: keyLength.HasValue && keyLength.Value >= 16);
+
+            if (key.Length == 0)
+                throw new CryptographicException("Llave Vigenère vacía o inválida.");
+
+            for (int i = 0; i < cipherBytes.Length; i++)
+                plain[i] = (byte)((cipherBytes[i] - key[i % key.Length] + 256) & 0xFF);
+        }
 
         return new CryptoOperationResult
         {
             AlgorithmCode = Info.Code,
             OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
+            SecretKeyBase64 = secretKeyBase64 ?? string.Empty,
             PublicParametersJson = publicParametersJson,
-            Summary = $"Vigenère descifrado ({plain.Length} bytes)."
+            Summary = $"Vigenère descifrado ({plain.Length} bytes, {alphabet})."
         };
     }
 }
@@ -134,19 +236,71 @@ public sealed class XorAsmStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        using var doc = JsonDocument.Parse(publicParametersJson);
-        byte[] key = Convert.FromBase64String(secretKeyBase64);
-        byte[] iv = Convert.FromBase64String(doc.RootElement.GetProperty("iv").GetString()!);
-        byte[] plain = Transform(cipherBytes, key, iv);
-
-        return new CryptoOperationResult
+        JsonDocument? doc = null;
+        try
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
-            PublicParametersJson = publicParametersJson,
-            Summary = $"XORASM revertido con éxito ({plain.Length} bytes)."
-        };
+            if (!string.IsNullOrWhiteSpace(publicParametersJson))
+                doc = JsonDocument.Parse(publicParametersJson);
+
+            byte[] plain;
+            if (doc != null &&
+                KeyInputParser.TryGetJsonString(doc.RootElement, out string ivStr, "iv", "ivBase64", "nonce") &&
+                !string.IsNullOrWhiteSpace(ivStr))
+            {
+                if (!KeyInputParser.TryDecodeBase64OrHex(ivStr, out byte[] iv) || iv.Length < 8)
+                    throw new CryptographicException("IV de XORASM inválido o corrupto.");
+
+                byte[] nativeKey = KeyInputParser.ResolveFixedLengthKey(secretKeyBase64, 16, "XORASM");
+                plain = Transform(cipherBytes, nativeKey, iv);
+            }
+            else
+            {
+                string rotation = "NONE";
+                int rotationBits = 0;
+                int? expectedKeyLen = null;
+
+                if (doc != null)
+                {
+                    if (KeyInputParser.TryGetJsonString(doc.RootElement, out string rot, "rotation", "rotateDirection", "op"))
+                        rotation = rot.Trim().ToUpperInvariant();
+                    if (KeyInputParser.TryGetJsonInt(doc.RootElement, out int rBits, "rotationBits", "rotBits", "bits"))
+                        rotationBits = rBits;
+                    if (KeyInputParser.TryGetJsonInt(doc.RootElement, out int kl, "keyLength"))
+                        expectedKeyLen = kl > 0 ? kl : null;
+                }
+
+                byte[] key = KeyInputParser.ParseRawOrTextKey(secretKeyBase64, expectedBytes: expectedKeyLen);
+                if (key.Length == 0)
+                    throw new CryptographicException("Llave XORASM vacía o inválida.");
+
+                int r = ((rotationBits % 8) + 8) % 8;
+                plain = new byte[cipherBytes.Length];
+                for (int i = 0; i < cipherBytes.Length; i++)
+                {
+                    byte b = cipherBytes[i];
+                    byte unrotated = rotation switch
+                    {
+                        "ROL" when r > 0 => (byte)(((b >> r) | (b << (8 - r))) & 0xFF),
+                        "ROR" when r > 0 => (byte)(((b << r) | (b >> (8 - r))) & 0xFF),
+                        _ => b
+                    };
+                    plain[i] = (byte)(unrotated ^ key[i % key.Length]);
+                }
+            }
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                OutputBytes = plain,
+                SecretKeyBase64 = secretKeyBase64,
+                PublicParametersJson = publicParametersJson,
+                Summary = $"XORASM revertido con éxito ({plain.Length} bytes)."
+            };
+        }
+        finally
+        {
+            doc?.Dispose();
+        }
     }
 
     private static byte[] Transform(byte[] data, byte[] key, byte[] iv)
@@ -201,14 +355,44 @@ public sealed class EuclidesAffineStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] key = Convert.FromBase64String(secretKeyBase64);
-        int a = key[0];
-        int b = key[1];
-        int aInv = ModInverse(a, 256);
+        int modulus = 256;
+        if (!string.IsNullOrWhiteSpace(publicParametersJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(publicParametersJson);
+                if (KeyInputParser.TryGetJsonInt(doc.RootElement, out int parsedMod, "modulus", "m") && parsedMod > 1)
+                    modulus = parsedMod;
+            }
+            catch { }
+        }
+
+        if (!TryParseAffineKey(secretKeyBase64, out int a, out int b))
+            throw new CryptographicException("Llave Afín inválida: usa formato \"a,b\", JSON {\"a\":...,\"b\":...} o Base64 de 3 bytes.");
+
+        a = ((a % modulus) + modulus) % modulus;
+        b = ((b % modulus) + modulus) % modulus;
+        int aInv = ModInverse(a, modulus);
 
         byte[] plain = new byte[cipherBytes.Length];
-        for (int i = 0; i < cipherBytes.Length; i++)
-            plain[i] = (byte)((aInv * ((cipherBytes[i] - b + 256) & 0xFF)) & 0xFF);
+        if (modulus == 26)
+        {
+            for (int i = 0; i < cipherBytes.Length; i++)
+            {
+                byte ch = cipherBytes[i];
+                if (ch is >= (byte)'A' and <= (byte)'Z')
+                    plain[i] = (byte)('A' + ((aInv * (((ch - 'A') - b + 26) % 26)) % 26));
+                else if (ch is >= (byte)'a' and <= (byte)'z')
+                    plain[i] = (byte)('a' + ((aInv * (((ch - 'a') - b + 26) % 26)) % 26));
+                else
+                    plain[i] = ch;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < cipherBytes.Length; i++)
+                plain[i] = (byte)((aInv * (((cipherBytes[i] - b) % modulus + modulus) % modulus)) % modulus);
+        }
 
         return new CryptoOperationResult
         {
@@ -216,21 +400,64 @@ public sealed class EuclidesAffineStrategy : ICryptoStrategy
             OutputBytes = plain,
             SecretKeyBase64 = secretKeyBase64,
             PublicParametersJson = publicParametersJson,
-            Summary = $"Afín descifrado con inverso modular a^-1={aInv} ({plain.Length} bytes)."
+            Summary = $"Afín descifrado con inverso modular a^-1={aInv} mod {modulus} ({plain.Length} bytes)."
         };
+    }
+
+    private static bool TryParseAffineKey(string? input, out int a, out int b)
+    {
+        a = 0;
+        b = 0;
+        if (string.IsNullOrWhiteSpace(input)) return false;
+
+        string trimmed = input.Trim();
+        if (trimmed.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(trimmed);
+                if (KeyInputParser.TryGetJsonInt(doc.RootElement, out a, "a") &&
+                    KeyInputParser.TryGetJsonInt(doc.RootElement, out b, "b"))
+                {
+                    return true;
+                }
+            }
+            catch { }
+        }
+
+        var parts = trimmed.Split(new[] { ',', ';', ':', ' ', '\t', '|', '/' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2)
+        {
+            string p0 = parts[0].StartsWith("a=", StringComparison.OrdinalIgnoreCase) ? parts[0][2..] : parts[0];
+            string p1 = parts[1].StartsWith("b=", StringComparison.OrdinalIgnoreCase) ? parts[1][2..] : parts[1];
+            if (int.TryParse(p0, NumberStyles.Integer, CultureInfo.InvariantCulture, out a) &&
+                int.TryParse(p1, NumberStyles.Integer, CultureInfo.InvariantCulture, out b))
+            {
+                return true;
+            }
+        }
+
+        if (KeyInputParser.TryDecodeBase64OrHex(trimmed, out byte[] raw) && raw.Length >= 2)
+        {
+            a = raw[0];
+            b = raw[1];
+            return true;
+        }
+
+        return false;
     }
 
     private static int ModInverse(int a, int m)
     {
         int t = 0, newT = 1;
-        int r = m, newR = a;
+        int r = m, newR = ((a % m) + m) % m;
         while (newR != 0)
         {
             int q = r / newR;
             (t, newT) = (newT, t - q * newT);
             (r, newR) = (newR, r - q * newR);
         }
-        if (r > 1) throw new CryptographicException("No existe inverso modular.");
+        if (r != 1) throw new CryptographicException($"No existe inverso modular para a={a} mod {m} (gcd={r}).");
         if (t < 0) t += m;
         return t;
     }
@@ -270,7 +497,10 @@ public sealed class FisherYatesStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] seed = Convert.FromBase64String(secretKeyBase64);
+        byte[] seed = KeyInputParser.ParseRawOrTextKey(secretKeyBase64, expectedBytes: 32, preferBase64WithoutPadding: true);
+        if (seed.Length == 0)
+            throw new CryptographicException("Semilla Fisher-Yates vacía o inválida.");
+
         int[] perm = BuildPermutation(cipherBytes.Length, seed);
         byte[] plain = new byte[cipherBytes.Length];
         for (int i = 0; i < cipherBytes.Length; i++)
@@ -362,7 +592,10 @@ public sealed class LorenzSz40Strategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] keySeed = Convert.FromBase64String(secretKeyBase64);
+        byte[] keySeed = KeyInputParser.ParseRawOrTextKey(secretKeyBase64, expectedBytes: 24, preferBase64WithoutPadding: true);
+        if (keySeed.Length == 0)
+            throw new CryptographicException("Semilla Lorenz SZ40/42 vacía o inválida.");
+
         byte[] plain = ApplyLorenzStream(cipherBytes, keySeed);
 
         return new CryptoOperationResult

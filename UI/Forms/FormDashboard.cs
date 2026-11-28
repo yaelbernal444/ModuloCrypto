@@ -7,6 +7,7 @@ using ModuloCrypto.Network.Shared;
 using ModuloCrypto.Network.V1;
 using ModuloCrypto.Network.V2;
 using ModuloCrypto.Security;
+using ModuloCrypto.Security.Strategies;
 using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Theme;
 using System.Diagnostics;
@@ -55,6 +56,7 @@ public partial class FormDashboard : Form
     // Dashboard / Crypto Stage Controls
     private HologramLockControl _hologram = null!;
     private Label _lblFileBadge = null!;
+    private Label _lblVerificationBanner = null!;
     private TextBox _txtPassphrase = null!;
     private TextBox _txtDataViewer = null!;
     private PictureBox _picImageViewer = null!;
@@ -651,7 +653,7 @@ public partial class FormDashboard : Form
             Dock = DockStyle.Fill,
             Margin = new Padding(4)
         };
-        btnEncrypt.Click += (_, _) => HandleEncryptAction(asIntermediateHop: false);
+        btnEncrypt.Click += async (_, _) => await HandleEncryptActionAsync(asIntermediateHop: false);
 
         var btnDecryptLocal = new NeonButton
         {
@@ -673,7 +675,7 @@ public partial class FormDashboard : Form
             Dock = DockStyle.Fill,
             Margin = new Padding(4)
         };
-        btnRelayEncrypt.Click += (_, _) => HandleEncryptAction(asIntermediateHop: true);
+        btnRelayEncrypt.Click += async (_, _) => await HandleEncryptActionAsync(asIntermediateHop: true);
 
         var btnSendZip = new NeonButton
         {
@@ -856,8 +858,19 @@ public partial class FormDashboard : Form
             Visible = false
         };
 
+        _lblVerificationBanner = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 44,
+            Visible = false,
+            Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
+            Padding = new Padding(12, 4, 12, 4),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
         viewerBody.Controls.Add(_txtDataViewer);
         viewerBody.Controls.Add(_picImageViewer);
+        viewerBody.Controls.Add(_lblVerificationBanner);
 
         viewerCard.Controls.Add(viewerBody);
         viewerCard.Controls.Add(fileActionsBar);
@@ -1094,6 +1107,7 @@ public partial class FormDashboard : Form
         _binarySummaryReport = null;
 
         ClearRelayContext();
+        HideVerificationBanner();
 
         _hologram.SetIdle(string.Empty);
 
@@ -1189,6 +1203,28 @@ public partial class FormDashboard : Form
         }
     }
 
+    private void ShowVerificationBanner(bool valid, string? detail)
+    {
+        if (_lblVerificationBanner == null) return;
+        string cleanDetail = string.IsNullOrWhiteSpace(detail)
+            ? (valid ? "VERIFICACIÓN VÁLIDA — integridad autenticada." : "VERIFICACIÓN INVÁLIDA — resumen/MAC no coincide.")
+            : detail.Trim();
+
+        _lblVerificationBanner.Text = (valid ? "✔ " : "✖ ") + cleanDetail;
+        _lblVerificationBanner.BackColor = valid ? Color.FromArgb(14, 58, 42) : Color.FromArgb(61, 20, 28);
+        _lblVerificationBanner.ForeColor = valid ? HologramTheme.Success : HologramTheme.Danger;
+        _lblVerificationBanner.Visible = true;
+    }
+
+    private void HideVerificationBanner()
+    {
+        if (_lblVerificationBanner != null)
+        {
+            _lblVerificationBanner.Visible = false;
+            _lblVerificationBanner.Text = string.Empty;
+        }
+    }
+
     private void ClearRelayContext()
     {
         _relayProducerNode = null;
@@ -1199,14 +1235,164 @@ public partial class FormDashboard : Form
         _relayHopHistory = null;
     }
 
-    private void HandleEncryptAction(bool asIntermediateHop)
+    private async Task HandleEncryptActionAsync(bool asIntermediateHop)
     {
         if (_cmbAlgorithm.SelectedItem is not CryptoAlgorithmInfo algInfo) return;
 
         try
         {
+            HideVerificationBanner();
+
             if (_viewerMode == "TEXT" && !_isShowingEncrypted && _binarySummaryReport == null)
                 _currentBytes = Encoding.UTF8.GetBytes(_txtDataViewer.Text);
+
+            if (NodeRuntimeState.IsV2 &&
+                !asIntermediateHop &&
+                !NodeRuntimeState.OwnedAlgorithms.Contains(algInfo.Code, StringComparer.OrdinalIgnoreCase))
+            {
+                var ownerPeer = ResolveBestPeerForAlgorithm(algInfo.Code);
+                if (ownerPeer != null && ownerPeer.IsOnline && ownerPeer.IsConfirmed && !ownerPeer.HasThumbprintMismatch)
+                {
+                    var askDelegate = MessageBox.Show(this,
+                        $"El algoritmo {algInfo.Code} pertenece al nodo remoto {ownerPeer.NodeId} ({ownerPeer.BaseUrl}), que está ONLINE y confirmado (TOFU).\n\n" +
+                        $"• Pulsa [Sí] para DELEGAR el cifrado remoto a {ownerPeer.NodeId} (POST /api/crypto/forward).\n" +
+                        $"• Pulsa [No] para ejecutar el cifrado localmente en {NodeRuntimeState.CurrentNodeId}.",
+                        $"Delegación Criptográfica v2.0 — {algInfo.Code}",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question);
+
+                    if (askDelegate == DialogResult.Yes)
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        V2AlgorithmProfileDto? profile = null;
+                        try
+                        {
+                            profile = await V2NetworkClient.GetOrFetchPeerAlgorithmProfileAsync(ownerPeer, algInfo.Code, 1500);
+                        }
+                        finally
+                        {
+                            Cursor = Cursors.Default;
+                        }
+
+                        var modalRes = PromptV2SecretsModal(
+                            algInfo.Code,
+                            operation: "forward",
+                            producerNode: ownerPeer.NodeId,
+                            sourceNode: NodeRuntimeState.CurrentNodeId,
+                            sigValid: true,
+                            profile: profile,
+                            pubParams: null,
+                            prefillSecret: _txtPassphrase.Text);
+
+                        if (modalRes == null)
+                            return;
+
+                        Cursor = Cursors.WaitCursor;
+                        (bool Success, V2CryptoForwardResponse? Response, string ErrorMessage) fwd;
+                        try
+                        {
+                            fwd = await V2NetworkClient.CallRemoteForwardAsync(
+                                ownerPeer,
+                                algInfo.Code,
+                                _currentBytes,
+                                _currentFileName,
+                                _currentExtension,
+                                keySizeBits: 256,
+                                secretsDictionary: modalRes.SecretsDictionary,
+                                options: modalRes.Options);
+                        }
+                        finally
+                        {
+                            Cursor = Cursors.Default;
+                        }
+
+                        if (!fwd.Success || fwd.Response == null)
+                        {
+                            MessageBox.Show(this,
+                                $"El nodo {ownerPeer.NodeId} rechazó la delegación remota ({algInfo.Code}):\n{fwd.ErrorMessage}",
+                                "Delegación Remota v2.0",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                            return;
+                        }
+
+                        var fwdResp = fwd.Response;
+                        byte[] outBytes = _currentBytes;
+                        if (!string.IsNullOrWhiteSpace(fwdResp.CiphertextBase64) &&
+                            KeyInputParser.TryDecodeFlexibleBase64(fwdResp.CiphertextBase64, out byte[] decodedOut))
+                        {
+                            outBytes = decodedOut;
+                        }
+
+                        string storedSecret = modalRes.LocalSecretKeyString;
+                        if (string.IsNullOrWhiteSpace(storedSecret) && fwdResp.SecretKeyEnvelope != null)
+                        {
+                            try
+                            {
+                                var opened = V2EnvelopeService.OpenSecretsDictionary(
+                                    fwdResp.SecretKeyEnvelope,
+                                    fwdResp.RequestId,
+                                    fallbackPacketId: fwdResp.PacketId);
+                                if (opened.TryGetValue("key", out var kVal) && !string.IsNullOrWhiteSpace(kVal))
+                                    storedSecret = kVal;
+                                else if (opened.Count > 0)
+                                    storedSecret = opened.Values.First();
+                            }
+                            catch { }
+                        }
+
+                        string effProducer = !string.IsNullOrWhiteSpace(fwdResp.ProducerNode)
+                            ? fwdResp.ProducerNode.Trim().ToUpperInvariant()
+                            : ownerPeer.NodeId;
+                        string effPacketId = !string.IsNullOrWhiteSpace(fwdResp.PacketId)
+                            ? fwdResp.PacketId
+                            : Guid.NewGuid().ToString("D").ToLowerInvariant();
+                        string effKeyRef = !string.IsNullOrWhiteSpace(fwdResp.KeyRef?.KeyId)
+                            ? fwdResp.KeyRef.KeyId
+                            : BuildDefaultKeyLink(effPacketId);
+                        string remotePubJson = JsonSerializer.Serialize(fwdResp.PublicParameters);
+                        var remoteHops = new List<string> { effProducer };
+                        if (!string.Equals(effProducer, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+                            remoteHops.Add(NodeRuntimeState.CurrentNodeId);
+
+                        var remoteReg = new RegistroCifrado
+                        {
+                            UsuarioId = _currentUser.Id,
+                            PacketId = effPacketId,
+                            NombreArchivo = _currentFileName,
+                            Extension = _currentExtension,
+                            BytesCifrados = Convert.ToBase64String(outBytes),
+                            AlgoritmoCodigo = algInfo.Code,
+                            ParametrosPublicosJson = remotePubJson,
+                            LlaveSecretaBase64 = storedSecret,
+                            LinkDescifradoRemoto = effKeyRef,
+                            NodoRaiz = effProducer,
+                            FirmaRaizBase64 = SignBytesCurrentVersion(outBytes),
+                            RutaSaltosJson = JsonSerializer.Serialize(remoteHops),
+                            Origen = "Remoto",
+                            FechaOperacion = DateTime.Now
+                        };
+
+                        using (var db = new AppDbContext())
+                        {
+                            db.RegistrosCifrados.Add(remoteReg);
+                            db.SaveChanges();
+                        }
+
+                        _activeRecord = remoteReg;
+                        _currentBytes = outBytes;
+                        _isShowingEncrypted = true;
+                        _binarySummaryReport = null;
+                        _lastSavedDecryptedPath = null;
+
+                        _hologram.TriggerEncryptAnimation(algInfo.Code);
+                        UpdateMetadataPanel(remoteReg, signatureValid: true);
+                        RenderCurrentBytesInViewer();
+                        RefreshConsultasGrid();
+                        return;
+                    }
+                }
+            }
 
             string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
             var strategy = CryptoCatalog.GetStrategy(algInfo.Code);
@@ -1474,34 +1660,33 @@ public partial class FormDashboard : Form
 
         var pubParams = V2PacketZipService.ParseFlatPublicParameters(_activeRecord.ParametrosPublicosJson);
 
-        string resolvedKeyId = _activeRecord.LinkDescifradoRemoto;
+        string? resolvedKeyId = null;
         if (pubParams.TryGetValue("keyId", out var paramKeyId) && !string.IsNullOrWhiteSpace(paramKeyId))
         {
-            resolvedKeyId = paramKeyId;
+            resolvedKeyId = paramKeyId.Trim();
         }
-        if (string.IsNullOrWhiteSpace(resolvedKeyId) || resolvedKeyId.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        else if (!string.IsNullOrWhiteSpace(_activeRecord.LinkDescifradoRemoto))
         {
-            string keyOwner = NodeRuntimeState.IsValidNodeId(_activeRecord.NodoRaiz)
-                ? _activeRecord.NodoRaiz
-                : NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
-            resolvedKeyId = V2FormatValidators.BuildKeyId(keyOwner, _activeRecord.PacketId);
-        }
-
-        bool isAsymmetric = algCode is "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC";
-        byte[]? rawSecretBytes = null;
-
-        if (!isAsymmetric)
-        {
-            // Tomar clave silenciosamente solo si ya existe en el registro o en la caja de texto (sin abrir ningún modal)
-            string existingSecret = !string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
-                ? _activeRecord.LlaveSecretaBase64
-                : _txtPassphrase.Text.Trim();
-
-            if (!string.IsNullOrWhiteSpace(existingSecret))
+            string link = _activeRecord.LinkDescifradoRemoto.Trim();
+            if (link.StartsWith("keyRef://", StringComparison.OrdinalIgnoreCase))
             {
-                rawSecretBytes = ResolveRawSecretBytesForV2(algCode, existingSecret);
+                int lastSlash = link.LastIndexOf('/');
+                if (lastSlash >= 0 && lastSlash + 1 < link.Length)
+                    resolvedKeyId = link[(lastSlash + 1)..].Trim();
+            }
+            else if (!link.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                     !link.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
+                     !link.StartsWith("result://", StringComparison.OrdinalIgnoreCase))
+            {
+                resolvedKeyId = link;
             }
         }
+
+        string existingSecret = !string.IsNullOrWhiteSpace(_activeRecord.LlaveSecretaBase64)
+            ? _activeRecord.LlaveSecretaBase64
+            : _txtPassphrase.Text.Trim();
+
+        var (secretsDict, optionsDict) = BuildV2SecretsAndOptionsFromInput(algCode, existingSecret, pubParams);
 
         var candidatePeers = ResolveOriginPeersForActiveRecord();
         var errors = new List<string>();
@@ -1534,7 +1719,8 @@ public partial class FormDashboard : Form
                     cipherBytes,
                     pubParams,
                     keyId: resolvedKeyId,
-                    rawSecretBytesToSeal: rawSecretBytes);
+                    secretsDictionary: secretsDict,
+                    options: optionsDict);
 
                 if (success && plainBytes != null)
                 {
@@ -1542,8 +1728,8 @@ public partial class FormDashboard : Form
                     return (true, "OK");
                 }
 
-                // Si teníamos una clave en la caja que falló, probar también enviando únicamente keyId (por si el emisor custodió la llave con keyRef)
-                if (rawSecretBytes != null)
+                // Si enviamos secretos locales y el emisor custodió keyId en su almacén, reintentar solo con keyId
+                if (secretsDict is { Count: > 0 } && !string.IsNullOrWhiteSpace(resolvedKeyId))
                 {
                     var (retryOk, retryPlain, retryZip, retryErr) = await V2NetworkClient.CallRemoteInverseAsync(
                         peer,
@@ -1552,7 +1738,7 @@ public partial class FormDashboard : Form
                         cipherBytes,
                         pubParams,
                         keyId: resolvedKeyId,
-                        rawSecretBytesToSeal: null);
+                        options: optionsDict);
 
                     if (retryOk && retryPlain != null)
                     {
@@ -1567,8 +1753,6 @@ public partial class FormDashboard : Form
         }
         finally
         {
-            if (rawSecretBytes != null)
-                CryptographicOperations.ZeroMemory(rawSecretBytes);
             RefreshNetworkGrid();
         }
 
@@ -1633,6 +1817,80 @@ public partial class FormDashboard : Form
             SetViewerMode("IMG");
         else
             SetViewerMode("TEXT");
+
+        if (resultZip?.Manifest.Verification != null)
+        {
+            ShowVerificationBanner(resultZip.Manifest.Verification.Valid, resultZip.Manifest.Verification.Detail);
+        }
+        else if (algCode is "HASHSHA" or "HMACSHA256")
+        {
+            ShowVerificationBanner(true, $"VERIFICACIÓN VÁLIDA ({algCode}) confirmada por {responderNodeId}.");
+        }
+        else
+        {
+            HideVerificationBanner();
+        }
+    }
+
+    private static bool PeerAdvertisesAlgorithm(PeerNode peer, string algCode)
+    {
+        if (string.IsNullOrWhiteSpace(peer.AlgorithmsJson) || string.IsNullOrWhiteSpace(algCode))
+            return false;
+        try
+        {
+            var list = JsonSerializer.Deserialize<List<string>>(peer.AlgorithmsJson);
+            return list != null && list.Any(a => string.Equals(a, algCode, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return peer.AlgorithmsJson.Contains(algCode, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private PeerNode? ResolveBestPeerForAlgorithm(string algCode, string? preferredNodeId = null)
+    {
+        string normAlg = algCode.Trim().ToUpperInvariant();
+
+        if (!string.IsNullOrWhiteSpace(preferredNodeId) &&
+            !string.Equals(preferredNodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            var pref = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, preferredNodeId, StringComparison.OrdinalIgnoreCase) && !p.HasThumbprintMismatch);
+            if (pref != null && (PeerAdvertisesAlgorithm(pref, normAlg) || pref.IsOnline))
+                return pref;
+        }
+
+        // 1. Pares que anuncian explícitamente el algoritmo en su /api/status o /api/algorithms (p. ej. EQ08 para HASHSHA/HMACSHA256)
+        var advertisingPeers = NodeRuntimeState.NetworkPeers
+            .Where(p => !string.Equals(p.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase) &&
+                        !p.HasThumbprintMismatch &&
+                        PeerAdvertisesAlgorithm(p, normAlg))
+            .OrderByDescending(p => p.IsOnline)
+            .ThenByDescending(p => p.IsConfirmed)
+            .ToList();
+
+        if (advertisingPeers.Count > 0)
+            return advertisingPeers[0];
+
+        // 2. Productor preferido aunque aún no tuviera lista de algoritmos
+        if (!string.IsNullOrWhiteSpace(preferredNodeId) &&
+            !string.Equals(preferredNodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            var prefFallback = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, preferredNodeId, StringComparison.OrdinalIgnoreCase) && !p.HasThumbprintMismatch);
+            if (prefFallback != null)
+                return prefFallback;
+        }
+
+        // 3. Fallback estático de Tabla 4.1
+        string staticOwner = NodeRuntimeState.GetOwnerNodeForAlgorithm(normAlg);
+        if (!string.Equals(staticOwner, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            return NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                string.Equals(p.NodeId, staticOwner, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return null;
     }
 
     private List<PeerNode> ResolveOriginPeersForActiveRecord()
@@ -1651,7 +1909,16 @@ public partial class FormDashboard : Form
             }
         }
 
-        // 1. Productor / NodoRaiz del paquete
+        // 1. Pares vivos que anuncian explícitamente el algoritmo (detecta EQ08 cuando EQ08 anuncia HASHSHA/HMACSHA256)
+        foreach (var adv in NodeRuntimeState.NetworkPeers
+                     .Where(p => PeerAdvertisesAlgorithm(p, _activeRecord.AlgoritmoCodigo))
+                     .OrderByDescending(p => p.IsOnline)
+                     .ThenByDescending(p => p.IsConfirmed))
+        {
+            AddPeerIfValid(adv);
+        }
+
+        // 2. Productor / NodoRaiz del paquete
         if (!string.IsNullOrWhiteSpace(_activeRecord.NodoRaiz))
         {
             var producerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
@@ -1659,7 +1926,7 @@ public partial class FormDashboard : Form
             AddPeerIfValid(producerPeer);
         }
 
-        // 2. Emisor registrado en RutaSaltosJson o en SolicitudesEntrantes (con su IP origen real si vino por red)
+        // 3. Emisor registrado en RutaSaltosJson o en SolicitudesEntrantes (con su IP origen real si vino por red)
         var hops = V2PacketZipService.TryDeserializeHops(_activeRecord.RutaSaltosJson);
         foreach (string hopNode in hops)
         {
@@ -1692,7 +1959,7 @@ public partial class FormDashboard : Form
         }
         catch { }
 
-        // 3. Nodo dueño oficial del algoritmo en v2.0
+        // 4. Nodo dueño oficial estático de Tabla 4.1
         string ownerNodeId = NodeRuntimeState.GetOwnerNodeForAlgorithm(_activeRecord.AlgoritmoCodigo);
         var ownerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
             string.Equals(p.NodeId, ownerNodeId, StringComparison.OrdinalIgnoreCase));
@@ -1727,19 +1994,137 @@ public partial class FormDashboard : Form
         return urls;
     }
 
-    private static byte[] ResolveRawSecretBytesForV2(string algCode, string secretBase64OrPassphrase)
+    private static (Dictionary<string, string>? Secrets, Dictionary<string, string>? Options) BuildV2SecretsAndOptionsFromInput(
+        string algCode,
+        string? rawSecretInput,
+        Dictionary<string, string> pubParams)
     {
-        try
+        string normAlg = algCode.Trim().ToUpperInvariant();
+        string trimmed = (rawSecretInput ?? string.Empty).Trim();
+
+        if (normAlg == "HASHSHA")
         {
-            byte[] decoded = Convert.FromBase64String(secretBase64OrPassphrase.Trim());
+            string hAlg = pubParams.TryGetValue("hashAlgorithm", out var pubH) && !string.IsNullOrWhiteSpace(pubH)
+                ? pubH.Trim()
+                : "SHA-256";
+            return (null, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["hashAlgorithm"] = hAlg });
+        }
+
+        if (normAlg == "HMACSHA256")
+        {
+            string mAlg = pubParams.TryGetValue("macAlgorithm", out var pubM) && !string.IsNullOrWhiteSpace(pubM)
+                ? pubM.Trim()
+                : "HMAC-SHA256";
+            var opts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["macAlgorithm"] = mAlg };
+            var sec = string.IsNullOrWhiteSpace(trimmed)
+                ? null
+                : new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = trimmed };
+            return (sec, opts);
+        }
+
+        if (normAlg is "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC" or "LAGRANGESHAMIR" or "MILLERRABIN")
+        {
+            return (null, null);
+        }
+
+        if (string.IsNullOrWhiteSpace(trimmed))
+            return (null, null);
+
+        if (normAlg == "CAESAR")
+        {
+            string shiftStr = KeyInputParser.TryParseIntegerKey(trimmed, out int shiftVal)
+                ? shiftVal.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : trimmed;
+            Dictionary<string, string>? opts = null;
+            if (pubParams.TryGetValue("alphabet", out var alph) && !string.IsNullOrWhiteSpace(alph))
+                opts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["alphabet"] = alph.Trim() };
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["shift"] = shiftStr }, opts);
+        }
+
+        if (normAlg == "EUCLIDESAFFINE")
+        {
+            Dictionary<string, string>? opts = null;
+            if (pubParams.TryGetValue("modulus", out var modVal) && !string.IsNullOrWhiteSpace(modVal))
+                opts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["modulus"] = modVal.Trim() };
+
+            if (trimmed.StartsWith('{'))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(trimmed);
+                    if (KeyInputParser.TryGetJsonInt(doc.RootElement, out int aJson, "a") &&
+                        KeyInputParser.TryGetJsonInt(doc.RootElement, out int bJson, "b"))
+                    {
+                        return (new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["a"] = aJson.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            ["b"] = bJson.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        }, opts);
+                    }
+                }
+                catch { }
+            }
+
+            var parts = trimmed.Split(new[] { ',', ';', ':', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2)
+            {
+                return (new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["a"] = parts[0].Trim(),
+                    ["b"] = parts[1].Trim()
+                }, opts);
+            }
+
+            if (KeyInputParser.TryDecodeBase64OrHex(trimmed, out byte[] raw) && raw.Length >= 2)
+            {
+                return (new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["a"] = raw[0].ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["b"] = raw[1].ToString(System.Globalization.CultureInfo.InvariantCulture)
+                }, opts);
+            }
+
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = trimmed }, opts);
+        }
+
+        if (normAlg == "FISHERYATES")
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["seed"] = trimmed }, null);
+
+        if (normAlg == "LORENZSZ40")
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["wheelStarts"] = trimmed }, null);
+
+        if (normAlg == "LSBSTEGO")
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["password"] = trimmed }, null);
+
+        if (normAlg is "AESGCM" or "DES" or "TRIPLEDES" or "CHACHA20")
+        {
+            byte[] symBytes = ResolveRawSymmetricSecretBytesForV2(normAlg, trimmed);
+            string symB64 = Convert.ToBase64String(symBytes);
+            CryptographicOperations.ZeroMemory(symBytes);
+            return (new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = symB64 }, null);
+        }
+
+        // VIGENERE, XORASM, DFTSPECTRAL y genéricos
+        return (new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = trimmed }, null);
+    }
+
+    private static byte[] ResolveRawSymmetricSecretBytesForV2(string algCode, string secretBase64OrPassphrase)
+    {
+        if (KeyInputParser.TryDecodeFlexibleBase64(secretBase64OrPassphrase.Trim(), out byte[] decoded))
+        {
             if (algCode == "AESGCM" && decoded.Length is 16 or 32) return decoded;
             if (algCode == "DES" && decoded.Length == 8) return decoded;
-            if (algCode == "TRIPLEDES" && decoded.Length == 24) return decoded;
+            if (algCode == "TRIPLEDES" && decoded.Length is 16 or 24) return decoded;
             if (algCode == "CHACHA20" && decoded.Length == 32) return decoded;
-            if (algCode is not ("AESGCM" or "DES" or "TRIPLEDES" or "CHACHA20") && decoded.Length > 0)
-                return decoded;
         }
-        catch { }
+
+        if (KeyInputParser.TryDecodeHex(secretBase64OrPassphrase.Trim(), out byte[] hexBytes))
+        {
+            if (algCode == "AESGCM" && hexBytes.Length is 16 or 32) return hexBytes;
+            if (algCode == "DES" && hexBytes.Length == 8) return hexBytes;
+            if (algCode == "TRIPLEDES" && hexBytes.Length is 16 or 24) return hexBytes;
+            if (algCode == "CHACHA20" && hexBytes.Length == 32) return hexBytes;
+        }
 
         byte[] utf8 = Encoding.UTF8.GetBytes(secretBase64OrPassphrase);
         return algCode switch
@@ -1835,6 +2220,11 @@ public partial class FormDashboard : Form
             {
                 SetViewerMode("TEXT");
             }
+
+            if (algCode is "HASHSHA" or "HMACSHA256" || !res.Success)
+                ShowVerificationBanner(res.Success, res.Summary);
+            else
+                HideVerificationBanner();
 
             return true;
         }

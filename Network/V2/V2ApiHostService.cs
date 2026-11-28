@@ -168,13 +168,35 @@ public sealed class V2ApiHostService : IAsyncDisposable
         var profiles = new List<V2AlgorithmProfileDto>();
         foreach (string code in NodeRuntimeState.OwnedAlgorithms)
         {
+            string upper = code.ToUpperInvariant();
             var info = CryptoCatalog.GetStrategy(code).Info;
-            var schema = code.ToUpperInvariant() switch
+            var schema = upper switch
             {
                 "AESGCM" => new List<string> { "keySizeBits", "nonceBase64", "tagBase64" },
                 "DES" => new List<string> { "mode", "padding", "ivBase64" },
                 _ => new List<string> { "mode", "parameters" }
             };
+
+            List<string> secretFields = upper switch
+            {
+                "HASHSHA" or "LAGRANGESHAMIR" or "RSA" or "ECC" or "DIFFIEHELLMAN" or "MILLERRABIN" or "DIGITALSIG" or "QUANTUMPQC" => new List<string>(),
+                "CAESAR" => new List<string> { "shift" },
+                "EUCLIDESAFFINE" => new List<string> { "a", "b" },
+                "FISHERYATES" => new List<string> { "seed" },
+                "LSBSTEGO" => new List<string> { "password" },
+                "LORENZSZ40" => new List<string> { "wheelStarts" },
+                _ => new List<string> { "key" }
+            };
+
+            List<string> optionsSchema = upper switch
+            {
+                "AESGCM" => new List<string> { "keySizeBits" },
+                "HASHSHA" => new List<string> { "hashAlgorithm" },
+                "HMACSHA256" => new List<string> { "macAlgorithm" },
+                _ => new List<string>()
+            };
+
+            bool reqSecret = secretFields.Count > 0 && upper is not ("LSBSTEGO" or "DFTSPECTRAL");
 
             profiles.Add(new V2AlgorithmProfileDto
             {
@@ -184,7 +206,11 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 OwnerNode = NodeRuntimeState.CurrentNodeId,
                 Category = info.Category,
                 Operations = info.IsReversible ? new List<string> { "forward", "inverse" } : new List<string> { "forward" },
-                RequiresKeyEnvelope = true,
+                RequiresKeyEnvelope = reqSecret,
+                RequiresSecret = reqSecret,
+                RequiresSecretOnInverse = reqSecret,
+                SecretFields = secretFields,
+                OptionsSchema = optionsSchema,
                 PublicParametersSchema = schema,
                 Description = info.Description
             });
@@ -402,6 +428,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 fwdReq.AlgorithmCode,
                 fwdReq.TimestampUtc,
                 requesterCertPem,
+                remoteIp,
                 checkReplay: true);
 
             string algCode = fwdReq.AlgorithmCode.Trim().ToUpperInvariant();
@@ -487,6 +514,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 invReq.AlgorithmCode,
                 invReq.TimestampUtc,
                 requesterCertPem,
+                remoteIp,
                 checkReplay: true);
 
             string algCode = invReq.AlgorithmCode.Trim().ToUpperInvariant();
@@ -535,9 +563,9 @@ public sealed class V2ApiHostService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Sección 13.2: Validaciones obligatorias en /api/crypto/forward e inverse:
-    /// - Cert X.509 válido y CN == requesterNode (422 E-CERT)
-    /// - TOFU (403 E-CERT-UNTRUSTED)
+    /// Sección 13.2 + ADR 0006: Validaciones obligatorias en /api/crypto/forward e inverse:
+    /// - Cert X.509 RSA-2048 vigente y CN == requesterNode (422 E-CERT)
+    /// - TOFU (403 E-CERT-UNTRUSTED si ya estaba fijado con otra huella; si no estaba fijado, auto-registra como PendienteConfirmar con Source='request')
     /// - targetNode == ownNodeId (400 E-MANIFEST)
     /// - timestampUtc ±10 min (422 E-TIMESTAMP)
     /// - Algoritmo oficial (400 E-ALGORITHM) y provisto por este nodo (404 E-ALGORITHM-NOT-PROVIDED)
@@ -550,20 +578,85 @@ public sealed class V2ApiHostService : IAsyncDisposable
         string algorithmCode,
         string timestampUtc,
         string requesterCertPem,
+        string remoteIp,
         bool checkReplay)
     {
         using var requesterCert = V2CertificateService.LoadCertificateFromPemOrBase64(requesterCertPem);
         if (!V2CertificateService.ValidateCertificateMetadata(requesterCert, requesterNode, out string certErr))
             throw new PacketValidationException("E-CERT", 422, certErr);
 
+        string reqThumb = V2CertificateService.GetThumbprintSha256Hex(requesterCert);
+        string normRequesterNode = requesterNode.Trim().ToUpperInvariant();
+        string cleanRemoteIp = NormalizeRemoteIp(remoteIp);
+
         var knownPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
-            p.NodeId.Equals(requesterNode, StringComparison.OrdinalIgnoreCase));
-        if (knownPeer != null)
+            p.NodeId.Equals(normRequesterNode, StringComparison.OrdinalIgnoreCase));
+
+        if (knownPeer != null && knownPeer.IsConfirmed && !string.IsNullOrWhiteSpace(knownPeer.PinnedThumbprintSha256))
         {
-            string reqThumb = V2CertificateService.GetThumbprintSha256Hex(requesterCert);
-            V2NetworkClient.ApplyTofuThumbprintCheck(knownPeer, reqThumb);
-            if (knownPeer.HasThumbprintMismatch)
+            if (!V2CertificateService.FixedTimeEqualsHex(knownPeer.PinnedThumbprintSha256, reqThumb))
+            {
+                knownPeer.CertThumbprint = reqThumb;
+                knownPeer.HasThumbprintMismatch = true;
+                knownPeer.Status = "blocked";
+                knownPeer.LastSeenUtc = DateTime.UtcNow;
+                AppDbContext.UpsertTrustedPeer(knownPeer);
+                NodeRuntimeState.NotifyPeerChanged(knownPeer);
                 throw new PacketValidationException("E-CERT-UNTRUSTED", 403, $"Cambio de huella TOFU detectado para {requesterNode}.");
+            }
+
+            if (string.IsNullOrWhiteSpace(knownPeer.CertificatePem))
+                knownPeer.CertificatePem = requesterCertPem;
+            knownPeer.Status = "online";
+            knownPeer.LastSeenUtc = DateTime.UtcNow;
+            AppDbContext.UpsertTrustedPeer(knownPeer);
+        }
+        else
+        {
+            // ADR 0006: Solicitante válido aún sin huella fijada -> aceptar y registrar como PendienteConfirmar (Source = "request")
+            int parsedTeam = knownPeer?.TeamNumber ?? 0;
+            if (parsedTeam <= 0 && normRequesterNode.Length == 4 && int.TryParse(normRequesterNode[2..], out int t))
+                parsedTeam = t;
+
+            if (knownPeer == null)
+            {
+                knownPeer = new PeerNode
+                {
+                    NodeId = normRequesterNode,
+                    TeamNumber = parsedTeam,
+                    IpAddress = cleanRemoteIp,
+                    Port = 5000 + Math.Max(1, parsedTeam),
+                    RoleLabel = $"Equipo {parsedTeam:D2} (PendienteConfirmar)",
+                    ProtocolType = "v2.0",
+                    Source = "request",
+                    Status = "online",
+                    CertThumbprint = reqThumb,
+                    PinnedThumbprintSha256 = string.Empty,
+                    CertificatePem = requesterCertPem,
+                    IsConfirmed = false,
+                    HasThumbprintMismatch = false,
+                    LastSeenUtc = DateTime.UtcNow
+                };
+                NodeRuntimeState.NetworkPeers.Add(knownPeer);
+            }
+            else
+            {
+                if (string.Equals(knownPeer.Source, "manual", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(cleanRemoteIp))
+                {
+                    knownPeer.IpAddress = cleanRemoteIp;
+                }
+                knownPeer.Source = "request";
+                knownPeer.Status = "online";
+                knownPeer.CertThumbprint = reqThumb;
+                knownPeer.CertificatePem = requesterCertPem;
+                knownPeer.IsConfirmed = false;
+                knownPeer.HasThumbprintMismatch = false;
+                knownPeer.LastSeenUtc = DateTime.UtcNow;
+            }
+
+            AppDbContext.UpsertTrustedPeer(knownPeer);
+            NodeRuntimeState.NotifyPeerChanged(knownPeer);
         }
 
         if (!string.IsNullOrWhiteSpace(targetNode) &&
@@ -635,10 +728,20 @@ public sealed class V2ApiHostService : IAsyncDisposable
         if (req.Secrets != null)
         {
             var secretsDict = V2EnvelopeService.OpenSecretsDictionary(req.Secrets, requestId, packetId);
-            if (secretsDict.TryGetValue("key", out var kVal))
+            if (secretsDict.Count == 1 && secretsDict.TryGetValue("key", out var kVal))
                 incomingKeyInput = kVal;
+            else if (secretsDict.Count > 1)
+                incomingKeyInput = JsonSerializer.Serialize(secretsDict);
             else if (secretsDict.Values.FirstOrDefault() is { } firstVal)
                 incomingKeyInput = firstVal;
+        }
+
+        int resolvedKeySizeBits = req.KeySizeBits ?? 256;
+        if (req.KeySizeBits == null &&
+            ((req.Options != null && req.Options.TryGetValue("keySizeBits", out var optKs) && int.TryParse(optKs, out int parsedOptKs)) ||
+             (req.Parameters != null && req.Parameters.TryGetValue("keySizeBits", out var parKs) && int.TryParse(parKs, out parsedOptKs))))
+        {
+            resolvedKeySizeBits = parsedOptKs;
         }
 
         byte[] cipherBytes;
@@ -648,7 +751,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
         if (algCode == "AESGCM")
         {
             // Tabla 4.2 AESGCM: keySizeBits ("128" o "256"), nonceBase64 (12 B), tagBase64 (16 B), AAD = Encoding.UTF8.GetBytes(packetId)
-            int keyBytesLen = req.KeySizeBits == 128 ? 16 : 32;
+            int keyBytesLen = resolvedKeySizeBits == 128 ? 16 : 32;
             if (!string.IsNullOrWhiteSpace(incomingKeyInput))
             {
                 var candidates = SymmetricKeyHelper.BuildCandidateKeys(incomingKeyInput, keyBytesLen, "AESGCM");
@@ -733,7 +836,7 @@ public sealed class V2ApiHostService : IAsyncDisposable
             {
                 UsuarioId = 0,
                 PacketId = packetId,
-                NombreArchivo = string.IsNullOrWhiteSpace(fileName) ? req.OriginalFileName : fileName,
+                NombreArchivo = string.IsNullOrWhiteSpace(fileName) ? (req.OriginalFileName ?? "payload.bin") : fileName,
                 Extension = string.IsNullOrWhiteSpace(req.OriginalExtension) ? ".bin" : req.OriginalExtension,
                 BytesCifrados = Convert.ToBase64String(cipherBytes),
                 AlgoritmoCodigo = algCode,
@@ -828,8 +931,10 @@ public sealed class V2ApiHostService : IAsyncDisposable
         var pubParams = new Dictionary<string, string>(req.PublicParameters, StringComparer.Ordinal);
         string origFileName = "resultado.bin";
         string origExtension = ".bin";
+        ManifestKeyRef? origPackageKeyRef = null;
 
-        // Si el cliente adjuntó un paquete .zip completo en 'package', validarlo con los pasos 1..13 de la Sección 13.1
+        // ADR 0005: Si el cliente adjuntó un paquete .zip en 'package', validar reglas #1..#12 + huella fijada (E-CERT-UNTRUSTED).
+        // NO rechazar el paquete embebido por #13 (E-TIMESTAMP) ni por #14 (E-DUPLICATE); esos dos aplican solo sobre request.timestampUtc / request.requestId.
         if (cipherOrPackageBytes.Length >= 4 &&
             cipherOrPackageBytes[0] == 0x50 && cipherOrPackageBytes[1] == 0x4B &&
             cipherOrPackageBytes[2] == 0x03 && cipherOrPackageBytes[3] == 0x04)
@@ -841,12 +946,26 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 var parsedPkg = V2PacketZipService.ReadPacketZip(
                     tempInZip,
                     enforceStrictSignature: true,
-                    validateTimestamp: true,
+                    validateTimestamp: false,
                     checkAndRecordReplay: false);
+
+                var pkgSourcePeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
+                    p.NodeId.Equals(parsedPkg.Manifest.SourceNode, StringComparison.OrdinalIgnoreCase));
+                if (pkgSourcePeer != null && pkgSourcePeer.IsConfirmed &&
+                    !string.IsNullOrWhiteSpace(pkgSourcePeer.PinnedThumbprintSha256) &&
+                    !V2CertificateService.FixedTimeEqualsHex(pkgSourcePeer.PinnedThumbprintSha256, parsedPkg.Manifest.CertificateThumbprintSha256))
+                {
+                    throw new PacketValidationException(
+                        "E-CERT-UNTRUSTED",
+                        403,
+                        $"La huella X.509 del paquete adjunto ({parsedPkg.Manifest.SourceNode}) no coincide con la huella fijada (TOFU).");
+                }
+
                 cipherBytes = parsedPkg.PayloadBytes;
                 packetId = parsedPkg.Manifest.PacketId;
                 origFileName = parsedPkg.Manifest.OriginalFileName;
                 origExtension = parsedPkg.Manifest.OriginalExtension;
+                origPackageKeyRef = parsedPkg.Manifest.KeyRef;
                 foreach (var kv in parsedPkg.Manifest.PublicParameters)
                     pubParams[kv.Key] = kv.Value;
             }
@@ -860,14 +979,16 @@ public sealed class V2ApiHostService : IAsyncDisposable
         if (req.Secrets != null)
         {
             var secretsDict = V2EnvelopeService.OpenSecretsDictionary(req.Secrets, requestId, packetId);
-            if (secretsDict.TryGetValue("key", out var kVal))
+            if (secretsDict.Count == 1 && secretsDict.TryGetValue("key", out var kVal))
                 secretKeyInput = kVal;
+            else if (secretsDict.Count > 1)
+                secretKeyInput = JsonSerializer.Serialize(secretsDict);
             else if (secretsDict.Values.FirstOrDefault() is { } firstVal)
                 secretKeyInput = firstVal;
         }
-        else
+        else if (!string.IsNullOrWhiteSpace(req.KeyId))
         {
-            string lookupId = !string.IsNullOrWhiteSpace(req.KeyId) ? req.KeyId : packetId;
+            string lookupId = req.KeyId;
             using var db = new AppDbContext();
             var stored = db.RegistrosCifrados.FirstOrDefault(r =>
                 r.PacketId == lookupId ||
@@ -879,12 +1000,38 @@ public sealed class V2ApiHostService : IAsyncDisposable
             }
         }
 
+        bool secretOptionalForAlgorithm = algCode is "HASHSHA" or "LSBSTEGO" or "DIGITALSIG";
         if (string.IsNullOrWhiteSpace(secretKeyInput))
-            throw new PacketValidationException("E-ENV-DECRYPT", 401, "No se proporcionó sobre 'secrets' CC-ENV-1 ni se encontró keyId local.");
+        {
+            if (secretOptionalForAlgorithm)
+            {
+                secretKeyInput = string.Empty;
+            }
+            else
+            {
+                using var db = new AppDbContext();
+                var stored = db.RegistrosCifrados.FirstOrDefault(r => r.PacketId == packetId);
+                if (stored != null && !string.IsNullOrWhiteSpace(stored.LlaveSecretaBase64))
+                    secretKeyInput = stored.LlaveSecretaBase64;
+                else
+                    throw new PacketValidationException("E-ENV-DECRYPT", 401, "No se proporcionó sobre 'secrets' CC-ENV-1 ni se encontró keyId local.");
+            }
+        }
 
         byte[] plainBytes;
+        bool verificationValid = true;
+        string verificationDetail = "OK";
         try
         {
+            if (req.Options != null)
+            {
+                foreach (var kv in req.Options)
+                {
+                    if (!pubParams.ContainsKey(kv.Key))
+                        pubParams[kv.Key] = kv.Value;
+                }
+            }
+
             var strategy = CryptoCatalog.GetStrategy(algCode);
             var ctx = new DecryptionContext(
                 PacketId: packetId,
@@ -893,6 +1040,9 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 OriginalExtension: origExtension);
             var dec = strategy.Decrypt(cipherBytes, secretKeyInput, JsonSerializer.Serialize(pubParams), ctx);
             plainBytes = dec.OutputBytes;
+            verificationValid = dec.Success;
+            if (!string.IsNullOrWhiteSpace(dec.Summary))
+                verificationDetail = dec.Summary;
         }
         catch (Exception ex)
         {
@@ -901,10 +1051,12 @@ public sealed class V2ApiHostService : IAsyncDisposable
 
         try
         {
-            // Sellar el resultado en claro para un paquete 'result' v2.0:
+            // ADR 0007 / Anexo A.2: Paquete 'result' estricto:
             // - AAD = Encoding.UTF8.GetBytes(resultPacketId)
-            // - resultado.enc recibe exclusivamente los bytes cifrados (resultadoEncBytes)
-            // - manifest.resultEnvelope recibe el sobre CC-ENV-1 SIN ciphertextBase64
+            // - resultado.enc = CC-ENV-1 para requesterCert (sin compresión / store)
+            // - manifest.resultEnvelope sin ciphertextBase64
+            // - publicParameters = {} y publicParametersSha256 = SHA256("")
+            // - keyRef = null para AESGCM/DES (o copiado del paquete original si existía)
             string resultPacketId = Guid.NewGuid().ToString("D").ToLowerInvariant();
             var resultEnvelopeForManifest = V2EnvelopeService.SealDetached(
                 plainBytes,
@@ -912,6 +1064,8 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 req.RequesterNode,
                 aadContext: resultPacketId,
                 out byte[] resultadoEncBytes);
+
+            ManifestKeyRef? resultKeyRef = (algCode is "AESGCM" or "DES") ? null : origPackageKeyRef;
 
             var resultRec = new RegistroCifrado
             {
@@ -924,8 +1078,8 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 NodoRaiz = NodeRuntimeState.CurrentNodeId,
                 FirmaRaizBase64 = V2CertificateService.SignDataPss(resultadoEncBytes),
                 RutaSaltosJson = JsonSerializer.Serialize(new[] { req.RequesterNode, NodeRuntimeState.CurrentNodeId }),
-                LinkDescifradoRemoto = V2FormatValidators.BuildKeyId(NodeRuntimeState.CurrentNodeId, resultPacketId),
-                ParametrosPublicosJson = JsonSerializer.Serialize(pubParams),
+                LinkDescifradoRemoto = resultKeyRef?.KeyId ?? string.Empty,
+                ParametrosPublicosJson = "{}",
                 Origen = "API-v2.0",
                 FechaOperacion = DateTime.Now
             };
@@ -948,9 +1102,12 @@ public sealed class V2ApiHostService : IAsyncDisposable
                 operation: "inverse",
                 requestId: requestId,
                 producerNode: NodeRuntimeState.CurrentNodeId,
-                explicitPublicParameters: pubParams,
+                explicitPublicParameters: new Dictionary<string, string>(StringComparer.Ordinal),
                 resultEnvelope: resultEnvelopeForManifest,
-                originalSizeBytesOverride: plainBytes.Length);
+                originalSizeBytesOverride: plainBytes.Length,
+                explicitKeyRef: resultKeyRef,
+                useExplicitKeyRef: true,
+                verification: new ManifestVerification { Valid = verificationValid, Detail = verificationDetail });
 
             NodeRuntimeState.NotifyPacketReceived(new SolicitudEntrante
             {
@@ -1184,6 +1341,16 @@ public sealed class V2ApiHostService : IAsyncDisposable
             Parameters = V2PacketZipService.ParseFlatPublicParameters(key.ParametersJson),
             CreatedAtUtc = key.CreatedAtUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
         });
+    }
+
+    private static string NormalizeRemoteIp(string? remoteIp)
+    {
+        string clean = (remoteIp ?? "127.0.0.1").Trim();
+        if (clean.StartsWith("::ffff:", StringComparison.OrdinalIgnoreCase))
+            clean = clean[7..];
+        else if (clean == "::1")
+            clean = "127.0.0.1";
+        return clean;
     }
 
     private static void TryDeleteFile(string? path)

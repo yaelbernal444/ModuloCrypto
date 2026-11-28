@@ -60,9 +60,17 @@ public static class V2CertificateService
                         secretPass,
                         X509KeyStorageFlags.Exportable);
 
-                    if (loaded.Subject.Contains(expectedCn, StringComparison.OrdinalIgnoreCase) &&
+                    bool startsWithExpectedCn = loaded.Subject.StartsWith(expectedCn, StringComparison.OrdinalIgnoreCase);
+                    bool hasCriticalBasicConstraints = loaded.Extensions
+                        .OfType<X509BasicConstraintsExtension>()
+                        .FirstOrDefault()?.Critical == true;
+
+                    if (startsWithExpectedCn &&
                         loaded.Subject.Contains(expectedOu, StringComparison.OrdinalIgnoreCase) &&
                         loaded.Subject.Contains(expectedOrg, StringComparison.OrdinalIgnoreCase) &&
+                        loaded.Subject.Contains("C=MX", StringComparison.OrdinalIgnoreCase) &&
+                        hasCriticalBasicConstraints &&
+                        loaded.NotBefore.ToUniversalTime() <= DateTime.UtcNow.AddMinutes(1) &&
                         loaded.NotAfter.ToUniversalTime() > DateTime.UtcNow)
                     {
                         _currentCert = loaded;
@@ -81,25 +89,33 @@ public static class V2CertificateService
             }
 
             using var rsa = RSA.Create(2048);
-            var subjectDn = new X500DistinguishedName(ExpectedSubjectDistinguishedName);
+
+            // Orden RFC 4514 exacto: CN=EQXX, OU=Equipo XX, O=Centro de Ciberseguridad, C=MX
+            // X500DistinguishedNameBuilder espera el orden RFC 4514 (CN -> OU -> O -> C) para codificar DER correctamente
+            var dnBuilder = new X500DistinguishedNameBuilder();
+            dnBuilder.AddCommonName(ExpectedNodeId);
+            dnBuilder.AddOrganizationalUnitName($"Equipo {NodeRuntimeState.TeamNumber:D2}");
+            dnBuilder.AddOrganizationName("Centro de Ciberseguridad");
+            dnBuilder.AddCountryOrRegion("MX");
+            X500DistinguishedName subjectDn = dnBuilder.Build();
+
             var req = new CertificateRequest(
                 subjectDn,
                 rsa,
                 HashAlgorithmName.SHA256,
                 RSASignaturePadding.Pkcs1);
 
-            req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
+            req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
             req.CertificateExtensions.Add(new X509KeyUsageExtension(
                 X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
             req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
 
-            DateTimeOffset notBefore = DateTimeOffset.UtcNow;
-            DateTimeOffset notAfter = notBefore.AddDays(365);
+            DateTimeOffset notBefore = DateTimeOffset.UtcNow.AddMinutes(-10);
+            DateTimeOffset notAfter = DateTimeOffset.UtcNow.AddDays(365);
 
-            // Serial aleatorio de 16 bytes (128 bits >= 64 bits), positivo
-            byte[] serialNumber = RandomNumberGenerator.GetBytes(16);
-            serialNumber[0] &= 0x7F;
-            if (serialNumber[0] == 0) serialNumber[0] = 0x01;
+            // Serial aleatorio positivo de 9 bytes (72 bits >= 64 bits)
+            byte[] serialNumber = RandomNumberGenerator.GetBytes(9);
+            serialNumber[0] = (byte)((serialNumber[0] & 0x7F) | 0x40);
 
             var sigGenerator = X509SignatureGenerator.CreateForRSA(rsa, RSASignaturePadding.Pkcs1);
             using var pubCert = req.Create(subjectDn, sigGenerator, notBefore, notAfter, serialNumber);
@@ -250,9 +266,9 @@ public static class V2CertificateService
         }
 
         using RSA? rsa = cert.GetRSAPublicKey();
-        if (rsa == null || rsa.KeySize < 2048)
+        if (rsa == null || rsa.KeySize != 2048)
         {
-            errorDetail = "El certificado X.509 debe poseer llave pública RSA >= 2048 bits.";
+            errorDetail = "El certificado X.509 debe poseer llave pública RSA-2048.";
             return false;
         }
 

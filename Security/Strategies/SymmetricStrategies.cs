@@ -217,10 +217,28 @@ internal static class SymmetricKeyHelper
     {
         var candidates = new List<byte[]>();
         bool isAesGcm = string.Equals(algorithmCode, "AESGCM", StringComparison.OrdinalIgnoreCase);
+        bool isTripleDes = string.Equals(algorithmCode, "TRIPLEDES", StringComparison.OrdinalIgnoreCase);
+
+        bool IsAcceptedLen(int len) =>
+            len == requiredBytes ||
+            (isAesGcm && len is 16 or 32) ||
+            (isTripleDes && len == 16);
 
         void AddCandidate(byte[]? keyBytes)
         {
             if (keyBytes == null) return;
+
+            if (isTripleDes && keyBytes.Length == 16)
+            {
+                // Expansión estándar 2-key 3DES (16 B -> 24 B = K1||K2||K1)
+                byte[] expanded24 = new byte[24];
+                Buffer.BlockCopy(keyBytes, 0, expanded24, 0, 16);
+                Buffer.BlockCopy(keyBytes, 0, expanded24, 16, 8);
+                AddCandidate(expanded24);
+                CryptographicOperations.ZeroMemory(expanded24);
+                return;
+            }
+
             bool validLen = keyBytes.Length == requiredBytes || (isAesGcm && keyBytes.Length is 16 or 32);
             if (!validLen) return;
 
@@ -246,7 +264,7 @@ internal static class SymmetricKeyHelper
             if (TryDecodeFlexibleBase64(trimmed, out byte[] b64))
             {
                 decodedB64 = b64;
-                if (b64.Length == requiredBytes || (isAesGcm && b64.Length is 16 or 32))
+                if (IsAcceptedLen(b64.Length))
                 {
                     AddCandidate(b64);
                 }
@@ -255,15 +273,15 @@ internal static class SymmetricKeyHelper
             // Prioridad 2: Hexadecimal del tamaño exacto
             if (TryDecodeHex(trimmed, out byte[] hexBytes))
             {
-                if (hexBytes.Length == requiredBytes || (isAesGcm && hexBytes.Length is 16 or 32))
+                if (IsAcceptedLen(hexBytes.Length))
                 {
                     AddCandidate(hexBytes);
                 }
                 CryptographicOperations.ZeroMemory(hexBytes);
             }
 
-            // Prioridad 3: Bytes UTF-8 directos si miden exactamente requiredBytes
-            if (utf8Bytes.Length == requiredBytes || (isAesGcm && utf8Bytes.Length is 16 or 32))
+            // Prioridad 3: Bytes UTF-8 directos si miden exactamente requiredBytes (o 16 B en 3DES)
+            if (IsAcceptedLen(utf8Bytes.Length))
             {
                 AddCandidate(utf8Bytes);
             }
@@ -978,7 +996,10 @@ public sealed class ChaCha20Strategy : ICryptoStrategy
                     cc.Decrypt(nonce, cipherBytes, tag, plain);
                 return plain;
             }
-            catch when (string.IsNullOrEmpty(mode)) { }
+            catch (CryptographicException) when (string.IsNullOrEmpty(mode) || !string.Equals(mode, "RFC8439-ChaCha20", StringComparison.OrdinalIgnoreCase))
+            {
+                // Si el nodo emisor etiquetó un modo gestionado/externo distinto, probar ComputeAuthTag antes de descartar la llave
+            }
         }
 
         byte[] expected = ComputeAuthTag(key, nonce, cipherBytes, aad);

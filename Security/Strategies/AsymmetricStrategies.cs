@@ -54,12 +54,14 @@ public sealed class RsaStrategy : ICryptoStrategy
     {
         using var doc = JsonDocument.Parse(publicParametersJson);
         using var rsa = RSA.Create();
-        rsa.ImportPkcs8PrivateKey(Convert.FromBase64String(secretKeyBase64), out _);
 
-        byte[] wrappedKey = Convert.FromBase64String(doc.RootElement.GetProperty("wrappedKey").GetString()!);
-        byte[] nonce = Convert.FromBase64String(doc.RootElement.GetProperty("nonce").GetString()!);
-        byte[] tag = Convert.FromBase64String(doc.RootElement.GetProperty("tag").GetString()!);
-        byte[] sig = Convert.FromBase64String(doc.RootElement.GetProperty("signaturePss").GetString()!);
+        byte[] privKeyBytes = DecodeAsymmetricKey(secretKeyBase64, "RSA privada");
+        rsa.ImportPkcs8PrivateKey(privKeyBytes, out _);
+
+        byte[] wrappedKey = DecodePubParamField(doc.RootElement, "wrappedKey", "RSA");
+        byte[] nonce = DecodePubParamField(doc.RootElement, "nonce", "RSA");
+        byte[] tag = DecodePubParamField(doc.RootElement, "tag", "RSA");
+        byte[] sig = DecodePubParamField(doc.RootElement, "signaturePss", "RSA");
 
         bool sigOk = rsa.VerifyData(cipherBytes, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
         if (!sigOk)
@@ -78,6 +80,41 @@ public sealed class RsaStrategy : ICryptoStrategy
             PublicParametersJson = publicParametersJson,
             Summary = $"RSA-2048 PSS verificado y descifrado ({plain.Length} bytes)."
         };
+    }
+
+    internal static byte[] DecodeAsymmetricKey(string? rawInput, string label)
+    {
+        if (string.IsNullOrWhiteSpace(rawInput))
+            throw new CryptographicException($"Llave {label} vacía.");
+
+        string body = rawInput.Trim();
+        if (body.Contains("-----BEGIN", StringComparison.OrdinalIgnoreCase))
+        {
+            var sb = new System.Text.StringBuilder(body.Length);
+            foreach (string line in body.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string t = line.Trim();
+                if (!t.StartsWith("-----", StringComparison.Ordinal))
+                    sb.Append(t);
+            }
+            body = sb.ToString();
+        }
+
+        if (KeyInputParser.TryDecodeBase64OrHex(body, out byte[] decoded) && decoded.Length > 0)
+            return decoded;
+
+        throw new CryptographicException($"Formato inválido en llave {label}: se esperaba Base64, PEM o Hex válido.");
+    }
+
+    internal static byte[] DecodePubParamField(JsonElement root, string fieldName, string algLabel)
+    {
+        if (!KeyInputParser.TryGetJsonString(root, out string rawVal, fieldName) || string.IsNullOrWhiteSpace(rawVal))
+            throw new CryptographicException($"Falta parámetro público '{fieldName}' en {algLabel}.");
+
+        if (KeyInputParser.TryDecodeBase64OrHex(rawVal, out byte[] bytes) && bytes.Length > 0)
+            return bytes;
+
+        throw new CryptographicException($"Parámetro público '{fieldName}' de {algLabel} no tiene Base64/Hex válido.");
     }
 }
 
@@ -131,11 +168,11 @@ public sealed class EccStrategy : ICryptoStrategy
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         using var doc = JsonDocument.Parse(publicParametersJson);
-        byte[] senderPubBytes = Convert.FromBase64String(doc.RootElement.GetProperty("ephemeralSenderPub").GetString()!);
-        byte[] ecdsaPubBytes = Convert.FromBase64String(doc.RootElement.GetProperty("ecdsaPub").GetString()!);
-        byte[] sig = Convert.FromBase64String(doc.RootElement.GetProperty("ecdsaSig").GetString()!);
-        byte[] nonce = Convert.FromBase64String(doc.RootElement.GetProperty("nonce").GetString()!);
-        byte[] tag = Convert.FromBase64String(doc.RootElement.GetProperty("tag").GetString()!);
+        byte[] senderPubBytes = RsaStrategy.DecodePubParamField(doc.RootElement, "ephemeralSenderPub", "ECC");
+        byte[] ecdsaPubBytes = RsaStrategy.DecodePubParamField(doc.RootElement, "ecdsaPub", "ECC");
+        byte[] sig = RsaStrategy.DecodePubParamField(doc.RootElement, "ecdsaSig", "ECC");
+        byte[] nonce = RsaStrategy.DecodePubParamField(doc.RootElement, "nonce", "ECC");
+        byte[] tag = RsaStrategy.DecodePubParamField(doc.RootElement, "tag", "ECC");
 
         using (var verifier = ECDsa.Create())
         {
@@ -145,7 +182,7 @@ public sealed class EccStrategy : ICryptoStrategy
         }
 
         using var receiver = ECDiffieHellman.Create();
-        receiver.ImportPkcs8PrivateKey(Convert.FromBase64String(secretKeyBase64), out _);
+        receiver.ImportPkcs8PrivateKey(RsaStrategy.DecodeAsymmetricKey(secretKeyBase64, "ECC privada"), out _);
         using var senderPub = ECDiffieHellman.Create();
         senderPub.ImportSubjectPublicKeyInfo(senderPubBytes, out _);
 
@@ -229,10 +266,10 @@ public sealed class DiffieHellmanStrategy : ICryptoStrategy
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         using var doc = JsonDocument.Parse(publicParametersJson);
-        BigInteger pubA = new BigInteger(Convert.FromBase64String(doc.RootElement.GetProperty("pubA").GetString()!), true, true);
-        BigInteger privB = new BigInteger(Convert.FromBase64String(secretKeyBase64), true, true);
-        byte[] nonce = Convert.FromBase64String(doc.RootElement.GetProperty("nonce").GetString()!);
-        byte[] tag = Convert.FromBase64String(doc.RootElement.GetProperty("tag").GetString()!);
+        BigInteger pubA = new BigInteger(RsaStrategy.DecodePubParamField(doc.RootElement, "pubA", "DH"), true, true);
+        BigInteger privB = new BigInteger(RsaStrategy.DecodeAsymmetricKey(secretKeyBase64, "Diffie-Hellman privada"), true, true);
+        byte[] nonce = RsaStrategy.DecodePubParamField(doc.RootElement, "nonce", "DH");
+        byte[] tag = RsaStrategy.DecodePubParamField(doc.RootElement, "tag", "DH");
 
         BigInteger shared = BigInteger.ModPow(pubA, privB, SafePrime);
         byte[] key = SHA256.HashData(shared.ToByteArray(true, true));
@@ -301,11 +338,31 @@ public sealed class DigitalSigStrategy : ICryptoStrategy
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         using var doc = JsonDocument.Parse(publicParametersJson);
-        byte[] pubKey = Convert.FromBase64String(doc.RootElement.GetProperty("publicKey").GetString()!);
+        byte[] pubKey = KeyInputParser.TryGetJsonString(doc.RootElement, out string pubPemOrB64, "publicKey", "publicKeyPem") &&
+                        !string.IsNullOrWhiteSpace(pubPemOrB64)
+            ? RsaStrategy.DecodeAsymmetricKey(pubPemOrB64, "DIGITALSIG pública")
+            : (!string.IsNullOrWhiteSpace(secretKeyBase64)
+                ? RsaStrategy.DecodeAsymmetricKey(secretKeyBase64, "DIGITALSIG pública")
+                : throw new CryptographicException("Falta publicKey en publicParameters de DIGITALSIG."));
 
-        int sigLen = BitConverter.ToInt32(cipherBytes, 0);
-        byte[] signature = cipherBytes[4..(4 + sigLen)];
-        byte[] payload = cipherBytes[(4 + sigLen)..];
+        byte[] signature;
+        byte[] payload;
+        int sigLen = cipherBytes.Length >= 4 ? BitConverter.ToInt32(cipherBytes, 0) : -1;
+        if (sigLen is >= 64 and <= 1024 && 4 + sigLen <= cipherBytes.Length)
+        {
+            signature = cipherBytes[4..(4 + sigLen)];
+            payload = cipherBytes[(4 + sigLen)..];
+        }
+        else if (KeyInputParser.TryGetJsonString(doc.RootElement, out string sigB64, "signatureBase64", "signature") &&
+                 KeyInputParser.TryDecodeFlexibleBase64(sigB64, out byte[] detachedSig))
+        {
+            signature = detachedSig;
+            payload = cipherBytes;
+        }
+        else
+        {
+            throw new CryptographicException("Formato de firma digital DIGITALSIG incompatible.");
+        }
 
         using var rsa = RSA.Create();
         rsa.ImportSubjectPublicKeyInfo(pubKey, out _);

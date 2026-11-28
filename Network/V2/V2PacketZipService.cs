@@ -68,7 +68,10 @@ public static class V2PacketZipService
         List<ManifestPartInfo>? multipartParts = null,
         Dictionary<string, string>? explicitPublicParameters = null,
         CcHybridEnvelope? resultEnvelope = null,
-        long? originalSizeBytesOverride = null)
+        long? originalSizeBytesOverride = null,
+        ManifestKeyRef? explicitKeyRef = null,
+        bool useExplicitKeyRef = false,
+        ManifestVerification? verification = null)
     {
         string outDir = Core.Data.AppDbContext.OutgoingPacketsDirectory;
         Directory.CreateDirectory(outDir);
@@ -103,12 +106,17 @@ public static class V2PacketZipService
             ? parsedGuid.ToString("D").ToLowerInvariant()
             : Guid.NewGuid().ToString("D").ToLowerInvariant();
 
-        // Regla de Oro: jamás inyectar originalFileName, originalExtension ni _packetId en publicParameters
-        var publicParamsDict = explicitPublicParameters != null
-            ? SanitizePublicParametersForEmission(explicitPublicParameters)
-            : SanitizePublicParametersForEmission(ParseFlatPublicParameters(registro.ParametrosPublicosJson));
+        // ADR 0007 / Anexo A.2: Todo .zip tipo 'result' emite publicParameters = {} y SHA-256("")
+        // Regla de Oro en 'package': jamás inyectar originalFileName, originalExtension ni _packetId en publicParameters
+        Dictionary<string, string> publicParamsDict = isResult
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : (explicitPublicParameters != null
+                ? SanitizePublicParametersForEmission(explicitPublicParameters)
+                : SanitizePublicParametersForEmission(ParseFlatPublicParameters(registro.ParametrosPublicosJson)));
 
-        string pubParamsSha256Lower = PacketManifest.ComputePublicParametersSha256(publicParamsDict);
+        string pubParamsSha256Lower = isResult
+            ? PacketManifest.EmptySha256Lower
+            : PacketManifest.ComputePublicParametersSha256(publicParamsDict);
 
         string certPem = V2CertificateService.ExportPublicCertPem();
         string certThumbUpper = V2CertificateService.GetThumbprintSha256Hex();
@@ -125,6 +133,26 @@ public static class V2PacketZipService
         string officialKeyId = V2FormatValidators.IsValidKeyId(registro.LinkDescifradoRemoto)
             ? registro.LinkDescifradoRemoto
             : V2FormatValidators.BuildKeyId(actualProducer, packetId);
+
+        ManifestKeyRef? manifestKeyRef;
+        if (isResult)
+        {
+            manifestKeyRef = (cleanAlg is "AESGCM" or "DES")
+                ? null
+                : (useExplicitKeyRef ? explicitKeyRef : null);
+        }
+        else if (useExplicitKeyRef)
+        {
+            manifestKeyRef = explicitKeyRef;
+        }
+        else
+        {
+            manifestKeyRef = new ManifestKeyRef
+            {
+                KeyId = officialKeyId,
+                OwnerNode = actualProducer
+            };
+        }
 
         if (resultEnvelope != null)
         {
@@ -156,14 +184,10 @@ public static class V2PacketZipService
             EncryptedSha256 = sha256FullLower,
             EncryptedSizeBytes = cipherBytes.Length,
             Parts = multipartParts,
-            KeyRef = new ManifestKeyRef
-            {
-                KeyId = officialKeyId,
-                OwnerNode = actualProducer
-            },
+            KeyRef = manifestKeyRef,
             PublicParameters = publicParamsDict,
             PublicParametersSha256 = pubParamsSha256Lower,
-            Verification = isResult ? new ManifestVerification { Valid = true, Detail = "OK" } : null,
+            Verification = isResult ? (verification ?? new ManifestVerification { Valid = true, Detail = "OK" }) : null,
             ResultEnvelope = isResult ? resultEnvelope : null,
             CertificateThumbprintSha256 = certThumbUpper,
             SignatureAlgorithm = "RSA-PSS-SHA256"
@@ -278,11 +302,12 @@ public static class V2PacketZipService
 
         using var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create);
 
-        var dataEntry = archive.CreateEntry(payloadEntryName);
+        // Guardar datos.enc / resultado.enc sin compresión (store) para evitar falsos E-ZIP-BOMB (ratio > 100:1) en otros nodos
+        var dataEntry = archive.CreateEntry(payloadEntryName, CompressionLevel.NoCompression);
         using (var ds = dataEntry.Open())
             ds.Write(payloadBytes, 0, payloadBytes.Length);
 
-        var pemEntry = archive.CreateEntry("certificado.pem");
+        var pemEntry = archive.CreateEntry("certificado.pem", CompressionLevel.NoCompression);
         using (var swPem = new StreamWriter(pemEntry.Open(), new UTF8Encoding(false)))
             swPem.Write(certPem);
 

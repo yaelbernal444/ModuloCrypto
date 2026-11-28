@@ -1,4 +1,5 @@
 using ModuloCrypto.Core.Contracts;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace ModuloCrypto.Network.V2;
@@ -18,6 +19,7 @@ public sealed class V2CryptoForwardRequest
     public string RequesterNode { get; set; } = "EQ01";
 
     [JsonPropertyName("targetNode")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? TargetNode { get; set; }
 
     [JsonPropertyName("algorithmCode")]
@@ -27,13 +29,16 @@ public sealed class V2CryptoForwardRequest
     public string Operation { get; set; } = "forward";
 
     [JsonPropertyName("originalFileName")]
-    public string OriginalFileName { get; set; } = "payload.bin";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? OriginalFileName { get; set; }
 
     [JsonPropertyName("originalExtension")]
-    public string OriginalExtension { get; set; } = ".bin";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? OriginalExtension { get; set; }
 
     [JsonPropertyName("keySizeBits")]
-    public int KeySizeBits { get; set; } = 256;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? KeySizeBits { get; set; }
 
     [JsonPropertyName("secrets")]
     public CcHybridEnvelope? Secrets { get; set; }
@@ -42,12 +47,17 @@ public sealed class V2CryptoForwardRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public CcHybridEnvelope? SecretEnvelope
     {
-        get => Secrets;
+        get => null;
         set { if (value != null) Secrets = value; }
     }
 
+    [JsonPropertyName("options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, string>? Options { get; set; }
+
     [JsonPropertyName("parameters")]
-    public Dictionary<string, string> Parameters { get; set; } = new(StringComparer.Ordinal);
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, string>? Parameters { get; set; }
 
     [JsonPropertyName("forceAsync")]
     public bool ForceAsync { get; set; }
@@ -116,6 +126,7 @@ public sealed class V2CryptoInverseRequest
     public string RequesterNode { get; set; } = "EQ01";
 
     [JsonPropertyName("targetNode")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? TargetNode { get; set; }
 
     [JsonPropertyName("algorithmCode")]
@@ -125,6 +136,7 @@ public sealed class V2CryptoInverseRequest
     public string Operation { get; set; } = "inverse";
 
     [JsonPropertyName("keyId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? KeyId { get; set; }
 
     [JsonPropertyName("secrets")]
@@ -134,9 +146,13 @@ public sealed class V2CryptoInverseRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public CcHybridEnvelope? SecretEnvelope
     {
-        get => Secrets;
+        get => null;
         set { if (value != null) Secrets = value; }
     }
+
+    [JsonPropertyName("options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, string>? Options { get; set; }
 
     [JsonPropertyName("publicParameters")]
     public Dictionary<string, string> PublicParameters { get; set; } = new(StringComparer.Ordinal);
@@ -231,11 +247,65 @@ public sealed class V2AlgorithmProfileDto
     [JsonPropertyName("requiresKeyEnvelope")]
     public bool RequiresKeyEnvelope { get; set; } = true;
 
+    [JsonPropertyName("requiresSecret")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? RequiresSecret { get; set; }
+
+    [JsonPropertyName("requiresSecretOnInverse")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? RequiresSecretOnInverse { get; set; }
+
+    [JsonPropertyName("secretFields")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? SecretFields { get; set; }
+
+    [JsonPropertyName("optionsSchema")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? OptionsSchema { get; set; }
+
     [JsonPropertyName("publicParametersSchema")]
     public List<string> PublicParametersSchema { get; set; } = new();
 
     [JsonPropertyName("description")]
     public string Description { get; set; } = string.Empty;
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; set; }
+
+    public List<string> ResolveSecretFieldNames()
+    {
+        if (SecretFields is { Count: > 0 })
+            return SecretFields.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+
+        if (ExtensionData != null)
+        {
+            foreach (string key in new[] { "secretsSchema", "secretSchema", "requiredSecrets", "secretParameters" })
+            {
+                if (ExtensionData.TryGetValue(key, out var el) && el.ValueKind == JsonValueKind.Array)
+                {
+                    var extracted = new List<string>();
+                    foreach (var item in el.EnumerateArray())
+                    {
+                        if (item.ValueKind == JsonValueKind.String)
+                        {
+                            string? s = item.GetString();
+                            if (!string.IsNullOrWhiteSpace(s)) extracted.Add(s);
+                        }
+                        else if (item.ValueKind == JsonValueKind.Object)
+                        {
+                            if (item.TryGetProperty("name", out var nEl) && nEl.ValueKind == JsonValueKind.String && nEl.GetString() is { } nm)
+                                extracted.Add(nm);
+                            else if (item.TryGetProperty("field", out var fEl) && fEl.ValueKind == JsonValueKind.String && fEl.GetString() is { } fl)
+                                extracted.Add(fl);
+                        }
+                    }
+                    if (extracted.Count > 0) return extracted;
+                }
+            }
+        }
+
+        return new List<string>();
+    }
 }
 
 public sealed class V2PublicKeyResponseDto

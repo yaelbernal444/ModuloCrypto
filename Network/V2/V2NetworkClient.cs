@@ -2,29 +2,35 @@ using ModuloCrypto.Core.Contracts;
 using ModuloCrypto.Core.Data;
 using ModuloCrypto.Core.Models;
 using ModuloCrypto.Core.Services;
+using ModuloCrypto.Security.Strategies;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 namespace ModuloCrypto.Network.V2;
 
 /// <summary>
-/// Cliente HTTP v2.0 con SocketsHttpHandler optimizado, cabeceras obligatorias X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id,
-/// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1), escaneo de subred /24 en puertos 5001–5020
-/// (SemaphoreSlim(64, 64), timeout 500 ms, cooldown 5 min) y validación TOFU.
+/// Cliente HTTP/HTTPS v2.0 con SocketsHttpHandler optimizado (UseProxy=false), pinning TLS SHA-256 TOFU con fallback HTTP,
+/// cabeceras obligatorias X-CC-Node / X-CC-Protocol: 2.0 / X-CC-Request-Id, caché de perfiles GET /api/algorithms,
+/// delegación criptográfica remota (/api/crypto/forward e inverse con CC-ENV-1) y escaneo de subred /24.
 /// </summary>
 public static class V2NetworkClient
 {
     private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
+        UseProxy = false,
         PooledConnectionLifetime = TimeSpan.FromMinutes(2),
         ConnectTimeout = TimeSpan.FromSeconds(3)
     })
     {
         Timeout = TimeSpan.FromSeconds(35)
     };
+
+    private static readonly ConcurrentDictionary<string, HttpClient> PinnedHttpsClients = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, Dictionary<string, V2AlgorithmProfileDto>> PeerAlgorithmProfiles = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -33,6 +39,74 @@ public static class V2NetworkClient
 
     private static DateTime _lastAutoSubnetScanUtc = DateTime.MinValue;
     public static readonly TimeSpan AutoScanCooldown = TimeSpan.FromMinutes(5);
+
+    private static HttpClient GetOrCreatePinnedHttpsClient(PeerNode peer)
+    {
+        string expectedThumb = (peer.PinnedThumbprintSha256 ?? peer.CertThumbprint ?? string.Empty).Trim().ToUpperInvariant();
+        string cacheKey = $"{peer.IpAddress}:{peer.HttpsPort ?? 0}:{expectedThumb}";
+        return PinnedHttpsClients.GetOrAdd(cacheKey, _ =>
+        {
+            var handler = new SocketsHttpHandler
+            {
+                UseProxy = false,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromSeconds(3)
+            };
+            handler.SslOptions.RemoteCertificateValidationCallback = (_, cert, _, _) =>
+            {
+                if (cert == null || string.IsNullOrWhiteSpace(expectedThumb))
+                    return false;
+                string actualThumb = Convert.ToHexString(SHA256.HashData(cert.GetRawCertData()));
+                return V2CertificateService.FixedTimeEqualsHex(actualThumb, expectedThumb);
+            };
+            return new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(35)
+            };
+        });
+    }
+
+    private static bool CanUsePinnedHttps(PeerNode peer)
+    {
+        return peer.HttpsPort is > 0 and <= 65535 &&
+               peer.IsConfirmed &&
+               !string.IsNullOrWhiteSpace(peer.PinnedThumbprintSha256) &&
+               !peer.HasThumbprintMismatch;
+    }
+
+    private static async Task<HttpResponseMessage> SendWithHttpsFallbackAsync(
+        PeerNode peer,
+        string relativePath,
+        Func<string, HttpRequestMessage> requestFactory,
+        CancellationToken ct = default)
+    {
+        string path = relativePath.StartsWith('/') ? relativePath : "/" + relativePath;
+
+        if (CanUsePinnedHttps(peer))
+        {
+            string httpsBase = $"https://{peer.IpAddress}:{peer.HttpsPort!.Value}";
+            try
+            {
+                var tlsClient = GetOrCreatePinnedHttpsClient(peer);
+                using var httpsReq = requestFactory(httpsBase + path);
+                return await tlsClient.SendAsync(httpsReq, ct);
+            }
+            catch (HttpRequestException)
+            {
+                // Fallback transparente a HTTP si el peer cerró el puerto TLS o el proxy local no soporta HTTPS
+            }
+            catch (IOException)
+            {
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+            }
+        }
+
+        string httpBase = peer.BaseUrl.TrimEnd('/');
+        using var httpReq = requestFactory(httpBase + path);
+        return await Http.SendAsync(httpReq, ct);
+    }
 
     private static void AddStandardV2Headers(HttpRequestMessage req, string? requestId = null)
     {
@@ -43,6 +117,109 @@ public static class V2NetworkClient
         req.Headers.TryAddWithoutValidation("X-CC-Node", NodeRuntimeState.CurrentNodeId);
         req.Headers.TryAddWithoutValidation("X-CC-Protocol", "2.0");
         req.Headers.TryAddWithoutValidation("X-CC-Request-Id", reqId);
+    }
+
+    public static bool TryGetCachedAlgorithmProfile(string? nodeId, string algorithmCode, out V2AlgorithmProfileDto? profile)
+    {
+        profile = null;
+        if (string.IsNullOrWhiteSpace(nodeId) || string.IsNullOrWhiteSpace(algorithmCode))
+            return false;
+
+        if (!PeerAlgorithmProfiles.TryGetValue(nodeId.Trim().ToUpperInvariant(), out var byAlg))
+            return false;
+
+        return byAlg.TryGetValue(algorithmCode.Trim().ToUpperInvariant(), out profile);
+    }
+
+    public static async Task<IReadOnlyDictionary<string, V2AlgorithmProfileDto>> FetchPeerAlgorithmsAsync(
+        PeerNode peer,
+        int timeoutMs = 1500)
+    {
+        var map = new Dictionary<string, V2AlgorithmProfileDto>(StringComparer.OrdinalIgnoreCase);
+        if (peer == null || string.IsNullOrWhiteSpace(peer.IpAddress))
+            return map;
+
+        try
+        {
+            using var cts = new CancellationTokenSource(timeoutMs);
+            using var resp = await SendWithHttpsFallbackAsync(peer, "/api/algorithms", url =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, url);
+                AddStandardV2Headers(req);
+                return req;
+            }, cts.Token);
+
+            if (!resp.IsSuccessStatusCode)
+                return map;
+
+            string body = await resp.Content.ReadAsStringAsync(cts.Token);
+            using var doc = JsonDocument.Parse(body);
+
+            JsonElement arrayEl = default;
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                arrayEl = doc.RootElement;
+            }
+            else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (string.Equals(prop.Name, "algorithms", StringComparison.OrdinalIgnoreCase) &&
+                        prop.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        arrayEl = prop.Value;
+                        break;
+                    }
+                }
+            }
+
+            if (arrayEl.ValueKind != JsonValueKind.Array)
+                return map;
+
+            var discoveredCodes = new List<string>();
+            foreach (var item in arrayEl.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                if (!KeyInputParser.TryGetJsonString(item, out string code, "algorithmCode", "code", "algorithm"))
+                    continue;
+
+                string normCode = code.Trim().ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(normCode)) continue;
+
+                var dto = JsonSerializer.Deserialize<V2AlgorithmProfileDto>(item.GetRawText(), JsonOpts);
+                if (dto == null) continue;
+
+                map[normCode] = dto;
+                discoveredCodes.Add(normCode);
+            }
+
+            if (map.Count > 0 && NodeRuntimeState.IsValidNodeId(peer.NodeId))
+            {
+                PeerAlgorithmProfiles[peer.NodeId.Trim().ToUpperInvariant()] = map;
+                if (string.IsNullOrWhiteSpace(peer.AlgorithmsJson) || peer.AlgorithmsJson == "[]")
+                {
+                    peer.AlgorithmsJson = JsonSerializer.Serialize(discoveredCodes.Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return map;
+    }
+
+    public static async Task<V2AlgorithmProfileDto?> GetOrFetchPeerAlgorithmProfileAsync(
+        PeerNode peer,
+        string algorithmCode,
+        int timeoutMs = 1500)
+    {
+        if (TryGetCachedAlgorithmProfile(peer.NodeId, algorithmCode, out var cached) && cached != null)
+            return cached;
+
+        var fetched = await FetchPeerAlgorithmsAsync(peer, timeoutMs);
+        fetched.TryGetValue(algorithmCode.Trim().ToUpperInvariant(), out var profile);
+        return profile;
     }
 
     public static async Task<(bool Online, string Latency, PeerStatusResponse? Info)> PingNodeAsync(
@@ -75,6 +252,10 @@ public static class V2NetworkClient
                 node.NodeId = status.NodeId.ToUpperInvariant();
             if (status.TeamNumber > 0)
                 node.TeamNumber = status.TeamNumber;
+            if (status.HttpPort is > 0 and <= 65535)
+                node.Port = status.HttpPort;
+            if (status.HttpsPort is > 0 and <= 65535)
+                node.HttpsPort = status.HttpsPort;
             if (status.Algorithms is { Count: > 0 })
             {
                 node.AlgorithmsJson = JsonSerializer.Serialize(status.Algorithms);
@@ -84,7 +265,10 @@ public static class V2NetworkClient
             ApplyTofuThumbprintCheck(node, status.CertificateThumbprintSha256);
 
             if (!node.HasThumbprintMismatch)
+            {
                 await FetchAndValidatePeerCertificateAsync(node, customTimeoutMs ?? 1500);
+                await FetchPeerAlgorithmsAsync(node, customTimeoutMs ?? 1500);
+            }
 
             AppDbContext.UpsertTrustedPeer(node);
             return (true, node.LastLatency, status);
@@ -122,10 +306,12 @@ public static class V2NetworkClient
         try
         {
             using var cts = new CancellationTokenSource(timeoutMs);
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"{peer.BaseUrl}/api/certificate");
-            AddStandardV2Headers(req);
-
-            var resp = await Http.SendAsync(req, cts.Token);
+            using var resp = await SendWithHttpsFallbackAsync(peer, "/api/certificate", url =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, url);
+                AddStandardV2Headers(req);
+                return req;
+            }, cts.Token);
             if (!resp.IsSuccessStatusCode) return false;
 
             string body = await resp.Content.ReadAsStringAsync(cts.Token);
@@ -202,41 +388,41 @@ public static class V2NetworkClient
             ? "/api/results/receive"
             : "/api/requests/receive";
 
-        string url = targetPeer.BaseUrl.TrimEnd('/') + endpointPath;
-
         try
         {
-            using var form = new MultipartFormDataContent();
-            var content = new ByteArrayContent(fileBytes);
-            content.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
-            form.Add(content, "package", fileName);
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, url)
+            using var resp = await SendWithHttpsFallbackAsync(targetPeer, endpointPath, url =>
             {
-                Content = form
-            };
-            AddStandardV2Headers(req, packetId);
+                var form = new MultipartFormDataContent();
+                var content = new ByteArrayContent(fileBytes);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+                form.Add(content, "package", fileName);
 
-            var resp = await Http.SendAsync(req);
+                var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
+                AddStandardV2Headers(req, packetId);
+                return req;
+            });
+
             string body = await resp.Content.ReadAsStringAsync();
 
             if (resp.IsSuccessStatusCode)
             {
                 targetPeer.Status = "online";
                 targetPeer.LastSeenUtc = DateTime.UtcNow;
-                return (true, $"Paquete v2.0 entregado a {url}.\nHTTP {(int)resp.StatusCode}: {body}");
+                string scheme = CanUsePinnedHttps(targetPeer) ? $"https://{targetPeer.IpAddress}:{targetPeer.HttpsPort}{endpointPath}" : targetPeer.BaseUrl.TrimEnd('/') + endpointPath;
+                return (true, $"Paquete v2.0 entregado a {scheme}.\nHTTP {(int)resp.StatusCode}: {body}");
             }
 
             return (false, $"Rechazado por {targetPeer.NodeId} (HTTP {(int)resp.StatusCode}):\n{body}");
         }
         catch (Exception ex)
         {
-            return (false, $"Error de conexión hacia {url}: {ex.Message}");
+            return (false, $"Error de conexión hacia {targetPeer.BaseUrl.TrimEnd('/')}{endpointPath}: {ex.Message}");
         }
     }
 
     /// <summary>
-    /// Invoca POST /api/crypto/forward en un nodo proveedor v2.0 (firmando los bytes crudos de 'request' con RSA-PSS-SHA256).
+    /// Invoca POST /api/crypto/forward en un nodo proveedor v2.0 (firmando los bytes crudos de 'request' con RSA-PSS-SHA256)
+    /// con soporte ADR 0013 para secretos sellados CC-ENV-1 y options específicas por algoritmo.
     /// </summary>
     public static async Task<(bool Success, V2CryptoForwardResponse? Response, string ErrorMessage)> CallRemoteForwardAsync(
         PeerNode providerPeer,
@@ -244,13 +430,64 @@ public static class V2NetworkClient
         byte[] payloadBytes,
         string fileName,
         string extension,
-        int keySizeBits = 256)
+        int? keySizeBits = 256,
+        Dictionary<string, string>? secretsDictionary = null,
+        Dictionary<string, string>? options = null)
     {
         if (providerPeer.HasThumbprintMismatch)
             return (false, null, $"El nodo {providerPeer.NodeId} está bloqueado por cambio de huella TOFU.");
 
+        string algCode = algorithmCode.Trim().ToUpperInvariant();
         string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
         string packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+
+        var effectiveOptions = options is { Count: > 0 }
+            ? new Dictionary<string, string>(options, StringComparer.OrdinalIgnoreCase)
+            : null;
+        var effectiveSecrets = secretsDictionary is { Count: > 0 }
+            ? new Dictionary<string, string>(secretsDictionary, StringComparer.Ordinal)
+            : null;
+        int? effectiveKeySizeBits = keySizeBits is > 0 ? keySizeBits : null;
+
+        if (algCode == "HASHSHA")
+        {
+            effectiveSecrets = null;
+            effectiveKeySizeBits = null;
+            effectiveOptions ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!effectiveOptions.TryGetValue("hashAlgorithm", out var hAlg) || string.IsNullOrWhiteSpace(hAlg))
+                effectiveOptions["hashAlgorithm"] = "SHA-256";
+        }
+        else if (algCode == "HMACSHA256")
+        {
+            effectiveKeySizeBits = null;
+            effectiveOptions ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!effectiveOptions.TryGetValue("macAlgorithm", out var mAlg) || string.IsNullOrWhiteSpace(mAlg))
+                effectiveOptions["macAlgorithm"] = "HMAC-SHA256";
+
+            if (effectiveSecrets != null &&
+                effectiveSecrets.TryGetValue("key", out var rawHmacKey) &&
+                !string.IsNullOrWhiteSpace(rawHmacKey))
+            {
+                effectiveSecrets["key"] = KeyInputParser.NormalizeHmacKeyBase64(rawHmacKey);
+            }
+        }
+
+        CcHybridEnvelope? sealedSecrets = null;
+        if (effectiveSecrets is { Count: > 0 })
+        {
+            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+                await FetchAndValidatePeerCertificateAsync(providerPeer);
+
+            if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+                return (false, null, $"No se pudo obtener el certificado X.509 de {providerPeer.NodeId} para sellar 'secrets' CC-ENV-1.");
+
+            using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
+            sealedSecrets = V2EnvelopeService.SealSecretsDictionary(
+                effectiveSecrets,
+                providerCert,
+                providerPeer.NodeId,
+                requestId);
+        }
 
         var fwdReq = new V2CryptoForwardRequest
         {
@@ -258,34 +495,39 @@ public static class V2NetworkClient
             PacketId = packetId,
             RequesterNode = NodeRuntimeState.CurrentNodeId,
             TargetNode = providerPeer.NodeId,
-            AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
+            AlgorithmCode = algCode,
             Operation = "forward",
             OriginalFileName = fileName,
             OriginalExtension = extension,
-            KeySizeBits = keySizeBits,
+            KeySizeBits = effectiveKeySizeBits,
+            Secrets = sealedSecrets,
+            Options = effectiveOptions,
             TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         };
 
         byte[] rawRequestBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(fwdReq));
         string requestSigBase64 = V2CertificateService.SignDataPss(rawRequestBytes);
         string requesterCertPem = V2CertificateService.ExportPublicCertPem();
+        string uploadFileName = string.IsNullOrWhiteSpace(fileName) ? "payload.bin" : fileName;
 
-        using var form = new MultipartFormDataContent();
-        var reqContent = new ByteArrayContent(rawRequestBytes);
-        reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        form.Add(reqContent, "request", "request.json");
-        form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
-        form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
+        using var resp = await SendWithHttpsFallbackAsync(providerPeer, "/api/crypto/forward", url =>
+        {
+            var form = new MultipartFormDataContent();
+            var reqContent = new ByteArrayContent(rawRequestBytes);
+            reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            form.Add(reqContent, "request", "request.json");
+            form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
+            form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
 
-        var payloadContent = new ByteArrayContent(payloadBytes);
-        payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        form.Add(payloadContent, "payload", string.IsNullOrWhiteSpace(fileName) ? "payload.bin" : fileName);
+            var payloadContent = new ByteArrayContent(payloadBytes);
+            payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            form.Add(payloadContent, "payload", uploadFileName);
 
-        string url = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/crypto/forward";
-        using var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
-        AddStandardV2Headers(httpReq, requestId);
+            var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
+            AddStandardV2Headers(httpReq, requestId);
+            return httpReq;
+        });
 
-        var resp = await Http.SendAsync(httpReq);
         string body = await resp.Content.ReadAsStringAsync();
 
         if (!resp.IsSuccessStatusCode)
@@ -307,43 +549,102 @@ public static class V2NetworkClient
         Dictionary<string, string> publicParameters,
         CcHybridEnvelope? secretEnvelope = null,
         string? keyId = null,
-        byte[]? rawSecretBytesToSeal = null)
+        byte[]? rawSecretBytesToSeal = null,
+        Dictionary<string, string>? secretsDictionary = null,
+        Dictionary<string, string>? options = null)
     {
         if (providerPeer.HasThumbprintMismatch)
             return (false, null, null, $"El nodo {providerPeer.NodeId} está bloqueado por cambio de huella TOFU.");
 
+        string algCode = algorithmCode.Trim().ToUpperInvariant();
         string requestId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+
+        var effectiveOptions = options is { Count: > 0 }
+            ? new Dictionary<string, string>(options, StringComparer.OrdinalIgnoreCase)
+            : null;
+        var effectiveSecrets = secretsDictionary is { Count: > 0 }
+            ? new Dictionary<string, string>(secretsDictionary, StringComparer.Ordinal)
+            : null;
+
+        if (algCode == "HASHSHA")
+        {
+            effectiveSecrets = null;
+            secretEnvelope = null;
+            rawSecretBytesToSeal = null;
+            effectiveOptions ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!effectiveOptions.TryGetValue("hashAlgorithm", out var hAlg) || string.IsNullOrWhiteSpace(hAlg))
+            {
+                effectiveOptions["hashAlgorithm"] =
+                    publicParameters.TryGetValue("hashAlgorithm", out var pubH) && !string.IsNullOrWhiteSpace(pubH)
+                        ? pubH
+                        : "SHA-256";
+            }
+        }
+        else if (algCode == "HMACSHA256")
+        {
+            effectiveOptions ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!effectiveOptions.TryGetValue("macAlgorithm", out var mAlg) || string.IsNullOrWhiteSpace(mAlg))
+            {
+                effectiveOptions["macAlgorithm"] =
+                    publicParameters.TryGetValue("macAlgorithm", out var pubM) && !string.IsNullOrWhiteSpace(pubM)
+                        ? pubM
+                        : "HMAC-SHA256";
+            }
+
+            if (effectiveSecrets != null &&
+                effectiveSecrets.TryGetValue("key", out var rawHmacKey) &&
+                !string.IsNullOrWhiteSpace(rawHmacKey))
+            {
+                effectiveSecrets["key"] = KeyInputParser.NormalizeHmacKeyBase64(rawHmacKey);
+            }
+            else if (rawSecretBytesToSeal is { Length: > 0 and < 32 })
+            {
+                rawSecretBytesToSeal = SHA256.HashData(rawSecretBytesToSeal);
+            }
+        }
+
+        bool needsProviderCertToSeal =
+            effectiveSecrets is { Count: > 0 } ||
+            rawSecretBytesToSeal is { Length: > 0 } ||
+            (secretEnvelope != null && string.Equals(providerPeer.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase));
 
         if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
             await FetchAndValidatePeerCertificateAsync(providerPeer);
 
-        if (string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+        if (needsProviderCertToSeal && string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
             return (false, null, null, $"No se pudo obtener el certificado X.509 de {providerPeer.NodeId} para sellar el sobre CC-ENV-1.");
 
-        using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
+        if (!string.IsNullOrWhiteSpace(providerPeer.CertificatePem))
+        {
+            using var providerCert = V2CertificateService.LoadCertificateFromPemOrBase64(providerPeer.CertificatePem);
 
-        // Si tenemos rawSecretBytesToSeal (o si nos pasaron un secretEnvelope ligado a otro requestId),
-        // sellamos el diccionario plano {"key": "<base64>"} con AAD = requestId para el certificado del proveedor
-        if (rawSecretBytesToSeal is { Length: > 0 })
-        {
-            string keyB64 = Convert.ToBase64String(rawSecretBytesToSeal);
-            secretEnvelope = V2EnvelopeService.SealSecretsDictionary(
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = keyB64 },
-                providerCert,
-                providerPeer.NodeId,
-                requestId);
-        }
-        else if (secretEnvelope != null &&
-                 string.Equals(providerPeer.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
-        {
-            // Si el sobre fue emitido para nosotros por /api/crypto/forward con su propio requestId previo,
-            // lo abrimos y re-sellamos con el nuevo requestId de esta petición inverse
-            try
+            if (effectiveSecrets is { Count: > 0 })
             {
-                var openedDict = V2EnvelopeService.OpenSecretsDictionary(secretEnvelope, string.Empty, packetId);
-                secretEnvelope = V2EnvelopeService.SealSecretsDictionary(openedDict, providerCert, providerPeer.NodeId, requestId);
+                secretEnvelope = V2EnvelopeService.SealSecretsDictionary(
+                    effectiveSecrets,
+                    providerCert,
+                    providerPeer.NodeId,
+                    requestId);
             }
-            catch { }
+            else if (rawSecretBytesToSeal is { Length: > 0 })
+            {
+                string keyB64 = Convert.ToBase64String(rawSecretBytesToSeal);
+                secretEnvelope = V2EnvelopeService.SealSecretsDictionary(
+                    new Dictionary<string, string>(StringComparer.Ordinal) { ["key"] = keyB64 },
+                    providerCert,
+                    providerPeer.NodeId,
+                    requestId);
+            }
+            else if (secretEnvelope != null &&
+                     string.Equals(providerPeer.NodeId, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var openedDict = V2EnvelopeService.OpenSecretsDictionary(secretEnvelope, string.Empty, packetId);
+                    secretEnvelope = V2EnvelopeService.SealSecretsDictionary(openedDict, providerCert, providerPeer.NodeId, requestId);
+                }
+                catch { }
+            }
         }
 
         var invReq = new V2CryptoInverseRequest
@@ -352,34 +653,50 @@ public static class V2NetworkClient
             PacketId = packetId,
             RequesterNode = NodeRuntimeState.CurrentNodeId,
             TargetNode = providerPeer.NodeId,
-            AlgorithmCode = algorithmCode.Trim().ToUpperInvariant(),
+            AlgorithmCode = algCode,
             Operation = "inverse",
-            KeyId = keyId ?? V2FormatValidators.BuildKeyId(providerPeer.NodeId, packetId),
+            KeyId = string.IsNullOrWhiteSpace(keyId) ? null : keyId.Trim(),
             Secrets = secretEnvelope,
             PublicParameters = publicParameters,
+            Options = effectiveOptions,
             TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         };
 
         byte[] rawRequestBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(invReq));
         string requestSigBase64 = V2CertificateService.SignDataPss(rawRequestBytes);
         string requesterCertPem = V2CertificateService.ExportPublicCertPem();
+        bool isZipPackage = cipherOrPackageBytes.Length >= 4 &&
+                            cipherOrPackageBytes[0] == 0x50 &&
+                            cipherOrPackageBytes[1] == 0x4B &&
+                            cipherOrPackageBytes[2] == 0x03 &&
+                            cipherOrPackageBytes[3] == 0x04;
 
-        using var form = new MultipartFormDataContent();
-        var reqContent = new ByteArrayContent(rawRequestBytes);
-        reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        form.Add(reqContent, "request", "request.json");
-        form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
-        form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
+        using var resp = await SendWithHttpsFallbackAsync(providerPeer, "/api/crypto/inverse", url =>
+        {
+            var form = new MultipartFormDataContent();
+            var reqContent = new ByteArrayContent(rawRequestBytes);
+            reqContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            form.Add(reqContent, "request", "request.json");
+            form.Add(new StringContent(requestSigBase64, Encoding.UTF8), "requestSignature");
+            form.Add(new StringContent(requesterCertPem, Encoding.UTF8), "requesterCertificate");
 
-        var payloadContent = new ByteArrayContent(cipherOrPackageBytes);
-        payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        form.Add(payloadContent, "payload", "datos.enc");
+            var payloadContent = new ByteArrayContent(cipherOrPackageBytes);
+            if (isZipPackage)
+            {
+                payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+                form.Add(payloadContent, "package", "package.zip");
+            }
+            else
+            {
+                payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                form.Add(payloadContent, "payload", "datos.enc");
+            }
 
-        string url = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/crypto/inverse";
-        using var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
-        AddStandardV2Headers(httpReq, requestId);
+            var httpReq = new HttpRequestMessage(HttpMethod.Post, url) { Content = form };
+            AddStandardV2Headers(httpReq, requestId);
+            return httpReq;
+        });
 
-        var resp = await Http.SendAsync(httpReq);
         if (!resp.IsSuccessStatusCode)
         {
             string errBody = await resp.Content.ReadAsStringAsync();
@@ -446,17 +763,20 @@ public static class V2NetworkClient
         string jobId,
         string requestId)
     {
-        string statusUrl = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/jobs/{jobId}";
-        string resultUrl = $"{providerPeer.BaseUrl.TrimEnd('/')}/api/jobs/{jobId}/result";
+        string statusPath = $"/api/jobs/{jobId}";
+        string resultPath = $"/api/jobs/{jobId}/result";
 
         for (int attempt = 0; attempt < 15; attempt++)
         {
             await Task.Delay(1500);
 
-            using var statusReq = new HttpRequestMessage(HttpMethod.Get, statusUrl);
-            AddStandardV2Headers(statusReq, requestId);
+            using var statusResp = await SendWithHttpsFallbackAsync(providerPeer, statusPath, url =>
+            {
+                var statusReq = new HttpRequestMessage(HttpMethod.Get, url);
+                AddStandardV2Headers(statusReq, requestId);
+                return statusReq;
+            });
 
-            var statusResp = await Http.SendAsync(statusReq);
             if (!statusResp.IsSuccessStatusCode)
             {
                 string err = await statusResp.Content.ReadAsStringAsync();
@@ -472,9 +792,13 @@ public static class V2NetworkClient
 
             if (string.Equals(statusDto.Status, "completed", StringComparison.OrdinalIgnoreCase))
             {
-                using var resReq = new HttpRequestMessage(HttpMethod.Get, resultUrl);
-                AddStandardV2Headers(resReq, requestId);
-                var resResp = await Http.SendAsync(resReq);
+                using var resResp = await SendWithHttpsFallbackAsync(providerPeer, resultPath, url =>
+                {
+                    var resReq = new HttpRequestMessage(HttpMethod.Get, url);
+                    AddStandardV2Headers(resReq, requestId);
+                    return resReq;
+                });
+
                 if (!resResp.IsSuccessStatusCode)
                 {
                     string err = await resResp.Content.ReadAsStringAsync();

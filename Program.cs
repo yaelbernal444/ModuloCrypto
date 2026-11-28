@@ -8,11 +8,14 @@ using ModuloCrypto.Network.Shared;
 using ModuloCrypto.Network.V1;
 using ModuloCrypto.Network.V2;
 using ModuloCrypto.Security;
+using ModuloCrypto.Security.Strategies;
 using ModuloCrypto.UI.Forms;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -749,12 +752,345 @@ internal static class Program
             AppDbContext.CheckpointWalTruncate(tempDbPath);
             AppDbContext.CheckpointWalTruncate();
 
+            // BLOQUE 4: INTEROPERABILIDAD ESTRICTA v2.0 (ADR 0012 / 0005 / 0006 / 0007 / NoCompression) + PARSEO DE LLAVES (21 ALGORITMOS)
+            V2CertificateService.Initialize(forceRegenerate: true);
+            using (var certAdr0012 = V2CertificateService.LoadCertificateFromPemOrBase64(V2CertificateService.ExportPublicCertPem()))
+            {
+                if (new DateTimeOffset(certAdr0012.NotBefore.ToUniversalTime()) > DateTimeOffset.UtcNow.AddMinutes(-9))
+                    throw new Exception($"ADR 0012 falló: notBefore={certAdr0012.NotBefore:O} no tiene margen de -10 minutos.");
+                if (!certAdr0012.Subject.StartsWith("CN=EQ01", StringComparison.Ordinal))
+                    throw new Exception($"ADR 0012 falló: Subject '{certAdr0012.Subject}' no inicia con CN=EQ01.");
+                var bcExt = certAdr0012.Extensions.OfType<X509BasicConstraintsExtension>().FirstOrDefault();
+                if (bcExt == null || !bcExt.Critical)
+                    throw new Exception("ADR 0012 falló: BasicConstraints no es crítico.");
+            }
+
+            // Verificar compresión store (NoCompression) para evitar E-ZIP-BOMB en payloads repetitivos
+            byte[] compressiblePayload = Encoding.UTF8.GetBytes(new string('A', 4096));
+            string storeZipPath = Path.Combine(Path.GetTempPath(), $"v2_store_test_{Guid.NewGuid():N}.zip");
+            tempFiles.Add(storeZipPath);
+            var storeDummyReg = new RegistroCifrado
+            {
+                PacketId = Guid.NewGuid().ToString("D").ToLowerInvariant(),
+                NombreArchivo = "store.txt",
+                Extension = ".txt",
+                AlgoritmoCodigo = "AESGCM",
+                ParametrosPublicosJson = "{}",
+                NodoRaiz = "EQ01"
+            };
+            V2PacketZipService.CreatePacketZip(
+                storeDummyReg,
+                compressiblePayload,
+                packetType: "package",
+                destinationPath: storeZipPath);
+            using (var storeArch = ZipFile.OpenRead(storeZipPath))
+            {
+                var datosEntry = storeArch.GetEntry("datos.enc") ?? throw new Exception("Falta datos.enc en prueba NoCompression.");
+                var pemEntry = storeArch.GetEntry("certificado.pem") ?? throw new Exception("Falta certificado.pem en prueba NoCompression.");
+                if (datosEntry.CompressedLength != datosEntry.Length || pemEntry.CompressedLength != pemEntry.Length)
+                    throw new Exception($"Fallo NoCompression: datos={datosEntry.CompressedLength}/{datosEntry.Length}, pem={pemEntry.CompressedLength}/{pemEntry.Length}.");
+            }
+
+            // Pruebas HTTP activas ADR 0005, ADR 0006 y ADR 0007 / Anexo A.2
+            int interopPort = GetFreeTcpPort();
+            NodeRuntimeState.ConfigureForMode(ProtocolVersionMode.V2, teamNumber: 1, explicitPort: interopPort);
+            var cleanupPacketIds = new List<string>();
+            await using (var interopRuntime = new V2ProtocolRuntime())
+            {
+                if (!await interopRuntime.StartAsync(interopPort))
+                    throw new Exception($"No pudo iniciar interopRuntime en puerto {interopPort}: {interopRuntime.LastStartupError}");
+
+                try
+                {
+                    string eq01Thumb = V2CertificateService.Thumbprint;
+                    var eq01Peer = new PeerNode
+                    {
+                        NodeId = "EQ01",
+                        TeamNumber = 1,
+                        IpAddress = "127.0.0.1",
+                        Port = interopPort,
+                        CertThumbprint = eq01Thumb,
+                        PinnedThumbprintSha256 = eq01Thumb,
+                        CertificatePem = V2CertificateService.ExportPublicCertPem(),
+                        IsConfirmed = true,
+                        Status = "online"
+                    };
+
+                    // ADR 0007 / Anexo A.2: forward + inverse + validación estricta del paquete result
+                    byte[] anexoPlain = Encoding.UTF8.GetBytes("ModuloCrypto Anexo A.2 Result Envelope Check");
+                    var (fwdOk, fwdResp, fwdErr) = await V2NetworkClient.CallRemoteForwardAsync(
+                        eq01Peer, "AESGCM", anexoPlain, "anexo.txt", ".txt");
+                    if (!fwdOk || fwdResp == null)
+                        throw new Exception($"CallRemoteForwardAsync falló en interop: {fwdErr}");
+                    cleanupPacketIds.Add(fwdResp.PacketId);
+
+                    byte[] fwdCipher = Convert.FromBase64String(fwdResp.CiphertextBase64);
+                    var (invOk, invPlain, resultZip, invErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        eq01Peer,
+                        "AESGCM",
+                        fwdResp.PacketId,
+                        fwdCipher,
+                        fwdResp.PublicParameters,
+                        keyId: fwdResp.KeyRef.KeyId);
+                    if (!invOk || invPlain == null || resultZip == null || !invPlain.SequenceEqual(anexoPlain))
+                        throw new Exception($"CallRemoteInverseAsync falló en Anexo A.2: {invErr}");
+                    if (resultZip.Manifest.PublicParameters.Count != 0 ||
+                        resultZip.Manifest.PublicParametersSha256 != PacketManifest.EmptySha256Lower ||
+                        resultZip.Manifest.KeyRef != null ||
+                        resultZip.Manifest.ResultEnvelope == null)
+                    {
+                        throw new Exception("ADR 0007 falló: el paquete result no cumplió publicParameters={} / KeyRef=null / resultEnvelope.");
+                    }
+                    byte[] directOpenedRes = V2EnvelopeService.Open(
+                        resultZip.Manifest.ResultEnvelope,
+                        expectedAadContext: resultZip.Manifest.PacketId,
+                        detachedCiphertext: resultZip.PayloadBytes);
+                    if (!directOpenedRes.SequenceEqual(anexoPlain))
+                        throw new Exception("Anexo A.2 falló: AAD = result.packetId no abrió resultado.enc.");
+
+                    // ADR 0005: paquete .zip repetido y paquete .zip con timestamp > 15 min aceptados en /api/crypto/inverse con requestId distinto
+                    string replayPkgZip = Path.Combine(Path.GetTempPath(), $"v2_adr0005_pkg_{Guid.NewGuid():N}.zip");
+                    string expiredPkgZip = Path.Combine(Path.GetTempPath(), $"v2_adr0005_exp_{Guid.NewGuid():N}.zip");
+                    tempFiles.Add(replayPkgZip);
+                    tempFiles.Add(expiredPkgZip);
+
+                    var replayReg = new RegistroCifrado
+                    {
+                        PacketId = fwdResp.PacketId,
+                        NombreArchivo = "anexo.txt",
+                        Extension = ".txt",
+                        AlgoritmoCodigo = "AESGCM",
+                        ParametrosPublicosJson = JsonSerializer.Serialize(fwdResp.PublicParameters),
+                        LinkDescifradoRemoto = fwdResp.KeyRef.KeyId,
+                        NodoRaiz = "EQ01"
+                    };
+                    V2PacketZipService.CreatePacketZip(
+                        replayReg,
+                        fwdCipher,
+                        packetType: "package",
+                        destinationPath: replayPkgZip,
+                        explicitPublicParameters: fwdResp.PublicParameters,
+                        explicitKeyRef: fwdResp.KeyRef,
+                        useExplicitKeyRef: true);
+                    byte[] replayPkgBytes = await File.ReadAllBytesAsync(replayPkgZip);
+
+                    for (int attempt = 1; attempt <= 2; attempt++)
+                    {
+                        var (repOk, repPlain, _, repErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                            eq01Peer,
+                            "AESGCM",
+                            fwdResp.PacketId,
+                            replayPkgBytes,
+                            fwdResp.PublicParameters,
+                            keyId: fwdResp.KeyRef.KeyId);
+                        if (!repOk || repPlain == null || !repPlain.SequenceEqual(anexoPlain))
+                            throw new Exception($"ADR 0005 replay intento #{attempt} falló: {repErr}");
+                    }
+
+                    // Construir .zip con timestamp > 30 min antiguo firmado válidamente
+                    var parsedForExpire = V2PacketZipService.ReadPacketZip(replayPkgZip, enforceStrictSignature: false);
+                    parsedForExpire.Manifest.TimestampUtc = DateTime.UtcNow.AddMinutes(-35).ToString("yyyy-MM-ddTHH:mm:ssZ");
+                    parsedForExpire.Manifest.ManifestSignatureBase64 = V2CertificateService.SignDataPss(
+                        Encoding.UTF8.GetBytes(parsedForExpire.Manifest.BuildCanonicalSigningString()));
+                    using (var expArch = ZipFile.Open(expiredPkgZip, ZipArchiveMode.Create))
+                    {
+                        using (var ds = expArch.CreateEntry("datos.enc", CompressionLevel.NoCompression).Open())
+                            ds.Write(parsedForExpire.PayloadBytes, 0, parsedForExpire.PayloadBytes.Length);
+                        using (var swPem = new StreamWriter(expArch.CreateEntry("certificado.pem", CompressionLevel.NoCompression).Open(), new UTF8Encoding(false)))
+                            swPem.Write(parsedForExpire.CertificatePem);
+                        using (var swMan = new StreamWriter(expArch.CreateEntry("manifest.json", CompressionLevel.NoCompression).Open(), new UTF8Encoding(false)))
+                            swMan.Write(JsonSerializer.Serialize(parsedForExpire.Manifest));
+                    }
+                    byte[] expiredPkgBytes = await File.ReadAllBytesAsync(expiredPkgZip);
+                    var (expOk, expPlain, _, expErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        eq01Peer,
+                        "AESGCM",
+                        fwdResp.PacketId,
+                        expiredPkgBytes,
+                        fwdResp.PublicParameters,
+                        keyId: fwdResp.KeyRef.KeyId);
+                    if (!expOk || expPlain == null || !expPlain.SequenceEqual(anexoPlain))
+                        throw new Exception($"ADR 0005 paquete antiguo (>15 min) fue rechazado: {expErr}");
+
+                    // ADR 0006: petición /api/crypto/forward firmada por nodo nuevo EQ09 no registrado previamente -> 200 OK y Source="request", IsConfirmed=false
+                    using var rsaEq09 = RSA.Create(2048);
+                    var dnEq09 = new X500DistinguishedNameBuilder();
+                    dnEq09.AddCommonName("EQ09");
+                    dnEq09.AddOrganizationalUnitName("Equipo-09");
+                    dnEq09.AddOrganizationName("CentroCiberseguridad");
+                    dnEq09.AddCountryOrRegion("MX");
+                    var reqEq09Cert = new CertificateRequest(dnEq09.Build(), rsaEq09, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                    reqEq09Cert.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, critical: true));
+                    reqEq09Cert.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, critical: true));
+                    reqEq09Cert.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(reqEq09Cert.PublicKey, false));
+                    byte[] serialEq09 = RandomNumberGenerator.GetBytes(9);
+                    serialEq09[0] = (byte)((serialEq09[0] & 0x7F) | 0x40);
+                    using var certEq09 = reqEq09Cert.Create(
+                        reqEq09Cert.SubjectName,
+                        X509SignatureGenerator.CreateForRSA(rsaEq09, RSASignaturePadding.Pkcs1),
+                        DateTimeOffset.UtcNow.AddMinutes(-10),
+                        DateTimeOffset.UtcNow.AddDays(365),
+                        serialEq09);
+
+                    string eq09PacketId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+                    string eq09ReqId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+                    cleanupPacketIds.Add(eq09PacketId);
+
+                    var fwdReqEq09 = new V2CryptoForwardRequest
+                    {
+                        RequestId = eq09ReqId,
+                        PacketId = eq09PacketId,
+                        RequesterNode = "EQ09",
+                        TargetNode = "EQ01",
+                        AlgorithmCode = "AESGCM",
+                        Operation = "forward",
+                        OriginalFileName = "eq09.txt",
+                        OriginalExtension = ".txt",
+                        KeySizeBits = 256,
+                        TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    };
+                    byte[] rawEq09Req = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(fwdReqEq09));
+                    string sigEq09 = Convert.ToBase64String(rsaEq09.SignData(rawEq09Req, HashAlgorithmName.SHA256, RSASignaturePadding.Pss));
+                    string pemEq09 = certEq09.ExportCertificatePem();
+
+                    using var eq09Form = new MultipartFormDataContent();
+                    var eq09JsonContent = new ByteArrayContent(rawEq09Req);
+                    eq09JsonContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                    eq09Form.Add(eq09JsonContent, "request", "request.json");
+                    eq09Form.Add(new StringContent(sigEq09, Encoding.UTF8), "requestSignature");
+                    eq09Form.Add(new StringContent(pemEq09, Encoding.UTF8), "requesterCertificate");
+                    var eq09Payload = new ByteArrayContent(Encoding.UTF8.GetBytes("ADR0006 OK"));
+                    eq09Payload.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                    eq09Form.Add(eq09Payload, "payload", "eq09.txt");
+
+                    using var eq09Client = new HttpClient();
+                    using var eq09Msg = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{interopPort}/api/crypto/forward") { Content = eq09Form };
+                    eq09Msg.Headers.TryAddWithoutValidation("X-CC-Node", "EQ09");
+                    eq09Msg.Headers.TryAddWithoutValidation("X-CC-Protocol", "2.0");
+                    eq09Msg.Headers.TryAddWithoutValidation("X-CC-Request-Id", eq09ReqId);
+
+                    var eq09Resp = await eq09Client.SendAsync(eq09Msg);
+                    if (!eq09Resp.IsSuccessStatusCode)
+                    {
+                        string eq09Err = await eq09Resp.Content.ReadAsStringAsync();
+                        throw new Exception($"ADR 0006 falló: EQ09 no fue aceptado ({(int)eq09Resp.StatusCode}): {eq09Err}");
+                    }
+
+                    using (var eq09Db = new AppDbContext())
+                    {
+                        var registeredEq09 = eq09Db.TrustedPeers.AsNoTracking().FirstOrDefault(p => p.NodeId == "EQ09");
+                        if (registeredEq09 == null || registeredEq09.Source != "request" || registeredEq09.IsConfirmed)
+                            throw new Exception($"ADR 0006 falló al auto-registrar EQ09: found={registeredEq09 != null}, source={registeredEq09?.Source}, confirmed={registeredEq09?.IsConfirmed}");
+                    }
+                }
+                finally
+                {
+                    // Limpiar registros efímeros generados en la BD de producción por la prueba HTTP
+                    try
+                    {
+                        NodeRuntimeState.NetworkPeers.RemoveAll(p => p.NodeId == "EQ09");
+                        using var cleanDb = new AppDbContext();
+                        var pEq09 = cleanDb.TrustedPeers.Where(p => p.NodeId == "EQ09").ToList();
+                        if (pEq09.Count > 0) cleanDb.TrustedPeers.RemoveRange(pEq09);
+                        var testRegs = cleanDb.RegistrosCifrados.Where(r => cleanupPacketIds.Contains(r.PacketId)).ToList();
+                        if (testRegs.Count > 0) cleanDb.RegistrosCifrados.RemoveRange(testRegs);
+                        cleanDb.SaveChanges();
+                        AppDbContext.CheckpointWalTruncate();
+                    }
+                    catch { }
+                }
+            }
+
+            // Bloque 3 (Interoperabilidad EQ08 + parseo robusto de llaves en los 21 algoritmos)
+            byte[] sampleMsg = Encoding.UTF8.GetBytes("MensajeInteropEQ08!");
+            var hashStrategy = CryptoCatalog.GetStrategy("HASHSHA");
+            string sha256HexLower = Convert.ToHexString(SHA256.HashData(sampleMsg)).ToLowerInvariant();
+            string sha512HexLower = Convert.ToHexString(SHA512.HashData(sampleMsg)).ToLowerInvariant();
+
+            var hashOk256 = hashStrategy.Decrypt(sampleMsg, "", JsonSerializer.Serialize(new { hashAlgorithm = "SHA-256", digestHex = sha256HexLower }));
+            var hashOk512 = hashStrategy.Decrypt(sampleMsg, "", JsonSerializer.Serialize(new { hashAlgorithm = "SHA-512", digestHex = sha512HexLower }));
+            var hashFail256 = hashStrategy.Decrypt(sampleMsg, "", JsonSerializer.Serialize(new { hashAlgorithm = "SHA-256", digestHex = new string('0', 64) }));
+            if (!hashOk256.Success || !hashOk256.OutputBytes.SequenceEqual(sampleMsg) ||
+                !hashOk512.Success || !hashOk512.OutputBytes.SequenceEqual(sampleMsg) ||
+                hashFail256.Success || !hashFail256.OutputBytes.SequenceEqual(sampleMsg))
+            {
+                throw new Exception("Falló verificación HASHSHA v2.0 (digestHex / archivo intacto).");
+            }
+
+            var hmacStrategy = CryptoCatalog.GetStrategy("HMACSHA256");
+            byte[] shortPayload = Encoding.UTF8.GetBytes("Hola EQ08 < 32 B");
+            byte[] rawHmacKey = Encoding.UTF8.GetBytes("secreto-hmac-interop");
+            string extMacHex = Convert.ToHexString(HMACSHA256.HashData(rawHmacKey, shortPayload)).ToLowerInvariant();
+            string hmacPubExt = JsonSerializer.Serialize(new { macAlgorithm = "HMAC-SHA256", macHex = extMacHex });
+            var hmacExtOk = hmacStrategy.Decrypt(shortPayload, "secreto-hmac-interop", hmacPubExt);
+            var hmacExtBad = hmacStrategy.Decrypt(shortPayload, "otra-clave-incorrecta", hmacPubExt);
+            if (!hmacExtOk.Success || !hmacExtOk.OutputBytes.SequenceEqual(shortPayload) ||
+                hmacExtBad.Success || !hmacExtBad.OutputBytes.SequenceEqual(shortPayload))
+            {
+                throw new Exception("Falló verificación HMACSHA256 v2.0 sin recorte de 32 bytes.");
+            }
+            string normHmacB64 = KeyInputParser.NormalizeHmacKeyBase64("mi-clave-corta");
+            if (Convert.FromBase64String(normHmacB64).Length < 32)
+                throw new Exception("NormalizeHmacKeyBase64 debe garantizar >= 32 bytes.");
+
+            // CAESAR ("3", A-Z y BYTE)
+            var caesarStrategy = CryptoCatalog.GetStrategy("CAESAR");
+            var caesarAzDec = caesarStrategy.Decrypt(Encoding.UTF8.GetBytes("Krod Pxqgr 123!"), "3", JsonSerializer.Serialize(new { alphabet = "A-Z" }));
+            if (Encoding.UTF8.GetString(caesarAzDec.OutputBytes) != "Hola Mundo 123!")
+                throw new Exception($"Falló CAESAR A-Z con shift '3': '{Encoding.UTF8.GetString(caesarAzDec.OutputBytes)}'");
+            byte[] byteShifted = sampleMsg.Select(b => (byte)((b + 3) & 0xFF)).ToArray();
+            if (!caesarStrategy.Decrypt(byteShifted, "3", JsonSerializer.Serialize(new { alphabet = "BYTE" })).OutputBytes.SequenceEqual(sampleMsg))
+                throw new Exception("Falló CAESAR BYTE con shift entero '3'.");
+
+            // VIGENERE ("CRIPTOGRAFIA", A-Z y BYTE sin keyLength)
+            var vigStrategy = CryptoCatalog.GetStrategy("VIGENERE");
+            byte[] vigKeyBytes = Encoding.UTF8.GetBytes("CRIPTOGRAFIA");
+            byte[] vigByteCipher = sampleMsg.Select((b, i) => (byte)((b + vigKeyBytes[i % vigKeyBytes.Length]) & 0xFF)).ToArray();
+            if (!vigStrategy.Decrypt(vigByteCipher, "CRIPTOGRAFIA", "{}").OutputBytes.SequenceEqual(sampleMsg))
+                throw new Exception("Falló VIGENERE BYTE al parsear 'CRIPTOGRAFIA' sin corromper por Base64.");
+
+            // XORASM (modo v2.0 ROL 3 con clave "clave123")
+            var xorStrategy = CryptoCatalog.GetStrategy("XORASM");
+            byte[] xorKey = Encoding.UTF8.GetBytes("clave123");
+            byte[] xorCipher = sampleMsg.Select((b, i) =>
+            {
+                byte x = (byte)(b ^ xorKey[i % xorKey.Length]);
+                return (byte)(((x << 3) | (x >> 5)) & 0xFF);
+            }).ToArray();
+            var xorDec = xorStrategy.Decrypt(xorCipher, "clave123", JsonSerializer.Serialize(new { rotation = "ROL", rotationBits = 3 }));
+            if (!xorDec.OutputBytes.SequenceEqual(sampleMsg))
+                throw new Exception("Falló XORASM v2.0 con ROL 3 y clave 'clave123'.");
+
+            // EUCLIDESAFFINE ("5,8", mod 256 y mod 26)
+            var affStrategy = CryptoCatalog.GetStrategy("EUCLIDESAFFINE");
+            byte[] affCipher256 = sampleMsg.Select(b => (byte)((5 * b + 8) & 0xFF)).ToArray();
+            if (!affStrategy.Decrypt(affCipher256, "5,8", JsonSerializer.Serialize(new { modulus = 256 })).OutputBytes.SequenceEqual(sampleMsg))
+                throw new Exception("Falló EUCLIDESAFFINE mod 256 con llave '5,8'.");
+
+            // Verificar que entradas inválidas nunca lancen FormatException crudo en estrategias protegidas
+            foreach (string codeGuard in new[] { "CAESAR", "XORASM", "EUCLIDESAFFINE", "MILLERRABIN", "RSA", "ECC", "DIFFIEHELLMAN", "DIGITALSIG", "DFTSPECTRAL", "LAGRANGESHAMIR" })
+            {
+                try
+                {
+                    _ = CryptoCatalog.GetStrategy(codeGuard).Decrypt(new byte[16], "no-es-base64!!!", "{}");
+                }
+                catch (FormatException fex)
+                {
+                    throw new Exception($"La estrategia {codeGuard} lanzó FormatException sin controlar: {fex.Message}");
+                }
+                catch
+                {
+                    // Se permite CryptographicException o JsonException controlada
+                }
+            }
+
             Console.WriteLine(
                 $"SELFTEST_OK: DualArchitecture=v1.0+v2.0, SinglePersistentDB={AppDbContext.DatabasePath}, Consolidation={AppDbContext.LastConsolidationReport}, " +
                 $"SQLiteWAL_CheckpointTruncate=OK, Legacy4PendingMigrationTo5thAndConsultas=OK, IPv4={primaryEp.Ipv4Address}({primaryEp.InterfaceName}), " +
                 $"Algorithms={passedAlgorithms}/21, V1_5FileZIP_DualAPI_RemoteKey=OK, " +
                 $"V2_StrictEmission_EQ01_Table4_2(AESGCM,DES)=OK, V2_CC_ENV_1_ExactByteSizes(32B,12B,16B,256B,NoCiphertextInResultEnvelope)=OK, " +
                 $"V2_EQ06_6ByteAliasTolerance(ivBase64,opt.keySizeBits,AAD_PacketId_or_Null,Base64_Hex_Passphrase)=OK, " +
+                $"V2_Interop_ADRs(0005,0006,0007,0012,NoCompression,UseProxyFalse)=OK, EQ08_HashHmac_ClassicalKeys(NoFormatException)=OK, " +
                 $"V2_14StepValidation(E-ZIP-STRUCTURE:400,E-HASH:422,E-PARAMS-HASH:422,E-SIGNATURE:422,E-TIMESTAMP:422,E-DUPLICATE:409,E-ENV-RECIPIENT:401,E-ENV-DECRYPT:401)=OK");
             return 0;
         }

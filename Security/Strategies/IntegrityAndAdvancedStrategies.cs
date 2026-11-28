@@ -208,10 +208,33 @@ public sealed class MillerRabinStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        string secretJson = Encoding.UTF8.GetString(Convert.FromBase64String(secretKeyBase64));
+        string trimmedSec = (secretKeyBase64 ?? string.Empty).Trim();
+        string secretJson;
+        if (trimmedSec.StartsWith('{'))
+        {
+            secretJson = trimmedSec;
+        }
+        else if (KeyInputParser.TryDecodeFlexibleBase64(trimmedSec, out byte[] rawSec))
+        {
+            secretJson = Encoding.UTF8.GetString(rawSec);
+        }
+        else
+        {
+            throw new CryptographicException("Llave privada Miller-Rabin inválida (se esperaba Base64 o JSON con {d, n}). Si proviene de otro nodo, delega el descifrado al dueño.");
+        }
+
         using var doc = JsonDocument.Parse(secretJson);
-        BigInteger d = BigInteger.Parse(doc.RootElement.GetProperty("d").GetString()!);
-        BigInteger n = BigInteger.Parse(doc.RootElement.GetProperty("n").GetString()!);
+        if (!KeyInputParser.TryGetJsonString(doc.RootElement, out string dStr, "d") ||
+            !KeyInputParser.TryGetJsonString(doc.RootElement, out string nStr, "n"))
+        {
+            throw new CryptographicException("Parámetros d/n faltantes en llave Miller-Rabin.");
+        }
+
+        BigInteger d = BigInteger.Parse(dStr);
+        BigInteger n = BigInteger.Parse(nStr);
+
+        if (cipherBytes.Length < 8 || cipherBytes.Length % 8 != 0)
+            throw new CryptographicException("Longitud de payload cifrado Miller-Rabin inválida (múltiplo de 8 bytes requerido).");
 
         int blocks = cipherBytes.Length / 8;
         byte[] padded = new byte[blocks * 4];
@@ -223,14 +246,20 @@ public sealed class MillerRabinStrategy : ICryptoStrategy
             BinaryPrimitives.WriteUInt32BigEndian(padded.AsSpan(i * 4, 4), m32);
         }
 
+        if (padded.Length < 4)
+            throw new CryptographicException("Bloque descifrado Miller-Rabin incompleto.");
+
         int origLen = BinaryPrimitives.ReadInt32BigEndian(padded.AsSpan(0, 4));
+        if (origLen < 0 || 4 + origLen > padded.Length)
+            throw new CryptographicException("Longitud original inválida tras descifrado Miller-Rabin (llave incorrecta o formato incompatible).");
+
         byte[] plain = padded[4..(4 + origLen)];
 
         return new CryptoOperationResult
         {
             AlgorithmCode = Info.Code,
             OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
+            SecretKeyBase64 = secretKeyBase64 ?? string.Empty,
             PublicParametersJson = publicParametersJson,
             Summary = $"Miller-Rabin exponenciación modular inversa completada ({plain.Length} bytes)."
         };
@@ -328,24 +357,93 @@ public sealed class HashShaStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        using var doc = JsonDocument.Parse(publicParametersJson);
-        string expected256 = doc.RootElement.GetProperty("sha256").GetString() ?? "";
-        string expected512 = doc.RootElement.GetProperty("sha512").GetString() ?? "";
-
-        string verification =
-            $"[VERIFICACIÓN HASHSHA — FUNCIÓN UNIDIRECCIONAL]\r\n" +
-            $"Estado: Integridad registrada\r\n" +
-            $"SHA-256 Esperado: {expected256}\r\n" +
-            $"SHA-512 Esperado: {expected512}";
-
-        return new CryptoOperationResult
+        JsonDocument? doc = null;
+        try
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = Encoding.UTF8.GetBytes(verification),
-            SecretKeyBase64 = secretKeyBase64,
-            PublicParametersJson = publicParametersJson,
-            Summary = "Verificación de resumen SHA-256/SHA-512 completada (función hash unidireccional)."
-        };
+            if (!string.IsNullOrWhiteSpace(publicParametersJson))
+                doc = JsonDocument.Parse(publicParametersJson);
+
+            if (doc != null &&
+                KeyInputParser.TryGetJsonString(doc.RootElement, out string digestHex, "digestHex", "digest", "hashHex") &&
+                !string.IsNullOrWhiteSpace(digestHex))
+            {
+                string hashAlg = KeyInputParser.TryGetJsonString(doc.RootElement, out string ha, "hashAlgorithm", "algorithm") &&
+                                 !string.IsNullOrWhiteSpace(ha)
+                    ? ha.Trim().ToUpperInvariant()
+                    : "SHA-256";
+
+                byte[] actualHash = hashAlg.Contains("512", StringComparison.OrdinalIgnoreCase)
+                    ? SHA512.HashData(cipherBytes)
+                    : SHA256.HashData(cipherBytes);
+
+                string actualHex = Convert.ToHexString(actualHash).ToLowerInvariant();
+                string expectedHex = digestHex.Trim().ToLowerInvariant();
+                bool isValid = expectedHex.Length == actualHex.Length &&
+                               CryptographicOperations.FixedTimeEquals(
+                                   Encoding.ASCII.GetBytes(actualHex),
+                                   Encoding.ASCII.GetBytes(expectedHex));
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    Success = isValid,
+                    OutputBytes = cipherBytes,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = isValid
+                        ? $"VERIFICACIÓN VÁLIDA ({hashAlg}) — integridad verificada sobre {cipherBytes.Length} bytes ({actualHex[..Math.Min(16, actualHex.Length)]}...)."
+                        : $"VERIFICACIÓN INVÁLIDA ({hashAlg}) — esperado={expectedHex[..Math.Min(16, expectedHex.Length)]}..., calculado={actualHex[..Math.Min(16, actualHex.Length)]}...."
+                };
+            }
+
+            if (doc != null &&
+                KeyInputParser.TryGetJsonString(doc.RootElement, out string expected256, "sha256") &&
+                !string.IsNullOrWhiteSpace(expected256))
+            {
+                string actual256 = Convert.ToHexString(SHA256.HashData(cipherBytes)).ToLowerInvariant();
+                string clean256 = expected256.Trim().ToLowerInvariant();
+                bool valid = clean256.Length == actual256.Length &&
+                             CryptographicOperations.FixedTimeEquals(
+                                 Encoding.ASCII.GetBytes(actual256),
+                                 Encoding.ASCII.GetBytes(clean256));
+
+                if (valid && KeyInputParser.TryGetJsonString(doc.RootElement, out string expected512, "sha512") && !string.IsNullOrWhiteSpace(expected512))
+                {
+                    string actual512 = Convert.ToHexString(SHA512.HashData(cipherBytes)).ToLowerInvariant();
+                    string clean512 = expected512.Trim().ToLowerInvariant();
+                    valid = clean512.Length == actual512.Length &&
+                            CryptographicOperations.FixedTimeEquals(
+                                Encoding.ASCII.GetBytes(actual512),
+                                Encoding.ASCII.GetBytes(clean512));
+                }
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    Success = valid,
+                    OutputBytes = cipherBytes,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = valid
+                        ? $"VERIFICACIÓN VÁLIDA (SHA-256/SHA-512) — integridad confirmada ({cipherBytes.Length} bytes)."
+                        : $"VERIFICACIÓN INVÁLIDA — el resumen SHA-256/SHA-512 no coincide."
+                };
+            }
+
+            return new CryptoOperationResult
+            {
+                AlgorithmCode = Info.Code,
+                Success = false,
+                OutputBytes = cipherBytes,
+                SecretKeyBase64 = secretKeyBase64,
+                PublicParametersJson = publicParametersJson,
+                Summary = "VERIFICACIÓN INVÁLIDA — no se encontró digestHex ni sha256 en publicParameters."
+            };
+        }
+        finally
+        {
+            doc?.Dispose();
+        }
     }
 }
 
@@ -369,7 +467,7 @@ public sealed class HmacSha256Strategy : ICryptoStrategy
         using var hmac = new HMACSHA256(key);
         byte[] mac = hmac.ComputeHash(plainBytes);
 
-        // Sobre: [32 bytes MAC][payload]
+        // Sobre local: [32 bytes MAC][payload]
         byte[] envelope = new byte[mac.Length + plainBytes.Length];
         Buffer.BlockCopy(mac, 0, envelope, 0, mac.Length);
         Buffer.BlockCopy(plainBytes, 0, envelope, mac.Length, plainBytes.Length);
@@ -381,8 +479,9 @@ public sealed class HmacSha256Strategy : ICryptoStrategy
             SecretKeyBase64 = Convert.ToBase64String(key),
             PublicParametersJson = JsonSerializer.Serialize(new
             {
-                macHex = Convert.ToHexString(mac),
-                macBits = 256
+                macTagHex = Convert.ToHexString(mac),
+                macBits = 256,
+                layout = "MAC32_PAYLOAD"
             }),
             Summary = $"HMAC-SHA256 autenticado (MAC={Convert.ToHexString(mac)[..16]}...)."
         };
@@ -390,24 +489,98 @@ public sealed class HmacSha256Strategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] key = Convert.FromBase64String(secretKeyBase64);
-        byte[] mac = cipherBytes[..32];
+        var candidateKeys = KeyInputParser.BuildKeyCandidates(secretKeyBase64);
+        if (candidateKeys.Count == 0)
+            throw new CryptographicException("Llave secreta HMAC vacía o con formato inválido.");
+
+        string? macHex = null;
+        string? layout = null;
+        string macAlg = "HMAC-SHA256";
+        if (!string.IsNullOrWhiteSpace(publicParametersJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(publicParametersJson);
+                if (KeyInputParser.TryGetJsonString(doc.RootElement, out string mh, "macHex") && !string.IsNullOrWhiteSpace(mh))
+                    macHex = mh.Trim();
+                if (KeyInputParser.TryGetJsonString(doc.RootElement, out string l, "layout") && !string.IsNullOrWhiteSpace(l))
+                    layout = l.Trim();
+                if (KeyInputParser.TryGetJsonString(doc.RootElement, out string ma, "macAlgorithm", "algorithm") && !string.IsNullOrWhiteSpace(ma))
+                    macAlg = ma.Trim().ToUpperInvariant();
+            }
+            catch { }
+        }
+
+        // Modo v2.0 estándar: publicParameters contiene macHex sin layout MAC32_PAYLOAD y cipherBytes es el archivo íntegro sin prefijo de 32 bytes
+        if (!string.IsNullOrWhiteSpace(macHex) &&
+            !string.Equals(layout, "MAC32_PAYLOAD", StringComparison.OrdinalIgnoreCase))
+        {
+            bool looksLikeLegacyPrefixed =
+                KeyInputParser.TryDecodeHex(macHex, out byte[] expectedMacBytes) &&
+                expectedMacBytes.Length == 32 &&
+                cipherBytes.Length >= 32 &&
+                cipherBytes.AsSpan(0, 32).SequenceEqual(expectedMacBytes);
+
+            if (!looksLikeLegacyPrefixed)
+            {
+                bool isSha512 = macAlg.Contains("512", StringComparison.OrdinalIgnoreCase);
+                bool matched = false;
+
+                if (KeyInputParser.TryDecodeHex(macHex, out byte[] expBytes))
+                {
+                    foreach (byte[] keyCand in candidateKeys)
+                    {
+                        byte[] computed = isSha512
+                            ? HMACSHA512.HashData(keyCand, cipherBytes)
+                            : HMACSHA256.HashData(keyCand, cipherBytes);
+                        if (computed.Length == expBytes.Length &&
+                            CryptographicOperations.FixedTimeEquals(computed, expBytes))
+                        {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    Success = matched,
+                    OutputBytes = cipherBytes,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = matched
+                        ? $"VERIFICACIÓN VÁLIDA ({macAlg}) — código de autenticación HMAC confirmado ({cipherBytes.Length} bytes)."
+                        : $"VERIFICACIÓN INVÁLIDA ({macAlg}) — llave incorrecta o mensaje alterado (macHex={macHex[..Math.Min(16, macHex.Length)]}...)."
+                };
+            }
+        }
+
+        // Modo local / legado: sobre [32B MAC][payload]
+        if (cipherBytes.Length < 32)
+            throw new CryptographicException("Sobre HMAC inválido: tamaño menor a 32 bytes de etiqueta MAC.");
+
+        byte[] embeddedMac = cipherBytes[..32];
         byte[] payload = cipherBytes[32..];
 
-        using var hmac = new HMACSHA256(key);
-        byte[] computed = hmac.ComputeHash(payload);
-
-        if (!CryptographicOperations.FixedTimeEquals(mac, computed))
-            throw new CryptographicException("HMAC-SHA256 inválido: el mensaje fue alterado.");
-
-        return new CryptoOperationResult
+        foreach (byte[] keyCand in candidateKeys)
         {
-            AlgorithmCode = Info.Code,
-            OutputBytes = payload,
-            SecretKeyBase64 = secretKeyBase64,
-            PublicParametersJson = publicParametersJson,
-            Summary = $"HMAC-SHA256 VÁLIDO — payload auténtico recuperado ({payload.Length} bytes)."
-        };
+            byte[] computed = HMACSHA256.HashData(keyCand, payload);
+            if (CryptographicOperations.FixedTimeEquals(embeddedMac, computed))
+            {
+                return new CryptoOperationResult
+                {
+                    AlgorithmCode = Info.Code,
+                    Success = true,
+                    OutputBytes = payload,
+                    SecretKeyBase64 = secretKeyBase64,
+                    PublicParametersJson = publicParametersJson,
+                    Summary = $"HMAC-SHA256 VÁLIDO — payload auténtico recuperado ({payload.Length} bytes)."
+                };
+            }
+        }
+
+        throw new CryptographicException("HMAC-SHA256 inválido: la llave secreta no coincide o el mensaje fue alterado.");
     }
 }
 
@@ -475,7 +648,10 @@ public sealed class QuantumPqcStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        byte[] bb84Key = Convert.FromBase64String(secretKeyBase64);
+        byte[] bb84Key = KeyInputParser.ParseRawOrTextKey(secretKeyBase64, preferBase64WithoutPadding: true);
+        if (bb84Key.Length < 2)
+            throw new CryptographicException("Llave cuántica BB84/LWE inválida o menor a 2 bytes.");
+
         int s = (BinaryPrimitives.ReadUInt16LittleEndian(bb84Key) % 41) + 3;
 
         int count = cipherBytes.Length / 4;
@@ -571,11 +747,16 @@ public sealed class DftSpectralStrategy : ICryptoStrategy
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
         const int blockSize = 16;
-        byte[] phaseSeed = Convert.FromBase64String(secretKeyBase64);
+        byte[] phaseSeed = KeyInputParser.ResolveFixedLengthKey(secretKeyBase64, blockSize, "DFTSPECTRAL");
+
+        if (cipherBytes.Length < 4)
+            throw new CryptographicException("Datos cifrados DFTSPECTRAL incompletos.");
 
         using var ms = new MemoryStream(cipherBytes);
         using var br = new BinaryReader(ms);
         int origLen = br.ReadInt32();
+        if (origLen < 0 || origLen > 50_000_000)
+            throw new CryptographicException("Cabecera DFTSPECTRAL inválida.");
         int blocks = Math.Max(1, (origLen + blockSize - 1) / blockSize);
 
         byte[] output = new byte[origLen];
@@ -675,7 +856,21 @@ public sealed class LagrangeShamirStrategy : ICryptoStrategy
 
     public CryptoOperationResult Decrypt(byte[] cipherBytes, string secretKeyBase64, string publicParametersJson)
     {
-        string secretJson = Encoding.UTF8.GetString(Convert.FromBase64String(secretKeyBase64));
+        string trimmedSec = (secretKeyBase64 ?? string.Empty).Trim();
+        string secretJson;
+        if (trimmedSec.StartsWith('['))
+        {
+            secretJson = trimmedSec;
+        }
+        else if (KeyInputParser.TryDecodeFlexibleBase64(trimmedSec, out byte[] rawShares))
+        {
+            secretJson = Encoding.UTF8.GetString(rawShares);
+        }
+        else
+        {
+            throw new CryptographicException("Secretos Lagrange/Shamir inválidos (se esperaba JSON o Base64 de shares). Si proviene de otro nodo, delega el descifrado al nodo dueño.");
+        }
+
         using var sharesDoc = JsonDocument.Parse(secretJson);
         var xs = new List<byte>();
         var ys = new List<byte[]>();
@@ -683,14 +878,22 @@ public sealed class LagrangeShamirStrategy : ICryptoStrategy
         foreach (var item in sharesDoc.RootElement.EnumerateArray())
         {
             xs.Add((byte)item.GetProperty("x").GetInt32());
-            ys.Add(Convert.FromBase64String(item.GetProperty("y").GetString()!));
+            string yStr = KeyInputParser.TryGetJsonString(item, out string ysVal, "y") ? ysVal : string.Empty;
+            if (!KeyInputParser.TryDecodeFlexibleBase64(yStr, out byte[] yBytes))
+                throw new CryptographicException("Share Shamir 'y' con Base64 inválido.");
+            ys.Add(yBytes);
         }
 
         byte[] masterKey = CombineSecretGf256(xs.ToArray(), ys.ToArray());
 
         using var pubDoc = JsonDocument.Parse(publicParametersJson);
-        byte[] nonce = Convert.FromBase64String(pubDoc.RootElement.GetProperty("nonce").GetString()!);
-        byte[] tag = Convert.FromBase64String(pubDoc.RootElement.GetProperty("tag").GetString()!);
+        if (!KeyInputParser.TryGetJsonString(pubDoc.RootElement, out string nonceStr, "nonce", "iv", "ivBase64") ||
+            !KeyInputParser.TryDecodeBase64OrHex(nonceStr, out byte[] nonce))
+            throw new CryptographicException("Parámetro público 'nonce' inválido en LAGRANGESHAMIR.");
+        if (!KeyInputParser.TryGetJsonString(pubDoc.RootElement, out string tagStr, "tag", "authTag", "tagBase64") ||
+            !KeyInputParser.TryDecodeBase64OrHex(tagStr, out byte[] tag))
+            throw new CryptographicException("Parámetro público 'tag' inválido en LAGRANGESHAMIR.");
+
         byte[] plain = new byte[cipherBytes.Length];
 
         using (var aes = new AesGcm(masterKey, 16))
@@ -700,7 +903,7 @@ public sealed class LagrangeShamirStrategy : ICryptoStrategy
         {
             AlgorithmCode = Info.Code,
             OutputBytes = plain,
-            SecretKeyBase64 = secretKeyBase64,
+            SecretKeyBase64 = secretKeyBase64 ?? string.Empty,
             PublicParametersJson = publicParametersJson,
             Summary = $"Interpolación Lagrange GF(256) reconstruyó llave y descifró ({plain.Length} bytes)."
         };

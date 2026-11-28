@@ -7,9 +7,11 @@ using ModuloCrypto.Network.Shared;
 using ModuloCrypto.Network.V1;
 using ModuloCrypto.Network.V2;
 using ModuloCrypto.Security;
+using ModuloCrypto.Security.Strategies;
 using ModuloCrypto.UI.Controls;
 using ModuloCrypto.UI.Theme;
 using System.Drawing;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows.Forms;
 
@@ -721,34 +723,85 @@ public partial class FormDashboard
         try
         {
             var parsed = V2PacketZipService.ReadPacketZip(sol.RutaZipTemporal, enforceStrictSignature: true);
+            string algCode = parsed.Manifest.AlgorithmCode.Trim().ToUpperInvariant();
             string? secretKey = null;
             string pubJson = JsonSerializer.Serialize(parsed.Manifest.PublicParameters);
+            var hops = new List<string> { parsed.Manifest.ProducerNode };
+            if (!hops.Contains(parsed.Manifest.SourceNode))
+                hops.Add(parsed.Manifest.SourceNode);
+            if (!hops.Contains(NodeRuntimeState.CurrentNodeId))
+                hops.Add(NodeRuntimeState.CurrentNodeId);
 
-            string lookupKeyId = parsed.Manifest.KeyRef?.KeyId ?? parsed.Manifest.PacketId;
+            string? lookupKeyId = !string.IsNullOrWhiteSpace(parsed.Manifest.KeyRef?.KeyId)
+                ? parsed.Manifest.KeyRef.KeyId.Trim()
+                : null;
+            string keyRefDisplay = lookupKeyId ?? $"owner={parsed.Manifest.ProducerNode}";
+
+            // Caso 1: Nuestro nodo tiene registro/llave guardada localmente
             var localMatch = db.RegistrosCifrados.FirstOrDefault(r =>
-                r.PacketId == lookupKeyId || r.PacketId == parsed.Manifest.PacketId);
+                (lookupKeyId != null && r.PacketId == lookupKeyId) || r.PacketId == parsed.Manifest.PacketId);
 
             if (localMatch != null && !string.IsNullOrWhiteSpace(localMatch.LlaveSecretaBase64))
             {
                 secretKey = localMatch.LlaveSecretaBase64;
                 if (string.IsNullOrWhiteSpace(pubJson) || pubJson == "{}")
                     pubJson = localMatch.ParametrosPublicosJson;
+
+                FinalizeAcceptedSolicitud(
+                    db,
+                    sol,
+                    parsed.Manifest.PacketId,
+                    parsed.Manifest.OriginalFileName,
+                    parsed.Manifest.OriginalExtension,
+                    parsed.PayloadBytes,
+                    algCode,
+                    pubJson,
+                    secretKey,
+                    keyRefDisplay,
+                    parsed.Manifest.ProducerNode,
+                    parsed.Manifest.ManifestSignatureBase64,
+                    hops,
+                    parsed.SignatureValid && parsed.IntegrityValid,
+                    hasSignature: true,
+                    requestId: parsed.Manifest.RequestId);
+                return;
             }
 
-            if (string.IsNullOrWhiteSpace(secretKey) &&
-                !string.Equals(parsed.Manifest.ProducerNode, NodeRuntimeState.CurrentNodeId, StringComparison.OrdinalIgnoreCase))
+            // Caso 2: Algoritmo de otro equipo / paquete externo — resolver dueño por KeyRef, pares que anuncian algoritmo (ej. EQ08), ProducerNode o Tabla 4.1
+            string? preferredOwner = !string.IsNullOrWhiteSpace(parsed.Manifest.KeyRef?.OwnerNode)
+                ? parsed.Manifest.KeyRef.OwnerNode
+                : parsed.Manifest.ProducerNode;
+
+            var ownerPeer = ResolveBestPeerForAlgorithm(algCode, preferredOwner);
+            if (ownerPeer != null && !ownerPeer.HasThumbprintMismatch &&
+                (!ownerPeer.IsOnline || string.IsNullOrWhiteSpace(ownerPeer.CertificatePem)))
             {
-                var producerPeer = NodeRuntimeState.NetworkPeers.FirstOrDefault(p =>
-                    string.Equals(p.NodeId, parsed.Manifest.ProducerNode, StringComparison.OrdinalIgnoreCase) && p.IsOnline);
-                if (producerPeer != null && !producerPeer.HasThumbprintMismatch)
+                await V2NetworkClient.PingNodeAsync(ownerPeer, customTimeoutMs: 1100);
+            }
+
+            bool ownerAvailable = ownerPeer != null && ownerPeer.IsOnline && !ownerPeer.HasThumbprintMismatch;
+            V2AlgorithmProfileDto? profile = ownerAvailable
+                ? await V2NetworkClient.GetOrFetchPeerAlgorithmProfileAsync(ownerPeer!, algCode, 1200)
+                : null;
+
+            bool isNaturallySecretlessOnInverse =
+                algCode is "HASHSHA" or "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC" or "LAGRANGESHAMIR" or "MILLERRABIN" ||
+                (profile?.RequiresSecretOnInverse == false && (profile.ResolveSecretFieldNames().Count == 0));
+
+            if (ownerAvailable)
+            {
+                // 2A. Sin modal si el algoritmo es sin secreto o custodiado con keyId en el proveedor
+                if (isNaturallySecretlessOnInverse || !string.IsNullOrWhiteSpace(lookupKeyId))
                 {
-                    var (invOk, plainFromRemote, _, _) = await V2NetworkClient.CallRemoteInverseAsync(
-                        producerPeer,
-                        parsed.Manifest.AlgorithmCode,
+                    var (_, autoOpts) = BuildV2SecretsAndOptionsFromInput(algCode, null, parsed.Manifest.PublicParameters);
+                    var (invOk, plainFromRemote, resultZip, invErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                        ownerPeer!,
+                        algCode,
                         parsed.Manifest.PacketId,
                         parsed.PayloadBytes,
                         parsed.Manifest.PublicParameters,
-                        keyId: lookupKeyId);
+                        keyId: lookupKeyId,
+                        options: autoOpts);
 
                     if (invOk && plainFromRemote != null)
                     {
@@ -759,42 +812,201 @@ public partial class FormDashboard
                             parsed.Manifest.OriginalFileName,
                             parsed.Manifest.OriginalExtension,
                             parsed.PayloadBytes,
-                            parsed.Manifest.AlgorithmCode,
+                            algCode,
                             pubJson,
                             string.Empty,
-                            $"keyRef://{parsed.Manifest.ProducerNode}/{lookupKeyId}",
+                            lookupKeyId != null ? $"keyRef://{ownerPeer!.NodeId}/{lookupKeyId}" : $"remote://{ownerPeer!.NodeId}/{parsed.Manifest.PacketId}",
                             parsed.Manifest.ProducerNode,
                             parsed.Manifest.ManifestSignatureBase64,
-                            new List<string> { parsed.Manifest.ProducerNode, parsed.Manifest.SourceNode, NodeRuntimeState.CurrentNodeId }.Distinct().ToList(),
+                            hops,
                             parsed.SignatureValid && parsed.IntegrityValid,
                             hasSignature: true,
-                            preDecryptedBytes: plainFromRemote);
+                            preDecryptedBytes: plainFromRemote,
+                            requestId: parsed.Manifest.RequestId,
+                            remoteVerification: resultZip?.Manifest.Verification);
                         return;
                     }
+
+                    // Si era sin secreto (p. ej. HASHSHA o asimétrico custodiado) y el dueño falló, ofrecer fallback local / guardar
+                    if (isNaturallySecretlessOnInverse)
+                    {
+                        if (algCode == "HASHSHA")
+                        {
+                            FinalizeAcceptedSolicitud(
+                                db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                                parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                                string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                                hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                                requestId: parsed.Manifest.RequestId);
+                            return;
+                        }
+
+                        var choice = MessageBox.Show(this,
+                            $"El nodo dueño ({ownerPeer!.NodeId}) devolvió error en /api/crypto/inverse ({algCode}):\n{invErr}\n\n" +
+                            $"• Pulsa [Sí] para intentar descifrado/llave manual en LOCAL.\n" +
+                            $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido'.\n" +
+                            $"• Pulsa [Cancelar] para mantener la solicitud en 'Pendiente'.",
+                            $"Delegación Remota v2.0 — {ownerPeer.NodeId}",
+                            MessageBoxButtons.YesNoCancel,
+                            MessageBoxIcon.Warning);
+
+                        if (choice == DialogResult.Cancel) return;
+                        if (choice == DialogResult.No)
+                        {
+                            FinalizeAcceptedSolicitud(
+                                db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                                parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                                string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                                hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                                skipDecryptAndStoreReceived: true,
+                                requestId: parsed.Manifest.RequestId);
+                            return;
+                        }
+                    }
                 }
-            }
 
-            if (string.IsNullOrWhiteSpace(secretKey))
-            {
-                string? manualKey = PromptExternalPassphraseModal(
-                    parsed.Manifest.AlgorithmCode,
-                    parsed.Manifest.ProducerNode,
-                    parsed.Manifest.SourceNode,
-                    parsed.SignatureValid);
-                if (manualKey == null)
+                // 2B. Pedir secretos dinámicos según /api/algorithms + Tabla 4.2 UNA sola vez y delegar al dueño
+                var modalRes = PromptV2SecretsModal(
+                    algCode,
+                    operation: "inverse",
+                    producerNode: parsed.Manifest.ProducerNode,
+                    sourceNode: parsed.Manifest.SourceNode,
+                    sigValid: parsed.SignatureValid,
+                    profile: profile,
+                    pubParams: parsed.Manifest.PublicParameters,
+                    targetPeer: ownerPeer);
+
+                if (modalRes == null)
                     return;
-                secretKey = manualKey;
+
+                var (invSecretOk, plainSecretRemote, resultSecretZip, invSecretErr) = await V2NetworkClient.CallRemoteInverseAsync(
+                    ownerPeer!,
+                    algCode,
+                    parsed.Manifest.PacketId,
+                    parsed.PayloadBytes,
+                    parsed.Manifest.PublicParameters,
+                    keyId: lookupKeyId,
+                    secretsDictionary: modalRes.SecretsDictionary,
+                    options: modalRes.Options);
+
+                if (invSecretOk && plainSecretRemote != null)
+                {
+                    FinalizeAcceptedSolicitud(
+                        db,
+                        sol,
+                        parsed.Manifest.PacketId,
+                        parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension,
+                        parsed.PayloadBytes,
+                        algCode,
+                        pubJson,
+                        modalRes.LocalSecretKeyString,
+                        lookupKeyId != null ? $"keyRef://{ownerPeer!.NodeId}/{lookupKeyId}" : $"remote://{ownerPeer!.NodeId}/{parsed.Manifest.PacketId}",
+                        parsed.Manifest.ProducerNode,
+                        parsed.Manifest.ManifestSignatureBase64,
+                        hops,
+                        parsed.SignatureValid && parsed.IntegrityValid,
+                        hasSignature: true,
+                        preDecryptedBytes: plainSecretRemote,
+                        requestId: parsed.Manifest.RequestId,
+                        remoteVerification: resultSecretZip?.Manifest.Verification);
+                    return;
+                }
+
+                var fallbackChoice = MessageBox.Show(this,
+                    $"El nodo {ownerPeer!.NodeId} no pudo completar el descifrado remoto ({algCode}):\n{invSecretErr}\n\n" +
+                    $"• Pulsa [Sí] para intentar descifrado LOCAL con la clave/parámetros ingresados.\n" +
+                    $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido'.\n" +
+                    $"• Pulsa [Cancelar] para dejar la solicitud en 'Pendiente'.",
+                    $"Fallback Local v2.0 — {algCode}",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Warning);
+
+                if (fallbackChoice == DialogResult.Cancel) return;
+
+                string effectivePubForLocal = MergeLocalOptionsIntoPubParams(pubJson, modalRes.Options);
+                FinalizeAcceptedSolicitud(
+                    db,
+                    sol,
+                    parsed.Manifest.PacketId,
+                    parsed.Manifest.OriginalFileName,
+                    parsed.Manifest.OriginalExtension,
+                    parsed.PayloadBytes,
+                    algCode,
+                    effectivePubForLocal,
+                    modalRes.LocalSecretKeyString,
+                    keyRefDisplay,
+                    parsed.Manifest.ProducerNode,
+                    parsed.Manifest.ManifestSignatureBase64,
+                    hops,
+                    parsed.SignatureValid && parsed.IntegrityValid,
+                    hasSignature: true,
+                    skipDecryptAndStoreReceived: fallbackChoice == DialogResult.No,
+                    requestId: parsed.Manifest.RequestId);
+                return;
             }
 
-            var hops = new List<string> { parsed.Manifest.ProducerNode };
-            if (!hops.Contains(parsed.Manifest.SourceNode))
-                hops.Add(parsed.Manifest.SourceNode);
-            if (!hops.Contains(NodeRuntimeState.CurrentNodeId))
-                hops.Add(NodeRuntimeState.CurrentNodeId);
+            // Caso 3: Nodo dueño offline, bloqueado o desconocido -> verificar HASHSHA directo o pedir clave local
+            if (algCode == "HASHSHA")
+            {
+                FinalizeAcceptedSolicitud(
+                    db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                    parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                    string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                    hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                    requestId: parsed.Manifest.RequestId);
+                return;
+            }
 
-            string keyRefDisplay = parsed.Manifest.KeyRef != null
-                ? parsed.Manifest.KeyRef.KeyId
-                : V2FormatValidators.BuildKeyId(parsed.Manifest.ProducerNode, parsed.Manifest.PacketId);
+            string? manualOrModalKey = string.Empty;
+            string effectiveLocalPub = pubJson;
+            if (!isNaturallySecretlessOnInverse)
+            {
+                var localModal = PromptV2SecretsModal(
+                    algCode,
+                    operation: "inverse",
+                    producerNode: parsed.Manifest.ProducerNode,
+                    sourceNode: parsed.Manifest.SourceNode,
+                    sigValid: parsed.SignatureValid,
+                    profile: null,
+                    pubParams: parsed.Manifest.PublicParameters,
+                    targetPeer: null);
+
+                if (localModal == null)
+                    return;
+
+                manualOrModalKey = localModal.LocalSecretKeyString;
+                effectiveLocalPub = MergeLocalOptionsIntoPubParams(pubJson, localModal.Options);
+            }
+            else
+            {
+                string ownerExpected = preferredOwner ?? NodeRuntimeState.GetOwnerNodeForAlgorithm(algCode);
+                var offlineChoice = MessageBox.Show(this,
+                    $"El algoritmo {algCode} requiere la llave custodiada por {ownerExpected}, pero ese nodo está OFFLINE o sin confirmar en Red de Nodos.\n\n" +
+                    $"• Pulsa [Sí] para intentar ingresar una llave manual en LOCAL.\n" +
+                    $"• Pulsa [No] para GUARDAR el paquete en Consultas como 'Recibido' y reintentar después.\n" +
+                    $"• Pulsa [Cancelar] para dejar la solicitud en 'Pendiente'.",
+                    $"Nodo Dueño {ownerExpected} Offline",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Information);
+
+                if (offlineChoice == DialogResult.Cancel) return;
+                if (offlineChoice == DialogResult.No)
+                {
+                    FinalizeAcceptedSolicitud(
+                        db, sol, parsed.Manifest.PacketId, parsed.Manifest.OriginalFileName,
+                        parsed.Manifest.OriginalExtension, parsed.PayloadBytes, algCode, pubJson,
+                        string.Empty, keyRefDisplay, parsed.Manifest.ProducerNode, parsed.Manifest.ManifestSignatureBase64,
+                        hops, parsed.SignatureValid && parsed.IntegrityValid, hasSignature: true,
+                        skipDecryptAndStoreReceived: true,
+                        requestId: parsed.Manifest.RequestId);
+                    return;
+                }
+
+                string? manualAsym = PromptExternalPassphraseModal(algCode, parsed.Manifest.ProducerNode, parsed.Manifest.SourceNode, parsed.SignatureValid);
+                if (manualAsym == null) return;
+                manualOrModalKey = manualAsym;
+            }
 
             FinalizeAcceptedSolicitud(
                 db,
@@ -803,9 +1015,9 @@ public partial class FormDashboard
                 parsed.Manifest.OriginalFileName,
                 parsed.Manifest.OriginalExtension,
                 parsed.PayloadBytes,
-                parsed.Manifest.AlgorithmCode,
-                pubJson,
-                secretKey,
+                algCode,
+                effectiveLocalPub,
+                manualOrModalKey,
                 keyRefDisplay,
                 parsed.Manifest.ProducerNode,
                 parsed.Manifest.ManifestSignatureBase64,
@@ -817,6 +1029,31 @@ public partial class FormDashboard
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Error al procesar solicitud v2.0:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static string MergeLocalOptionsIntoPubParams(string pubJson, Dictionary<string, string>? modalOptions)
+    {
+        if (modalOptions == null || modalOptions.Count == 0)
+            return pubJson;
+
+        try
+        {
+            var dict = V2PacketZipService.ParseFlatPublicParameters(pubJson);
+            bool changed = false;
+            foreach (var kv in modalOptions)
+            {
+                if (!dict.ContainsKey(kv.Key) && !string.IsNullOrWhiteSpace(kv.Value))
+                {
+                    dict[kv.Key] = kv.Value;
+                    changed = true;
+                }
+            }
+            return changed ? JsonSerializer.Serialize(dict) : pubJson;
+        }
+        catch
+        {
+            return pubJson;
         }
     }
 
@@ -909,7 +1146,9 @@ public partial class FormDashboard
         bool sigValid,
         bool hasSignature,
         byte[]? preDecryptedBytes = null,
-        string? requestId = null)
+        string? requestId = null,
+        ManifestVerification? remoteVerification = null,
+        bool skipDecryptAndStoreReceived = false)
     {
         _relayProducerNode = rootNode;
         _relayHopHistory = new List<string>(hops);
@@ -926,7 +1165,7 @@ public partial class FormDashboard
         string currentKeyAttempt = secretKey;
 
         // Si aún no viene pre-descifrado por inverse remoto, probar descifrar con posibilidad de reintentar clave o conservar el paquete recibido en Consultas
-        while (!decryptSucceeded)
+        while (!decryptSucceeded && !skipDecryptAndStoreReceived)
         {
             decryptSucceeded = ExecuteDecryption(
                 algCode,
@@ -1020,9 +1259,17 @@ public partial class FormDashboard
                 _isShowingEncrypted = false;
                 _hologram.TriggerDecryptAnimation(algCode);
                 RenderCurrentBytesInViewer();
+
+                if (remoteVerification != null)
+                    ShowVerificationBanner(remoteVerification.Valid, remoteVerification.Detail);
+                else if (algCode is "HASHSHA" or "HMACSHA256")
+                    ShowVerificationBanner(true, $"VERIFICACIÓN VÁLIDA ({algCode}) confirmada por {rootNode}.");
+                else
+                    HideVerificationBanner();
             }
             else if (!decryptSucceeded)
             {
+                HideVerificationBanner();
                 _currentBytes = cipherBytes;
                 _isShowingEncrypted = true;
                 _hologram.TriggerEncryptAnimation(algCode);
@@ -1039,28 +1286,155 @@ public partial class FormDashboard
         }
     }
 
-    private string? PromptExternalPassphraseModal(string algCode, string producerNode, string sourceNode, bool sigValid)
+    private sealed record V2SecretsModalResult(
+        Dictionary<string, string>? SecretsDictionary,
+        Dictionary<string, string>? Options,
+        string LocalSecretKeyString);
+
+    private V2SecretsModalResult? PromptV2SecretsModal(
+        string algCode,
+        string operation,
+        string producerNode,
+        string sourceNode,
+        bool sigValid,
+        V2AlgorithmProfileDto? profile = null,
+        Dictionary<string, string>? pubParams = null,
+        PeerNode? targetPeer = null,
+        string? prefillSecret = null)
     {
-        string defaultKey = algCode.ToUpperInvariant() switch
+        string normAlg = algCode.Trim().ToUpperInvariant();
+        bool isForward = string.Equals(operation, "forward", StringComparison.OrdinalIgnoreCase);
+
+        // Algoritmos sin secreto de usuario o custodiados en servidor dueño: no abrir modal
+        if (normAlg == "HASHSHA")
         {
-            "AESGCM" => "clave-aes-256-segura",
-            "CHACHA20" => "chacha20-llave-32bytes",
-            "DES" => "claveDES",
-            "TRIPLEDES" => "clave-3des-96-ede",
-            "VIGENERE" => "CRIPTOGRAFIA",
-            "CAESAR" => "3",
-            _ => "clave-prueba"
-        };
+            string hashAlg = pubParams != null && pubParams.TryGetValue("hashAlgorithm", out var pubH) && !string.IsNullOrWhiteSpace(pubH)
+                ? pubH.Trim()
+                : "SHA-256";
+            return new V2SecretsModalResult(
+                null,
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["hashAlgorithm"] = hashAlg },
+                string.Empty);
+        }
+
+        if (normAlg is "RSA" or "ECC" or "DIFFIEHELLMAN" or "DIGITALSIG" or "QUANTUMPQC" or "LAGRANGESHAMIR" or "MILLERRABIN")
+        {
+            return new V2SecretsModalResult(null, null, string.Empty);
+        }
+
+        var profileFields = profile?.ResolveSecretFieldNames() ?? new List<string>();
+        if (profile != null)
+        {
+            bool needsSecret = isForward ? (profile.RequiresSecret ?? true) : (profile.RequiresSecretOnInverse ?? true);
+            if (!needsSecret && profileFields.Count == 0 && normAlg is "LSBSTEGO" or "DFTSPECTRAL")
+                return new V2SecretsModalResult(null, null, string.Empty);
+        }
+
+        bool isOptionalSecret = normAlg is "LSBSTEGO" or "DFTSPECTRAL";
+
+        // Construir definición dinámica de campos (Tabla 4.2 + perfil remoto /api/algorithms)
+        var fieldDefs = new List<(string Name, string Label, string DefaultValue, bool AllowGenerate, int GenBytes)>();
+        if (profileFields.Count > 0 && normAlg != "EUCLIDESAFFINE")
+        {
+            foreach (string fn in profileFields)
+            {
+                string fTrim = fn.Trim();
+                string defVal = normAlg switch
+                {
+                    "CAESAR" => "3",
+                    "VIGENERE" => "CRIPTOGRAFIA",
+                    "XORASM" => "clave123",
+                    "HMACSHA256" => isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) : "",
+                    "AESGCM" or "CHACHA20" => isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) : "clave-aes-256-segura",
+                    "DES" => isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(8)) : "claveDES",
+                    "TRIPLEDES" => isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(24)) : "clave-3des-96-ede",
+                    "FISHERYATES" => isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) : "clave-fisher-yates",
+                    "LORENZSZ40" => "clave-lorenz-sz40",
+                    _ when isOptionalSecret => "",
+                    _ => "clave-prueba"
+                };
+                if (!string.IsNullOrWhiteSpace(prefillSecret))
+                    defVal = prefillSecret.Trim();
+
+                bool allowGen = normAlg is "HMACSHA256" or "AESGCM" or "CHACHA20" or "DES" or "TRIPLEDES" or "FISHERYATES";
+                int genBytes = normAlg == "DES" ? 8 : normAlg == "TRIPLEDES" ? 24 : 32;
+                string lblText = isOptionalSecret
+                    ? $"{fTrim} (opcional — dejar vacío si no usa secreto):"
+                    : $"Campo secreto '{fTrim}' ({normAlg}):";
+                fieldDefs.Add((fTrim, lblText, defVal, allowGen, genBytes));
+            }
+        }
+        else if (normAlg == "EUCLIDESAFFINE")
+        {
+            string defA = "5", defB = "8";
+            if (!string.IsNullOrWhiteSpace(prefillSecret))
+            {
+                var pts = prefillSecret.Split(new[] { ',', ';', ' ', ':' }, StringSplitOptions.RemoveEmptyEntries);
+                if (pts.Length >= 2) { defA = pts[0]; defB = pts[1]; }
+            }
+            fieldDefs.Add(("a", "Parámetro secreto 'a' (coprimo con el módulo, ej. 5):", defA, false, 0));
+            fieldDefs.Add(("b", "Parámetro secreto 'b' (desplazamiento entero, ej. 8):", defB, false, 0));
+        }
+        else if (normAlg == "CAESAR")
+        {
+            fieldDefs.Add(("shift", "Desplazamiento 'shift' (entero, ej. 3):", string.IsNullOrWhiteSpace(prefillSecret) ? "3" : prefillSecret.Trim(), false, 0));
+        }
+        else if (normAlg == "VIGENERE")
+        {
+            fieldDefs.Add(("key", "Clave Vigenère ('key', ej. CRIPTOGRAFIA):", string.IsNullOrWhiteSpace(prefillSecret) ? "CRIPTOGRAFIA" : prefillSecret.Trim(), false, 0));
+        }
+        else if (normAlg == "XORASM")
+        {
+            fieldDefs.Add(("key", "Llave XOR 1–8 bytes ('key', ej. clave123):", string.IsNullOrWhiteSpace(prefillSecret) ? "clave123" : prefillSecret.Trim(), false, 0));
+        }
+        else if (normAlg == "HMACSHA256")
+        {
+            string defHmac = !string.IsNullOrWhiteSpace(prefillSecret)
+                ? prefillSecret.Trim()
+                : (isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) : string.Empty);
+            fieldDefs.Add(("key", "Llave HMAC ('key' >= 32 B en Base64 o frase UTF-8):", defHmac, true, 32));
+        }
+        else if (normAlg is "AESGCM" or "CHACHA20" or "DES" or "TRIPLEDES")
+        {
+            int genLen = normAlg == "DES" ? 8 : normAlg == "TRIPLEDES" ? 24 : 32;
+            string defSym = !string.IsNullOrWhiteSpace(prefillSecret)
+                ? prefillSecret.Trim()
+                : (isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(genLen)) : (normAlg == "DES" ? "claveDES" : normAlg == "TRIPLEDES" ? "clave-3des-96-ede" : "clave-aes-256-segura"));
+            fieldDefs.Add(("key", $"Llave simétrica ('key', Base64 {genLen} B o frase):", defSym, isForward, genLen));
+        }
+        else if (normAlg == "FISHERYATES")
+        {
+            string defFy = !string.IsNullOrWhiteSpace(prefillSecret)
+                ? prefillSecret.Trim()
+                : (isForward ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)) : "clave-fisher-yates");
+            fieldDefs.Add(("seed", "Semilla Fisher-Yates ('seed'):", defFy, isForward, 32));
+        }
+        else if (normAlg == "LORENZSZ40")
+        {
+            fieldDefs.Add(("wheelStarts", "Estado inicial / semilla Lorenz ('wheelStarts'):", string.IsNullOrWhiteSpace(prefillSecret) ? "clave-lorenz-sz40" : prefillSecret.Trim(), false, 0));
+        }
+        else if (normAlg is "LSBSTEGO" or "DFTSPECTRAL")
+        {
+            string fn = normAlg == "LSBSTEGO" ? "password" : "key";
+            fieldDefs.Add((fn, $"Secreto opcional '{fn}' (dejar vacío si no aplica):", prefillSecret?.Trim() ?? string.Empty, false, 0));
+        }
+        else
+        {
+            fieldDefs.Add(("key", "Llave o frase secreta ('key'):", string.IsNullOrWhiteSpace(prefillSecret) ? "clave-prueba" : prefillSecret.Trim(), false, 0));
+        }
 
         using var dlg = new Form
         {
-            Text = $"Clave de Descifrado de Paquete v{NodeRuntimeState.ProtocolVersion}",
+            Text = $"Parámetros v2.0 — {algCode}",
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.CenterParent,
-            Size = new Size(540, 290),
+            AutoScaleMode = AutoScaleMode.Dpi,
             BackColor = HologramTheme.BackgroundBase,
             ForeColor = HologramTheme.TextPrimary,
-            KeyPreview = true
+            KeyPreview = true,
+            MinimumSize = new Size(560, 260),
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink
         };
 
         var card = new GlassPanel
@@ -1069,70 +1443,237 @@ public partial class FormDashboard
             CornerRadius = 16,
             NeonBorderGlow = true,
             BorderColor = HologramTheme.AccentStart,
-            Padding = new Padding(26)
+            Padding = new Padding(22),
+            MinimumSize = new Size(560, 250)
         };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            BackColor = HologramTheme.PanelGlass,
+            MinimumSize = new Size(512, 0),
+            MaximumSize = new Size(580, 0)
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        string opLabel = isForward ? "Cifrado Remoto (forward)" : "Descifrado / Verificación (inverse)";
+        string sigNote = sigValid ? "✓ Firma verificada" : "⚠ Firma no verificada";
+        string peerNote = targetPeer != null ? $" • Destino: {targetPeer.NodeId} ({targetPeer.BaseUrl})" : "";
 
         var lblTitle = new Label
         {
-            Text = $"Descifrar Paquete v{NodeRuntimeState.ProtocolVersion} ({algCode})",
-            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
+            Text = $"{opLabel} — {normAlg}",
+            Font = new Font("Segoe UI", 13.5f, FontStyle.Bold),
             ForeColor = HologramTheme.HologramCyan,
-            Location = new Point(26, 20),
-            Size = new Size(488, 30),
+            AutoSize = true,
+            MaximumSize = new Size(520, 0),
+            Margin = new Padding(0, 0, 0, 4),
             BackColor = HologramTheme.PanelGlass
         };
 
-        string sigNote = sigValid ? "✓ Firma X.509 verificada" : "⚠ Firma no verificada";
         var lblSub = new Label
         {
-            Text = $"Origen: {producerNode} • Emisor: {sourceNode} • {sigNote}\nIngresa la clave o llave Base64 para descifrar:",
-            Font = new Font("Segoe UI", 9.2f),
+            Text = $"Productor: {producerNode} • Emisor: {sourceNode} • {sigNote}{peerNote}",
+            Font = new Font("Segoe UI", 8.8f),
             ForeColor = HologramTheme.TextSecondary,
-            Location = new Point(26, 54),
-            Size = new Size(488, 46),
+            AutoSize = true,
+            MaximumSize = new Size(520, 0),
+            Margin = new Padding(0, 0, 0, 10),
             BackColor = HologramTheme.PanelGlass
         };
 
-        var txtKey = HologramTheme.CreateDarkTextBox();
-        txtKey.Location = new Point(26, 110);
-        txtKey.Size = new Size(488, 34);
-        txtKey.Font = new Font("Cascadia Mono", 10.5f);
-        txtKey.Text = defaultKey;
+        layout.Controls.Add(lblTitle);
+        layout.Controls.Add(lblSub);
+
+        var inputBoxes = new Dictionary<string, TextBox>(StringComparer.Ordinal);
+        foreach (var fd in fieldDefs)
+        {
+            var lblField = new Label
+            {
+                Text = fd.Label,
+                Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
+                ForeColor = HologramTheme.TextPrimary,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 3),
+                BackColor = HologramTheme.PanelGlass
+            };
+            layout.Controls.Add(lblField);
+
+            var rowPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                ColumnCount = fd.AllowGenerate ? 2 : 1,
+                BackColor = HologramTheme.PanelGlass,
+                Margin = new Padding(0, 0, 0, 6)
+            };
+            rowPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            if (fd.AllowGenerate)
+                rowPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var txt = HologramTheme.CreateDarkTextBox(mono: true);
+            txt.Dock = DockStyle.Fill;
+            txt.MinimumSize = new Size(320, 32);
+            txt.Font = new Font("Cascadia Mono", 10f);
+            txt.Text = fd.DefaultValue;
+            rowPanel.Controls.Add(txt, 0, 0);
+            inputBoxes[fd.Name] = txt;
+
+            if (fd.AllowGenerate)
+            {
+                int byteCount = fd.GenBytes;
+                var btnGen = new NeonButton
+                {
+                    Text = $"🎲 {byteCount} B",
+                    Variant = NeonButtonVariant.Cyan,
+                    Height = 32,
+                    Margin = new Padding(6, 0, 0, 0)
+                };
+                btnGen.Click += (_, _) => txt.Text = Convert.ToBase64String(RandomNumberGenerator.GetBytes(byteCount));
+                rowPanel.Controls.Add(btnGen, 1, 0);
+            }
+
+            layout.Controls.Add(rowPanel);
+        }
+
+        // Opciones opcionales (p. ej. alphabet para CAESAR/VIGENERE, modulus para EUCLIDESAFFINE, macAlgorithm para HMACSHA256)
+        ComboBox? cmbOptionSelector = null;
+        string? optionKeyName = null;
+        if (normAlg is "CAESAR" or "VIGENERE")
+        {
+            optionKeyName = "alphabet";
+            cmbOptionSelector = new ComboBox();
+            HologramTheme.StyleComboBox(cmbOptionSelector);
+            cmbOptionSelector.Items.AddRange(new object[] { "BYTE", "A-Z" });
+            string existing = pubParams != null && pubParams.TryGetValue("alphabet", out var a) ? a.Trim().ToUpperInvariant() : "BYTE";
+            cmbOptionSelector.SelectedItem = existing.Contains("A-Z") ? "A-Z" : "BYTE";
+        }
+        else if (normAlg == "EUCLIDESAFFINE")
+        {
+            optionKeyName = "modulus";
+            cmbOptionSelector = new ComboBox();
+            HologramTheme.StyleComboBox(cmbOptionSelector);
+            cmbOptionSelector.Items.AddRange(new object[] { "256", "26" });
+            string existing = pubParams != null && pubParams.TryGetValue("modulus", out var m) ? m.Trim() : "256";
+            cmbOptionSelector.SelectedItem = existing == "26" ? "26" : "256";
+        }
+        else if (normAlg == "HMACSHA256")
+        {
+            optionKeyName = "macAlgorithm";
+            cmbOptionSelector = new ComboBox();
+            HologramTheme.StyleComboBox(cmbOptionSelector);
+            cmbOptionSelector.Items.AddRange(new object[] { "HMAC-SHA256", "HMAC-SHA512" });
+            string existing = pubParams != null && pubParams.TryGetValue("macAlgorithm", out var m) ? m.Trim().ToUpperInvariant() : "HMAC-SHA256";
+            cmbOptionSelector.SelectedItem = existing.Contains("512") ? "HMAC-SHA512" : "HMAC-SHA256";
+        }
+
+        if (cmbOptionSelector != null && optionKeyName != null)
+        {
+            var optRow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                BackColor = HologramTheme.PanelGlass,
+                Margin = new Padding(0, 2, 0, 6)
+            };
+            var lblOpt = new Label
+            {
+                Text = $"Opción '{optionKeyName}':",
+                Font = new Font("Segoe UI", 8.8f),
+                ForeColor = HologramTheme.TextSecondary,
+                AutoSize = true,
+                Padding = new Padding(0, 6, 8, 0),
+                BackColor = HologramTheme.PanelGlass
+            };
+            cmbOptionSelector.Width = 170;
+            optRow.Controls.Add(lblOpt);
+            optRow.Controls.Add(cmbOptionSelector);
+            layout.Controls.Add(optRow);
+        }
 
         var lblHint = new Label
         {
-            Text = "Las llaves nunca viajan en texto claro dentro de manifest.json.",
-            Font = new Font("Segoe UI", 8.4f),
+            Text = "Los secretos se sellan con CC-ENV-1 (nunca viajan en claro en manifest.json).",
+            Font = new Font("Segoe UI", 8.2f),
             ForeColor = HologramTheme.HologramViolet,
-            Location = new Point(26, 152),
-            Size = new Size(488, 22),
+            AutoSize = true,
+            Margin = new Padding(0, 4, 0, 10),
             BackColor = HologramTheme.PanelGlass
         };
+        layout.Controls.Add(lblHint);
 
-        string? resultKey = null;
+        var btnRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            BackColor = HologramTheme.PanelGlass,
+            Margin = new Padding(0, 2, 0, 0)
+        };
+        btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+
+        V2SecretsModalResult? modalResult = null;
+
+        void ConfirmAndClose()
+        {
+            var secDict = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var kv in inputBoxes)
+            {
+                string v = kv.Value.Text.Trim();
+                if (!string.IsNullOrEmpty(v))
+                    secDict[kv.Key] = v;
+            }
+
+            if (secDict.Count == 0 && !isOptionalSecret)
+            {
+                MessageBox.Show(dlg, "Ingresa el parámetro secreto requerido.", "ModuloCrypto", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            Dictionary<string, string>? optsDict = null;
+            if (cmbOptionSelector != null && optionKeyName != null && cmbOptionSelector.SelectedItem is string optVal)
+                optsDict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [optionKeyName] = optVal };
+
+            if (normAlg == "XORASM" && isForward)
+            {
+                optsDict ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (!optsDict.ContainsKey("rotation")) optsDict["rotation"] = "ROL";
+                if (!optsDict.ContainsKey("rotationBits")) optsDict["rotationBits"] = "3";
+            }
+
+            string localStr = normAlg == "EUCLIDESAFFINE"
+                ? $"{(secDict.TryGetValue("a", out var av) ? av : "1")},{(secDict.TryGetValue("b", out var bv) ? bv : "0")}"
+                : (secDict.Count > 0 ? secDict.Values.First() : string.Empty);
+
+            modalResult = new V2SecretsModalResult(
+                secDict.Count > 0 ? secDict : null,
+                optsDict,
+                localStr);
+            dlg.DialogResult = DialogResult.OK;
+            dlg.Close();
+        }
 
         var btnOk = new NeonButton
         {
-            Text = "🔓 Aceptar y Descifrar",
+            Text = isForward ? "🔒 Enviar y Cifrar" : "🔓 Aceptar y Descifrar",
             Variant = NeonButtonVariant.Success,
-            AutoFitWidth = false,
-            Location = new Point(26, 198),
-            Size = new Size(236, 44)
+            Dock = DockStyle.Fill,
+            Height = 42,
+            Margin = new Padding(0, 0, 6, 0)
         };
-        btnOk.Click += (_, _) =>
-        {
-            resultKey = txtKey.Text;
-            dlg.DialogResult = DialogResult.OK;
-            dlg.Close();
-        };
+        btnOk.Click += (_, _) => ConfirmAndClose();
 
         var btnCancel = new NeonButton
         {
             Text = "Cancelar",
             Variant = NeonButtonVariant.Secondary,
-            AutoFitWidth = false,
-            Location = new Point(278, 198),
-            Size = new Size(236, 44)
+            Dock = DockStyle.Fill,
+            Height = 42,
+            Margin = new Padding(6, 0, 0, 0)
         };
         btnCancel.Click += (_, _) =>
         {
@@ -1140,7 +1681,11 @@ public partial class FormDashboard
             dlg.Close();
         };
 
-        card.Controls.AddRange(new Control[] { lblTitle, lblSub, txtKey, lblHint, btnOk, btnCancel });
+        btnRow.Controls.Add(btnOk, 0, 0);
+        btnRow.Controls.Add(btnCancel, 1, 0);
+        layout.Controls.Add(btnRow);
+
+        card.Controls.Add(layout);
         dlg.Controls.Add(card);
 
         dlg.KeyDown += (_, e) =>
@@ -1148,9 +1693,7 @@ public partial class FormDashboard
             if (e.KeyCode == Keys.Enter)
             {
                 e.SuppressKeyPress = true;
-                resultKey = txtKey.Text;
-                dlg.DialogResult = DialogResult.OK;
-                dlg.Close();
+                ConfirmAndClose();
             }
             else if (e.KeyCode == Keys.Escape)
             {
@@ -1159,7 +1702,13 @@ public partial class FormDashboard
             }
         };
 
-        return dlg.ShowDialog(this) == DialogResult.OK ? resultKey : null;
+        return dlg.ShowDialog(this) == DialogResult.OK ? modalResult : null;
+    }
+
+    private string? PromptExternalPassphraseModal(string algCode, string producerNode, string sourceNode, bool sigValid)
+    {
+        var modal = PromptV2SecretsModal(algCode, "inverse", producerNode, sourceNode, sigValid);
+        return modal?.LocalSecretKeyString;
     }
 
     private void BuildConsultasView()
@@ -1326,6 +1875,7 @@ public partial class FormDashboard
 
         _relayProducerNode = r.NodoRaiz;
         _relayHopHistory = V2PacketZipService.TryDeserializeHops(r.RutaSaltosJson);
+        HideVerificationBanner();
 
         SelectAlgorithmInCombo(r.AlgoritmoCodigo);
         UpdateMetadataPanel(r, !string.IsNullOrWhiteSpace(r.FirmaRaizBase64), !string.IsNullOrWhiteSpace(r.FirmaRaizBase64));
